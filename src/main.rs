@@ -11,10 +11,17 @@ Rules: inspect before editing; keep output small (use head, grep, ranges); when 
 
 const MAX_OUT: usize = 2000;
 
+#[derive(Clone, Copy, PartialEq)]
+enum Api {
+    Chat,
+    Responses,
+}
+
 struct Cfg {
+    api: Api,
     base: String,
     key: String,
-    model: String,
+    model: Option<String>,
     yes: bool,
 }
 
@@ -29,11 +36,45 @@ fn truncate(s: String) -> String {
     format!("{}\n...({} bytes omitted)", &s[..end], s.len() - end)
 }
 
+/// First model the server lists, used when `REVEX_MODEL` is unset.
+fn default_model(base: &str, key: &str) -> Option<String> {
+    let text = ureq::get(&format!("{base}/models"))
+        .set("Authorization", &format!("Bearer {key}"))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    v["data"][0]["id"].as_str().map(String::from)
+}
+
 fn chat(cfg: &Cfg, msgs: &[Value]) -> Result<String, String> {
-    let mut body = json!({
-        "model": cfg.model, "messages": msgs, "stream": true,
-        "stop": ["<out>"], "cache_prompt": true
-    });
+    let (path, mut body) = match cfg.api {
+        Api::Chat => (
+            "chat/completions",
+            json!({
+                "model": cfg.model.as_deref(), "messages": msgs, "stream": true,
+                "stop": ["<out>"], "cache_prompt": true
+            }),
+        ),
+        Api::Responses => {
+            let (sys, rest) = match msgs.split_first() {
+                Some((f, r)) if f["role"] == "system" => (f["content"].clone(), r),
+                _ => (Value::Null, msgs),
+            };
+            let mut b = json!({
+                "model": cfg.model.as_deref(), "input": rest, "stream": true, "store": false
+            });
+            if !sys.is_null() {
+                b["instructions"] = sys;
+            }
+            ("responses", b)
+        }
+    };
+    // If no model could be found, let the server pick its own default.
+    if cfg.model.is_none() {
+        body.as_object_mut().map(|o| o.remove("model"));
+    }
     if let Some(Ok(Value::Object(extra))) = std::env::var("REVEX_EXTRA")
         .ok()
         .map(|e| serde_json::from_str::<Value>(&e))
@@ -42,7 +83,7 @@ fn chat(cfg: &Cfg, msgs: &[Value]) -> Result<String, String> {
             body[k] = v;
         }
     }
-    let resp = ureq::post(&format!("{}/chat/completions", cfg.base))
+    let resp = ureq::post(&format!("{}/{path}", cfg.base))
         .set("Authorization", &format!("Bearer {}", cfg.key))
         .set("Content-Type", "application/json")
         .send_string(&body.to_string())
@@ -62,14 +103,47 @@ fn chat(cfg: &Cfg, msgs: &[Value]) -> Result<String, String> {
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             continue;
         };
-        if v["choices"][0]["finish_reason"] == "content_filter"
-            || v["choices"][0]["delta"]["refusal"].is_string()
-        {
-            return Err("refused by model/provider (content_filter)".into());
-        }
-        if let Some(t) = v["choices"][0]["delta"]["content"].as_str() {
+        let delta = match cfg.api {
+            Api::Chat => {
+                if v["choices"][0]["finish_reason"] == "content_filter"
+                    || v["choices"][0]["delta"]["refusal"].is_string()
+                {
+                    return Err("refused by model/provider (content_filter)".into());
+                }
+                v["choices"][0]["delta"]["content"].as_str()
+            }
+            Api::Responses => match v["type"].as_str().unwrap_or("") {
+                "response.output_text.delta" => v["delta"].as_str(),
+                "response.refusal.delta" | "response.refusal.done" => {
+                    return Err("refused by model/provider (refusal)".into());
+                }
+                "response.incomplete" => {
+                    if v["response"]["incomplete_details"]["reason"] == "content_filter" {
+                        return Err("refused by model/provider (content_filter)".into());
+                    }
+                    break;
+                }
+                "response.failed" | "error" => {
+                    let m = v["response"]["error"]["message"]
+                        .as_str()
+                        .or(v["message"].as_str())
+                        .unwrap_or("unknown error");
+                    return Err(format!("provider error: {m}"));
+                }
+                "response.completed" => break,
+                _ => None,
+            },
+        };
+        if let Some(t) = delta {
             eprint!("{t}");
             full.push_str(t);
+            // The Responses API has no `stop`, so cut at the marker here.
+            if cfg.api == Api::Responses
+                && let Some(i) = full.find("<out>")
+            {
+                full.truncate(i);
+                break;
+            }
         }
     }
     eprintln!();
@@ -274,12 +348,24 @@ fn main() {
             std::process::exit(2);
         })
     };
+    let api = match std::env::var("REVEX_API").as_deref() {
+        Err(_) | Ok("chat") => Api::Chat,
+        Ok("responses") => Api::Responses,
+        Ok(o) => {
+            eprintln!("error: REVEX_API must be `chat` or `responses`, got `{o}`");
+            std::process::exit(2);
+        }
+    };
     let mut cfg = Cfg {
+        api,
         base: need("REVEX_BASE_URL"),
         key: std::env::var("REVEX_API_KEY").unwrap_or_default(),
-        model: need("REVEX_MODEL"),
+        model: std::env::var("REVEX_MODEL").ok(),
         yes: false,
     };
+    if cfg.model.is_none() {
+        cfg.model = default_model(&cfg.base, &cfg.key);
+    }
     let mut task = vec![];
     for a in std::env::args().skip(1) {
         match a.as_str() {

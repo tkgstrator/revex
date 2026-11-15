@@ -8,7 +8,7 @@ time and context window. `revex` keeps the whole prompt to roughly 200 tokens an
 skips tool schemas entirely: the model calls tools by writing one-line commands.
 
 - Single binary of about 1.3 MB, two dependencies (`ureq`, `serde_json`)
-- Talks to any OpenAI-compatible `/chat/completions` endpoint with streaming
+- Talks to any OpenAI-compatible endpoint with streaming, through either Chat Completions or the Responses API
 - One-shot, interactive and MCP server modes
 - Tool output is truncated to protect the context window
 - Refusals from the provider are detected and reported to the caller
@@ -101,13 +101,18 @@ Prebuilt binaries for macOS (arm64) and Linux (x86_64, arm64) are attached to ea
 
 All configuration is through environment variables.
 
-| Variable         | Required | Description                                            |
-| ---------------- | -------- | ------------------------------------------------------ |
-| `REVEX_BASE_URL` | yes      | Base URL of the OpenAI-compatible API, including `/v1` |
-| `REVEX_MODEL`    | yes      | Model ID to use                                        |
-| `REVEX_API_KEY`  | no       | Sent as `Authorization: Bearer <key>`                  |
-| `REVEX_EXTRA`    | no       | JSON object merged into every request body             |
-| `REVEX_DEBUG`    | no       | Set to print raw SSE lines to stderr                   |
+| Variable         | Required | Description                                                                                                            |
+| ---------------- | -------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `REVEX_BASE_URL` | yes      | Base URL of the OpenAI-compatible API, including `/v1`                                                                 |
+| `REVEX_API`      | no       | `chat` (default, `/chat/completions`) or `responses` (`/responses`)                                                    |
+| `REVEX_MODEL`    | no       | Model ID. If unset, the first model from `/models` is used; if that fails, the field is omitted and the server decides |
+| `REVEX_API_KEY`  | no       | Sent as `Authorization: Bearer <key>`                                                                                  |
+| `REVEX_EXTRA`    | no       | JSON object merged into every request body                                                                             |
+| `REVEX_DEBUG`    | no       | Set to print raw SSE lines to stderr                                                                                   |
+
+The Responses API has no `stop` parameter, so with `REVEX_API=responses` the reply is cut
+at `<out>` on the client side. It is stateless (`store: false`): the full history is sent
+every step.
 
 ```sh
 export REVEX_BASE_URL=http://localhost:8000/v1
