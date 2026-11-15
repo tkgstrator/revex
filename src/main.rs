@@ -38,6 +38,30 @@ struct Cfg {
     key: String,
     model: Option<String>,
     yes: bool,
+    history: Option<History>,
+    /// A failed history save aborts the run instead of only warning.
+    strict_save: bool,
+}
+
+enum AgentAnswer {
+    Streamed(String),
+    Forwarded(String),
+}
+
+impl AgentAnswer {
+    fn text(&self) -> &str {
+        match self {
+            Self::Streamed(text) | Self::Forwarded(text) => text,
+        }
+    }
+
+    /// Local answers were already streamed by `chat`; forwarded answers were not.
+    fn interactive_output(&self) -> Option<&str> {
+        match self {
+            Self::Streamed(_) => None,
+            Self::Forwarded(text) => Some(text),
+        }
+    }
 }
 
 fn truncate(s: String) -> String {
@@ -359,34 +383,336 @@ fn forward(frontier: &str, task: &str) -> Option<String> {
     Some(text)
 }
 
-fn agent(cfg: &Cfg, msgs: &mut Vec<Value>, task: &str) -> Result<String, String> {
-    if let Some(f) = &cfg.frontier
-        && matches!(cfg.route, Route::Auto | Route::Remote)
-        && (cfg.route == Route::Remote || route(cfg, task))
-        && let Some(r) = forward(f, task)
+const HISTORY_VERSION: u64 = 1;
+
+/// Where one working directory's interactive history lives.
+#[derive(Clone, Debug)]
+struct History {
+    path: PathBuf,
+    cwd: String,
+}
+
+fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf29ce484222325, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x100000001b3)
+    })
+}
+
+/// `$XDG_STATE_HOME/revex`, else `~/.local/state/revex`. Not `~/.revex`, which is a settings file.
+fn state_dir() -> Result<PathBuf, String> {
+    let abs = |v: std::ffi::OsString| Some(PathBuf::from(v)).filter(|p| p.is_absolute());
+    std::env::var_os("XDG_STATE_HOME")
+        .and_then(abs)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .and_then(abs)
+                .map(|h| h.join(".local/state"))
+        })
+        .map(|d| d.join("revex"))
+        .ok_or_else(|| "neither XDG_STATE_HOME nor HOME is an absolute path".to_string())
+}
+
+/// Keep UTF-8 paths byte-for-byte compatible with existing history files. Unix paths
+/// with invalid UTF-8 get a NUL-prefixed hex identity; NUL cannot occur in a real path,
+/// so this cannot equal any valid UTF-8 path or another distinct byte sequence.
+fn cwd_identity(cwd: &Path) -> String {
+    #[cfg(unix)]
     {
-        return Ok(r);
+        use std::os::unix::ffi::OsStrExt;
+        if let Some(s) = cwd.to_str() {
+            return s.to_owned();
+        }
+        let hex: String = cwd
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!("\0{hex}")
+    }
+    #[cfg(not(unix))]
+    {
+        cwd.to_string_lossy().into_owned()
+    }
+}
+
+fn history_for(dir: &Path, cwd: &Path) -> History {
+    let cwd = cwd_identity(cwd);
+    History {
+        path: dir.join(format!("history-{:016x}.json", fnv1a(&cwd))),
+        cwd,
+    }
+}
+
+fn fresh_history() -> Vec<Value> {
+    vec![json!({"role": "system", "content": SYSTEM})]
+}
+
+/// Stored messages with the first one replaced by the current `SYSTEM`.
+/// A missing file is a fresh session; anything unreadable or mismatched is an error.
+fn load_history(h: &History) -> Result<Vec<Value>, String> {
+    let text = match std::fs::read_to_string(&h.path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(fresh_history()),
+        Err(e) => return Err(format!("{}: {e}", h.path.display())),
+    };
+    let bad = |why: &str| format!("{}: {why}", h.path.display());
+    let v: Value = serde_json::from_str(&text).map_err(|e| bad(&format!("corrupt ({e})")))?;
+    if v["version"].as_u64() != Some(HISTORY_VERSION) {
+        return Err(bad(&format!(
+            "unsupported version {} (expected {HISTORY_VERSION})",
+            v["version"]
+        )));
+    }
+    if v["cwd"].as_str() != Some(&h.cwd) {
+        return Err(bad(&format!("belongs to another directory ({})", v["cwd"])));
+    }
+    let Some(Value::Array(mut msgs)) = v.get("messages").cloned() else {
+        return Err(bad("corrupt (messages is not an array)"));
+    };
+    if msgs.first().is_none_or(|m| m["role"] != "system")
+        || msgs
+            .iter()
+            .any(|m| !m["role"].is_string() || !m["content"].is_string())
+    {
+        return Err(bad("corrupt (malformed messages)"));
+    }
+    msgs[0] = fresh_history().remove(0);
+    Ok(msgs)
+}
+
+/// Atomic write: private temp file beside the target, fsync, rename over it.
+fn save_history(h: &History, msgs: &[Value]) -> Result<(), String> {
+    write_history(h, msgs, false).map_err(|e| format!("{}: {e}", h.path.display()))
+}
+
+/// Like `save_history`, but the target must not exist: the file is hard-linked into place,
+/// so an existing one is never replaced (`AlreadyExists`) and readers never see partial data.
+fn create_history(h: &History, msgs: &[Value]) -> std::io::Result<()> {
+    write_history(h, msgs, true)
+}
+
+fn write_history(h: &History, msgs: &[Value], exclusive: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = h
+        .path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("history path has no parent"))?;
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let body = json!({"version": HISTORY_VERSION, "cwd": h.cwd, "messages": msgs});
+    let tmp = h.path.with_extension(format!("tmp{}", std::process::id()));
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let res = (|| {
+        let mut f = o.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(body.to_string().as_bytes())?;
+        f.sync_all()?;
+        if exclusive {
+            std::fs::hard_link(&tmp, &h.path)
+        } else {
+            std::fs::rename(&tmp, &h.path)
+        }
+    })();
+    if res.is_err() || exclusive {
+        std::fs::remove_file(&tmp).ok();
+    }
+    res
+}
+
+/// Persist after a message mutation. Interactive runs only warn; `strict_save` runs fail.
+fn persist(cfg: &Cfg, msgs: &[Value]) -> Result<(), String> {
+    if let Some(h) = &cfg.history
+        && let Err(e) = save_history(h, msgs)
+    {
+        if cfg.strict_save {
+            return Err(format!("history not saved: {e}"));
+        }
+        eprintln!("history not saved: {e}");
+    }
+    Ok(())
+}
+
+fn valid_session_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// 128 random bits from the OS CSPRNG as 32 hex chars. Session files may hold secrets,
+/// so the ID must not be guessable. Fails rather than falling back to a weaker source.
+fn new_session_id() -> Result<String, String> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .map_err(|e| format!("cannot generate session id: {e}"))?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+/// Open an MCP delegate session: an existing one by `id` (which must exist, load, and
+/// belong to `cwd`), or a new one, written to disk before any work so its ID is resumable.
+fn open_session(
+    dir: &Path,
+    cwd: &Path,
+    id: Option<&str>,
+) -> Result<(String, History, Vec<Value>), String> {
+    let path = |id: &str| dir.join(format!("session-{id}.json"));
+    let cwd = cwd_identity(cwd);
+    match id {
+        Some(id) => {
+            if !valid_session_id(id) {
+                return Err("invalid session_id: use 1-64 of A-Z a-z 0-9 - _".into());
+            }
+            let h = History {
+                path: path(id),
+                cwd,
+            };
+            match std::fs::metadata(&h.path) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(format!("unknown session_id {id}"));
+                }
+                Err(e) => return Err(format!("{}: {e}", h.path.display())),
+            }
+            let msgs = load_history(&h)?;
+            Ok((id.to_string(), h, msgs))
+        }
+        None => {
+            let msgs = fresh_history();
+            // exclusive create: a colliding ID is retried, never overwritten
+            for _ in 0..8 {
+                let id = new_session_id()?;
+                let h = History {
+                    path: path(&id),
+                    cwd: cwd.clone(),
+                };
+                match create_history(&h, &msgs) {
+                    Ok(()) => return Ok((id, h, msgs)),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => {
+                        return Err(format!("session not saved: {}: {e}", h.path.display()));
+                    }
+                }
+            }
+            Err("session not saved: could not pick an unused session id".into())
+        }
+    }
+}
+
+/// Forward the task when routing says so, recording the exchange in `msgs` so later
+/// local turns (and the saved history) see it. None means handle it locally.
+fn remote_turn(
+    cfg: &Cfg,
+    msgs: &mut Vec<Value>,
+    task: &str,
+    fwd: impl Fn(&str, &str) -> Option<String>,
+) -> Option<Result<String, String>> {
+    let f = cfg.frontier.as_ref()?;
+    if !matches!(cfg.route, Route::Auto | Route::Remote)
+        || !(cfg.route == Route::Remote || route(cfg, task))
+    {
+        return None;
+    }
+    let r = fwd(f, task)?;
+    msgs.push(json!({"role": "user", "content": task}));
+    msgs.push(json!({"role": "assistant", "content": r}));
+    Some(persist(cfg, msgs).map(|()| r))
+}
+
+fn agent(cfg: &Cfg, msgs: &mut Vec<Value>, task: &str) -> Result<AgentAnswer, String> {
+    if let Some(r) = remote_turn(cfg, msgs, task, forward) {
+        return r.map(AgentAnswer::Forwarded);
     }
     msgs.push(json!({"role": "user", "content": task}));
+    persist(cfg, msgs)?;
     for _ in 0..30 {
         let reply = chat(cfg, msgs)?;
         if reply.trim() == ">>" {
             continue;
         }
         msgs.push(json!({"role": "assistant", "content": reply}));
+        persist(cfg, msgs)?;
         let calls = parse(&reply);
         if calls.is_empty() {
-            return Ok(reply.trim().to_string());
+            return Ok(AgentAnswer::Streamed(reply.trim().to_string()));
         }
         let outs: Vec<String> = calls.iter().map(|c| run(cfg, c)).collect();
         msgs.push(
             json!({"role": "user", "content": format!("<out>\n{}\n</out>", outs.join("\n---\n"))}),
         );
+        persist(cfg, msgs)?;
     }
     Err("step limit reached".into())
 }
 
+/// One `delegate` call. Returns the text, whether it failed, and the session ID only
+/// when the session is known to be saved.
+fn delegate(
+    cfg: &Cfg,
+    startup: &Result<PathBuf, String>,
+    state: &Result<PathBuf, String>,
+    a: &Value,
+) -> (String, bool, Option<String>) {
+    let open = || -> Result<(String, History, Vec<Value>), String> {
+        let base = startup.clone().map_err(|e| format!("startup cwd: {e}"))?;
+        let want = match &a["cwd"] {
+            Value::Null => base.clone(),
+            Value::String(d) => base.join(d),
+            _ => return Err("cwd must be a string".into()),
+        };
+        let cwd = want
+            .canonicalize()
+            .map_err(|e| format!("cwd {}: {e}", want.display()))?;
+        let id = match &a["session_id"] {
+            Value::Null => None,
+            Value::String(s) => Some(s.as_str()),
+            _ => return Err("session_id must be a string".into()),
+        };
+        let dir = state
+            .clone()
+            .map_err(|e| format!("session directory: {e}"))?;
+        std::env::set_current_dir(&cwd).map_err(|e| format!("cwd {}: {e}", cwd.display()))?;
+        open_session(&dir, &cwd, id)
+    };
+    let (id, h, mut msgs) = match open() {
+        Ok(x) => x,
+        Err(e) => return (e, true, None),
+    };
+    let cfg = Cfg {
+        history: Some(h),
+        strict_save: true,
+        ..cfg.clone()
+    };
+    match agent(&cfg, &mut msgs, a["task"].as_str().unwrap_or("")) {
+        Ok(t) => (t.text().to_string(), false, Some(id)),
+        // a save failure means the stored session may lag behind; do not hand out the ID
+        Err(e) if e.starts_with("history not saved") => (e, true, None),
+        Err(e) => (e, true, Some(id)),
+    }
+}
+
 fn mcp(cfg: &Cfg) {
+    let startup = std::env::current_dir()
+        .and_then(|d| d.canonicalize())
+        .map_err(|e| e.to_string());
+    let state = state_dir();
     let reply = |id: Value, r: Result<Value, (i64, &str)>| {
         let m = match r {
             Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
@@ -415,20 +741,18 @@ fn mcp(cfg: &Cfg) {
                 "description": "Run a coding / reverse-engineering task on a local LLM agent (shell, file read/write). Returns its final answer.",
                 "inputSchema": {"type": "object", "properties": {
                     "task": {"type": "string"},
-                    "cwd": {"type": "string", "description": "working directory"}
+                    "cwd": {"type": "string", "description": "working directory (default: the server's startup directory)"},
+                    "session_id": {"type": "string", "description": "continue a session returned by an earlier call; it must exist and use the same cwd. Omit to start a new one"}
                 }, "required": ["task"]}
             }]})),
             "tools/call" => {
                 let a = &req["params"]["arguments"];
-                if let Some(d) = a["cwd"].as_str() {
-                    std::env::set_current_dir(d).ok();
+                let (text, err, sid) = delegate(cfg, &startup, &state, a);
+                let mut res = json!({"content": [{"type": "text", "text": text}], "isError": err});
+                if let Some(id) = sid {
+                    res["structuredContent"] = json!({"session_id": id});
                 }
-                let mut msgs = vec![json!({"role": "system", "content": SYSTEM})];
-                let (text, err) = match agent(cfg, &mut msgs, a["task"].as_str().unwrap_or("")) {
-                    Ok(t) => (t, false),
-                    Err(e) => (e, true),
-                };
-                Ok(json!({"content": [{"type": "text", "text": text}], "isError": err}))
+                Ok(res)
             }
             "ping" => Ok(json!({})),
             _ => Err((-32601, "method not found")),
@@ -568,6 +892,15 @@ fn saved(key: &str, env: &str, value: &str) {
     }
 }
 
+fn clear_history(cfg: &Cfg, msgs: &mut Vec<Value>) -> Result<(), String> {
+    let cleared = msgs[..1].to_vec();
+    if let Some(h) = &cfg.history {
+        save_history(h, &cleared)?;
+    }
+    *msgs = cleared;
+    Ok(())
+}
+
 fn command(cfg: &mut Cfg, msgs: &mut Vec<Value>, line: &str) -> Cmd {
     let Some(rest) = line.strip_prefix('/') else {
         return Cmd::No;
@@ -577,10 +910,10 @@ fn command(cfg: &mut Cfg, msgs: &mut Vec<Value>, line: &str) -> Cmd {
     match name {
         "help" => eprintln!("{HELP}"),
         "exit" | "quit" => return Cmd::Exit,
-        "clear" => {
-            msgs.truncate(1);
-            eprintln!("history cleared");
-        }
+        "clear" => match clear_history(cfg, msgs) {
+            Ok(()) => eprintln!("history cleared"),
+            Err(e) => eprintln!("history not cleared: {e}"),
+        },
         "model" if arg.is_empty() => {
             let cur = cfg.model.clone().unwrap_or_default();
             eprintln!(
@@ -666,6 +999,8 @@ fn main() {
         key: std::env::var("REVEX_API_KEY").unwrap_or_default(),
         model: get("model", "REVEX_MODEL"),
         yes: false,
+        history: None,
+        strict_save: false,
     };
     if cfg.model.is_none() {
         cfg.model = default_model(&cfg.base, &cfg.key);
@@ -687,7 +1022,7 @@ fn main() {
     let mut msgs = vec![json!({"role": "system", "content": SYSTEM})];
     if !task.is_empty() {
         match agent(&cfg, &mut msgs, &task.join(" ")) {
-            Ok(r) => println!("{r}"),
+            Ok(r) => println!("{}", r.text()),
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -699,13 +1034,32 @@ fn main() {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         std::io::stdin().read_to_string(&mut piped).ok();
         match agent(&cfg, &mut msgs, piped.trim()) {
-            Ok(r) => println!("{r}"),
+            Ok(r) => println!("{}", r.text()),
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
         }
         return;
+    }
+    // Interactive mode promises a saved history, so failing to locate it is fatal.
+    let h = std::env::current_dir()
+        .and_then(|d| d.canonicalize())
+        .map_err(|e| e.to_string())
+        .and_then(|cwd| Ok(history_for(&state_dir()?, &cwd)))
+        .unwrap_or_else(|e| die(&format!("cannot locate history directory: {e}")));
+    match load_history(&h) {
+        Ok(m) => {
+            if m.len() > 1 {
+                eprintln!("resumed {} messages from {}", m.len() - 1, h.path.display());
+            }
+            msgs = m;
+            cfg.history = Some(h);
+            cfg.strict_save = true;
+        }
+        Err(e) => die(&format!(
+            "cannot load history: {e}\nfix or remove that file to continue"
+        )),
     }
     loop {
         eprint!("> ");
@@ -722,8 +1076,324 @@ fn main() {
             Cmd::Done => continue,
             Cmd::No => {}
         }
-        if let Err(e) = agent(&cfg, &mut msgs, line) {
-            eprintln!("error: {e}");
+        match agent(&cfg, &mut msgs, line) {
+            Ok(r) => {
+                if let Some(text) = r.interactive_output() {
+                    eprintln!("{text}");
+                }
+            }
+            Err(e) if e.starts_with("history not saved:") => die(&e),
+            Err(e) => eprintln!("error: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("revex-test-{}-{name}", std::process::id()));
+        std::fs::remove_dir_all(&d).ok();
+        d
+    }
+
+    fn sample() -> Vec<Value> {
+        let mut m = fresh_history();
+        m.push(json!({"role": "user", "content": "hi"}));
+        m.push(json!({"role": "user", "content": "<out>\nsecret tool output\n</out>"}));
+        m
+    }
+
+    #[test]
+    fn save_load_roundtrip_replaces_system() {
+        let dir = tmp("rt");
+        let h = history_for(&dir, Path::new("/work/a"));
+        assert_eq!(load_history(&h).unwrap().len(), 1);
+        let mut m = sample();
+        m[0] = json!({"role": "system", "content": "old prompt"});
+        save_history(&h, &m).unwrap();
+        let got = load_history(&h).unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0]["content"], SYSTEM);
+        assert_eq!(got[2], m[2]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&dir), 0o700);
+            assert_eq!(mode(&h.path), 0o600);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clear_persists() {
+        let dir = tmp("clear");
+        let h = history_for(&dir, Path::new("/work/a"));
+        save_history(&h, &sample()).unwrap();
+        save_history(&h, &sample()[..1]).unwrap();
+        assert_eq!(load_history(&h).unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_clear_keeps_in_memory_history() {
+        let dir = tmp("clear-fail");
+        let h = history_for(&dir, Path::new("/work/a"));
+        std::fs::create_dir_all(&h.path).unwrap();
+        let cfg = Cfg {
+            temperature: None,
+            max_tokens: None,
+            quiet: true,
+            frontier: None,
+            route: Route::Off,
+            api: Api::Chat,
+            base: String::new(),
+            key: String::new(),
+            model: None,
+            yes: false,
+            history: Some(h),
+            strict_save: true,
+        };
+        let mut msgs = sample();
+        let before = msgs.clone();
+        assert!(clear_history(&cfg, &mut msgs).is_err());
+        assert_eq!(msgs, before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn interactive_displays_only_forwarded_answers() {
+        let local = AgentAnswer::Streamed("local answer".into());
+        assert_eq!(local.interactive_output(), None);
+        #[cfg(unix)]
+        {
+            let cfg = Cfg {
+                temperature: None,
+                max_tokens: None,
+                quiet: true,
+                frontier: Some("/bin/echo".into()),
+                route: Route::Remote,
+                api: Api::Chat,
+                base: String::new(),
+                key: String::new(),
+                model: None,
+                yes: false,
+                history: None,
+                strict_save: false,
+            };
+            let mut msgs = fresh_history();
+            let remote = agent(&cfg, &mut msgs, "remote answer").unwrap();
+            assert!(matches!(remote, AgentAnswer::Forwarded(_)));
+            assert_eq!(remote.interactive_output(), Some("remote answer"));
+        }
+    }
+
+    #[test]
+    fn rejects_corrupt_version_and_cwd_mismatch() {
+        let dir = tmp("bad");
+        let h = history_for(&dir, Path::new("/work/a"));
+        save_history(&h, &sample()).unwrap();
+        let good = std::fs::read_to_string(&h.path).unwrap();
+
+        std::fs::write(&h.path, "{not json").unwrap();
+        assert!(load_history(&h).unwrap_err().contains("corrupt"));
+
+        let mut v: Value = serde_json::from_str(&good).unwrap();
+        v["version"] = json!(99);
+        std::fs::write(&h.path, v.to_string()).unwrap();
+        assert!(load_history(&h).unwrap_err().contains("version"));
+
+        let mut v: Value = serde_json::from_str(&good).unwrap();
+        v["messages"] = json!([{"role": "user"}]);
+        std::fs::write(&h.path, v.to_string()).unwrap();
+        assert!(load_history(&h).unwrap_err().contains("corrupt"));
+
+        let mut v: Value = serde_json::from_str(&good).unwrap();
+        v["cwd"] = json!("/work/b");
+        std::fs::write(&h.path, v.to_string()).unwrap();
+        assert!(load_history(&h).unwrap_err().contains("another directory"));
+        // the bad file is left in place, not overwritten by loading
+        assert!(
+            std::fs::read_to_string(&h.path)
+                .unwrap()
+                .contains("/work/b")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remote_turn_records_exchange_and_persists() {
+        let dir = tmp("remote");
+        let h = history_for(&dir, Path::new("/work/a"));
+        let cfg = Cfg {
+            temperature: None,
+            max_tokens: None,
+            quiet: true,
+            frontier: Some("fake".into()),
+            route: Route::Remote,
+            api: Api::Chat,
+            base: String::new(),
+            key: String::new(),
+            model: None,
+            yes: false,
+            history: Some(h.clone()),
+            strict_save: false,
+        };
+        let mut msgs = fresh_history();
+        let r = remote_turn(&cfg, &mut msgs, "do it", |f, t| {
+            assert_eq!((f, t), ("fake", "do it"));
+            Some("done".into())
+        });
+        assert_eq!(r, Some(Ok("done".to_string())));
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1], json!({"role": "user", "content": "do it"}));
+        assert_eq!(msgs[2], json!({"role": "assistant", "content": "done"}));
+        assert_eq!(load_history(&h).unwrap(), msgs);
+        // a failed forward records nothing, so the local loop starts clean
+        assert!(remote_turn(&cfg, &mut msgs, "x", |_, _| None).is_none());
+        assert_eq!(msgs.len(), 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cwds_use_separate_files_and_save_leaves_no_temp() {
+        let dir = tmp("sep");
+        let a = history_for(&dir, Path::new("/work/a"));
+        let b = history_for(&dir, Path::new("/work/b"));
+        assert_eq!(a.cwd, "/work/a");
+        assert_eq!(
+            a.path,
+            dir.join(format!("history-{:016x}.json", fnv1a("/work/a")))
+        );
+        assert_ne!(a.path, b.path);
+        save_history(&a, &sample()).unwrap();
+        save_history(&a, &sample()).unwrap();
+        assert_eq!(load_history(&b).unwrap().len(), 1);
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(names.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_utf8_cwds_keep_separate_histories_and_sessions() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tmp("invalid-utf8");
+        let a = PathBuf::from(OsString::from_vec(b"/work/\xff".to_vec()));
+        let b = PathBuf::from(OsString::from_vec(b"/work/\xfe".to_vec()));
+        let valid_replacement = PathBuf::from("/work/\u{fffd}");
+        assert_eq!(a.to_string_lossy(), b.to_string_lossy());
+        assert_eq!(a.to_string_lossy(), valid_replacement.to_string_lossy());
+
+        let ha = history_for(&dir, &a);
+        let hb = history_for(&dir, &b);
+        let hv = history_for(&dir, &valid_replacement);
+        assert_ne!(ha.cwd, hb.cwd);
+        assert_ne!(ha.cwd, hv.cwd);
+        assert_ne!(ha.path, hb.path);
+        assert_ne!(ha.path, hv.path);
+        save_history(&ha, &sample()).unwrap();
+        assert_eq!(load_history(&hb).unwrap(), fresh_history());
+
+        let (id, _, _) = open_session(&dir, &a, None).unwrap();
+        let err = open_session(&dir, &b, Some(&id)).unwrap_err();
+        assert!(err.contains("another directory"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_id_validation() {
+        for ok in ["a", "A-z_9", &"x".repeat(64), &new_session_id().unwrap()] {
+            assert!(valid_session_id(ok), "{ok}");
+        }
+        for bad in ["", "..", "a/b", "a\\b", "a.b", "a b", "é", &"x".repeat(65)] {
+            assert!(!valid_session_id(bad), "{bad}");
+        }
+        let (a, b) = (new_session_id().unwrap(), new_session_id().unwrap());
+        assert_ne!(a, b);
+        assert!(a.len() == 32 && a.bytes().all(|c| c.is_ascii_hexdigit()));
+        let dir = tmp("badid");
+        let e = open_session(&dir, Path::new("/w"), Some("../x")).unwrap_err();
+        assert!(e.contains("invalid"));
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn session_new_then_reopen() {
+        let dir = tmp("sess");
+        let cwd = Path::new("/work/a");
+        let (id, h, mut m) = open_session(&dir, cwd, None).unwrap();
+        assert!(h.path.ends_with(format!("session-{id}.json")));
+        assert_eq!(m.len(), 1);
+        m.push(json!({"role": "user", "content": "hi"}));
+        save_history(&h, &m).unwrap();
+        let (id2, _, m2) = open_session(&dir, cwd, Some(&id)).unwrap();
+        assert_eq!(id2, id);
+        assert_eq!(m2, m);
+        // a second call without an ID is independent
+        let (other, _, m3) = open_session(&dir, cwd, None).unwrap();
+        assert_ne!(other, id);
+        assert_eq!(m3.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_unknown_mismatch_and_malformed() {
+        let dir = tmp("sesserr");
+        let cwd = Path::new("/work/a");
+        let e = open_session(&dir, cwd, Some("nope")).unwrap_err();
+        assert!(e.contains("unknown session_id"));
+        let (id, h, _) = open_session(&dir, cwd, None).unwrap();
+        let e = open_session(&dir, Path::new("/work/b"), Some(&id)).unwrap_err();
+        assert!(e.contains("another directory"));
+        std::fs::write(&h.path, r#"{"version":1,"cwd":"/work/a","messages":[1]}"#).unwrap();
+        let e = open_session(&dir, cwd, Some(&id)).unwrap_err();
+        assert!(e.contains("corrupt"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delegate_errors_return_no_id() {
+        let cfg = Cfg {
+            temperature: None,
+            max_tokens: None,
+            quiet: true,
+            frontier: None,
+            route: Route::Off,
+            api: Api::Chat,
+            base: String::new(),
+            key: String::new(),
+            model: None,
+            yes: true,
+            history: None,
+            strict_save: false,
+        };
+        let dir = tmp("deleg");
+        let state = Ok(dir.clone());
+        let start = Ok(std::env::temp_dir());
+        let call = |a: Value| delegate(&cfg, &start, &state, &a);
+        let r = call(json!({"task": "x", "cwd": "/no/such/dir"}));
+        assert!(r.1 && r.2.is_none() && r.0.contains("cwd"));
+        let r = call(json!({"task": "x", "cwd": "revex-no-such-dir"}));
+        assert!(r.1 && r.2.is_none());
+        assert!(
+            r.0.contains(
+                &start
+                    .as_ref()
+                    .unwrap()
+                    .join("revex-no-such-dir")
+                    .display()
+                    .to_string()
+            )
+        );
+        let r = call(json!({"task": "x", "cwd": 5}));
+        assert!(r.1 && r.2.is_none());
+        let r = call(json!({"task": "x", "session_id": "nope"}));
+        assert!(r.1 && r.2.is_none() && r.0.contains("unknown session_id"));
+        assert!(!dir.exists());
     }
 }

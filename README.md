@@ -73,10 +73,11 @@ that caches the prompt prefix can reuse it between steps.
 ### What it deliberately does not do
 
 - **No sandbox.** Commands run with your user's permissions.
-- **No context management.** The history grows until the model's window is full;
-  there is no summarization or compaction.
-- **No planning, sub-agents or memory.** It is one model in one loop.
-- **No native tool calling or vision.** Only text over `/chat/completions`.
+- **No context management.** The saved history grows
+  until the model's window is full; there is no summarization or compaction.
+- **No planning or sub-agents.** It is one model in one loop. Saved conversation
+  history is available in interactive and MCP sessions.
+- **No native tool calling or vision.** Only text over Chat Completions or the Responses API.
 - **No retries or backoff** beyond ignoring a stray `>>`-only reply.
 
 If you need those, use a full harness. `revex` trades them for a prompt you can
@@ -162,7 +163,7 @@ In the interactive mode these slash commands are available:
 | Command | Effect |
 | --- | --- |
 | `/help` | List the commands |
-| `/clear` | Drop the conversation history |
+| `/clear` | Drop the conversation history, including the saved copy |
 | `/model [ID]` | Show the current model and the server's list, or switch |
 | `/route [off\|auto\|local\|remote]` | Show or switch the forwarding mode |
 | `/status` | Show the active settings |
@@ -171,6 +172,31 @@ In the interactive mode these slash commands are available:
 `/model` and `/route` save the choice: to `./.revex` if it exists, otherwise to
 `~/.revex`. When writing a project file, keys that a project file may not set are
 dropped. If the matching environment variable is set, it still wins on the next start.
+
+#### Saved history
+
+The interactive mode (no arguments, terminal on stdin) keeps its conversation across
+restarts, one history per canonical working directory. It is stored as versioned JSON in
+`$XDG_STATE_HOME/revex/`, or `~/.local/state/revex/` if that is unset. (`~/.revex` is the
+settings file and is not used.) The file is rewritten atomically (temp file and rename)
+after every message, including partial progress when a request fails. A save failure
+stops the current request and exits interactive mode. On start the
+messages are reloaded, tool outputs included, and the stored system prompt is replaced by
+the current one. `/clear` rewrites the saved file as empty.
+
+The directory is created `0700` and the file `0600` on Unix. The history holds your
+prompts and everything tools printed, so it may contain secrets from files or commands.
+`REVEX_API_KEY` is never written by revex itself, but a tool output that shows it would be.
+Forwarded exchanges (the task and the remote answer) are saved too, and later local
+turns see them. Forwarding still passes only the current task to the remote command.
+If the history directory cannot be determined (no absolute
+`XDG_STATE_HOME` or `HOME`), interactive mode exits with an error rather than running
+without persistence. Two interactive sessions in the same directory are not coordinated:
+the last one to write wins. If the file is corrupt, has an unknown version or belongs to another directory, revex
+exits with an error and leaves it untouched; fix or delete it to continue. If `/clear`
+cannot save, it keeps the current in-memory conversation. One-shot,
+piped runs do not read or write this history. `--mcp` keeps separate sessions; see
+[Use from Claude Code or Codex](#use-from-claude-code-or-codex).
 
 Without `--yes`, every shell command and file write asks for confirmation first.
 `--mcp` implies `--yes`, because an MCP call has no terminal to ask on.
@@ -255,9 +281,35 @@ codex mcp add revex \
   -- revex --mcp
 ```
 
-`delegate` takes `task` (required) and `cwd`. It returns the final answer. If the
-provider refuses, the result has `isError: true`, so the caller can decide what to
-do next.
+`delegate` takes `task` (required), `cwd` and `session_id`. It returns the final answer
+as text. If the provider refuses, the result has `isError: true`, so the caller can
+decide what to do next.
+
+`cwd` defaults to the directory the server started in, not the previous call's. A `cwd`
+that cannot be entered is an error; the task is not run elsewhere. Relative `cwd` paths
+are resolved from the server's startup directory.
+
+#### Continuing a session
+
+Every call is a session, saved after each message in the same private state directory as
+the interactive history, as `session-<id>.json`. Without `session_id`, a new session with
+a fresh ID is created, so such calls stay independent. The ID is returned in the result's
+`structuredContent`:
+
+```json
+{"content": [{"type": "text", "text": "..."}], "isError": false,
+ "structuredContent": {"session_id": "0123456789abcdef0123456789abcdef"}}
+```
+
+Pass it as `session_id` in a later call to continue with the earlier messages, tool
+outputs included. Repeat `cwd` on every call if the session used a non-default directory.
+The ID must be 1-64 characters of `A-Z a-z 0-9 - _`. An unknown ID is
+an error, never a new session, and so is a session started in a different (canonical)
+`cwd` or whose file is corrupt. If saving fails, the call returns `isError: true` with
+the failure and no `session_id`, since persistence is not guaranteed. A task that fails
+for another reason still returns its ID if the session was saved. Concurrent calls on
+one session are not coordinated. Revex never deletes session files, and they may hold
+secrets from tool output.
 
 ### Provider-specific request fields
 
