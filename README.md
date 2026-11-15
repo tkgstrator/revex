@@ -4,7 +4,7 @@ A minimal coding and reverse-engineering agent harness for local LLMs, written i
 
 Most agent harnesses spend thousands of tokens on a system prompt and tool JSON
 schemas before the first user message. On a local model that cost is paid in prefill
-time and context window. `revex` keeps the whole prompt to roughly 200 tokens and
+time and context window. `revex` keeps the whole prompt to roughly 250 tokens and
 skips tool schemas entirely: the model calls tools by writing one-line commands.
 
 - Single binary of about 1.3 MB, two dependencies (`ureq`, `serde_json`)
@@ -63,7 +63,7 @@ that caches the prompt prefix can reuse it between steps.
 | Choice                                              | Why                                                                                                                                               |
 | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Four one-line commands instead of JSON tool schemas | The schemas cost nothing, and small models write a plain line more reliably than a nested JSON call.                                              |
-| System prompt of about 600 characters               | Keeps prefill short and leaves the context window for the actual work.                                                                            |
+| System prompt of about 900 characters               | Keeps prefill short and leaves the context window for the actual work.                                                                            |
 | Everything else goes through `sh`                   | No dedicated wrappers to maintain; any installed tool is available.                                                                               |
 | Tool output cut at 2000 bytes                       | Disassembly and logs are the fastest way to fill a small context. The model is told how many bytes were omitted and can ask for a narrower range. |
 | Unknown verbs run as shell commands                 | Small models often write `>> cat file`. Treating it as `sh` is more useful than failing.                                                          |
