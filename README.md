@@ -103,7 +103,7 @@ All configuration is through environment variables.
 
 | Variable         | Required | Description                                                                                                            |
 | ---------------- | -------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `REVEX_BASE_URL` | yes      | Base URL of the OpenAI-compatible API, including `/v1`                                                                 |
+| `REVEX_BASE_URL` | yes      | Base URL of the OpenAI-compatible API, including `/v1`. Can also be `base_url` in `~/.revex`                                                                 |
 | `REVEX_API`      | no       | `chat` (default, `/chat/completions`) or `responses` (`/responses`)                                                    |
 | `REVEX_MODEL`    | no       | Model ID. If unset, the first model from `/models` is used; if that fails, the field is omitted and the server decides |
 | `REVEX_API_KEY`  | no       | Sent as `Authorization: Bearer <key>`                                                                                  |
@@ -122,6 +122,25 @@ export REVEX_MODEL=your-model-id
 export REVEX_API_KEY=your-key
 ```
 
+### Settings files
+
+Settings can also live in a JSON file. `~/.revex` and the `.revex` in the current
+directory are both read and merged key by key, and the project file wins.
+Environment variables beat both.
+
+```json
+{ "model": "your-model-id", "route": "auto", "api": "chat" }
+```
+
+| Key | Allowed in `./.revex` | Environment variable |
+| --- | --- | --- |
+| `model`, `route`, `api` | yes | `REVEX_MODEL`, `REVEX_ROUTE`, `REVEX_API` |
+| `frontier`, `base_url` | no, `~/.revex` only | `REVEX_FRONTIER`, `REVEX_BASE_URL` |
+
+`frontier` runs a command and `base_url` receives your API key, so a repository you
+cloned cannot set either; they are ignored with a warning. The API key is never read
+from or written to a file.
+
 ## Usage
 
 ```sh
@@ -137,6 +156,21 @@ revex
 # MCP server over stdio
 revex --mcp
 ```
+
+In the interactive mode these slash commands are available:
+
+| Command | Effect |
+| --- | --- |
+| `/help` | List the commands |
+| `/clear` | Drop the conversation history |
+| `/model [ID]` | Show the current model and the server's list, or switch |
+| `/route [off\|auto\|local\|remote]` | Show or switch the forwarding mode |
+| `/status` | Show the active settings |
+| `/exit` | Quit |
+
+`/model` and `/route` save the choice: to `./.revex` if it exists, otherwise to
+`~/.revex`. When writing a project file, keys that a project file may not set are
+dropped. If the matching environment variable is set, it still wins on the next start.
 
 Without `--yes`, every shell command and file write asks for confirmation first.
 `--mcp` implies `--yes`, because an MCP call has no terminal to ask on.

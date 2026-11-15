@@ -1,5 +1,6 @@
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::io::{BufRead, Read};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SYSTEM: &str = "You are a terse coding and reverse-engineering agent. To act, output lines starting with `>> `; results come back in <out>. One action per line, then stop.\n\
@@ -51,15 +52,27 @@ fn truncate(s: String) -> String {
 }
 
 /// First model the server lists, used when `REVEX_MODEL` is unset.
-fn default_model(base: &str, key: &str) -> Option<String> {
+fn list_models(base: &str, key: &str) -> Vec<String> {
     let text = ureq::get(&format!("{base}/models"))
         .set("Authorization", &format!("Bearer {key}"))
         .call()
-        .ok()?
-        .into_string()
-        .ok()?;
-    let v: Value = serde_json::from_str(&text).ok()?;
-    v["data"][0]["id"].as_str().map(String::from)
+        .ok()
+        .and_then(|r| r.into_string().ok());
+    let v: Value = text
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null);
+    v["data"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m["id"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn default_model(base: &str, key: &str) -> Option<String> {
+    list_models(base, key).into_iter().next()
 }
 
 fn chat(cfg: &Cfg, msgs: &[Value]) -> Result<String, String> {
@@ -424,36 +437,234 @@ fn mcp(cfg: &Cfg) {
     }
 }
 
-fn main() {
-    let need = |k: &str| {
-        std::env::var(k).unwrap_or_else(|_| {
-            eprintln!("error: {k} is not set");
-            std::process::exit(2);
-        })
+/// Keys a project-local `.revex` may set. `frontier` runs a command and `base_url`
+/// receives the API key, so a cloned repository must not control either.
+const PROJECT_KEYS: [&str; 3] = ["model", "route", "api"];
+
+fn die(msg: &str) -> ! {
+    eprintln!("error: {msg}");
+    std::process::exit(2);
+}
+
+fn parse_api(s: &str) -> Option<Api> {
+    match s {
+        "chat" => Some(Api::Chat),
+        "responses" => Some(Api::Responses),
+        _ => None,
+    }
+}
+
+fn parse_route(s: &str) -> Option<Route> {
+    match s {
+        "off" => Some(Route::Off),
+        "auto" => Some(Route::Auto),
+        "local" => Some(Route::Local),
+        "remote" => Some(Route::Remote),
+        _ => None,
+    }
+}
+
+fn route_name(r: Route) -> &'static str {
+    match r {
+        Route::Off => "off",
+        Route::Auto => "auto",
+        Route::Local => "local",
+        Route::Remote => "remote",
+    }
+}
+
+fn home_file() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".revex"))
+}
+
+/// A missing file is empty settings; an unreadable or invalid one is an error.
+fn read_settings(path: &Path) -> Result<Map<String, Value>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
     };
-    let api = match std::env::var("REVEX_API").as_deref() {
-        Err(_) | Ok("chat") => Api::Chat,
-        Ok("responses") => Api::Responses,
-        Ok(o) => {
-            eprintln!("error: REVEX_API must be `chat` or `responses`, got `{o}`");
-            std::process::exit(2);
+    match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(m)) => Ok(m),
+        _ => Err(format!("{}: not a JSON object", path.display())),
+    }
+}
+
+/// `~/.revex` merged with `./.revex`; the project file wins key by key.
+fn load_settings() -> Map<String, Value> {
+    let home = home_file();
+    let mut m = Map::new();
+    if let Some(h) = &home {
+        match read_settings(h) {
+            Ok(v) => m = v,
+            Err(e) => eprintln!("warning: {e}; ignored"),
         }
+    }
+    let project = Path::new(".revex");
+    let same = home
+        .as_ref()
+        .and_then(|h| Some(std::fs::canonicalize(h).ok()? == std::fs::canonicalize(project).ok()?))
+        .unwrap_or(false);
+    if !same {
+        match read_settings(project) {
+            Ok(v) => {
+                for (k, val) in v {
+                    if PROJECT_KEYS.contains(&k.as_str()) {
+                        m.insert(k, val);
+                    } else {
+                        eprintln!(
+                            "warning: ./.revex: `{k}` is not allowed in a project file; ignored"
+                        );
+                    }
+                }
+            }
+            Err(e) => eprintln!("warning: {e}; ignored"),
+        }
+    }
+    m
+}
+
+/// Environment first, then the merged settings file.
+fn setting(file: &Map<String, Value>, key: &str, env: &str) -> Option<String> {
+    std::env::var(env)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| file.get(key).and_then(|v| v.as_str()).map(String::from))
+}
+
+/// Write to `./.revex` if it exists, otherwise to `~/.revex`.
+fn save_setting(key: &str, value: &str) -> Result<PathBuf, String> {
+    let path = if Path::new(".revex").exists() {
+        PathBuf::from(".revex")
+    } else {
+        home_file().ok_or("HOME is not set")?
+    };
+    let mut m = read_settings(&path)?;
+    if path == Path::new(".revex") {
+        // Drop the keys a project file may not set instead of writing them back.
+        m.retain(|k, _| PROJECT_KEYS.contains(&k.as_str()));
+    }
+    m.insert(key.into(), Value::String(value.into()));
+    let text = serde_json::to_string_pretty(&Value::Object(m)).map_err(|e| e.to_string())?;
+    std::fs::write(&path, text + "\n").map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
+enum Cmd {
+    No,
+    Done,
+    Exit,
+}
+
+const HELP: &str = "/help  /clear  /model [ID]  /route [off|auto|local|remote]  /status  /exit";
+
+fn saved(key: &str, env: &str, value: &str) {
+    match save_setting(key, value) {
+        Ok(p) => eprintln!("{key} = {value} (saved to {})", p.display()),
+        Err(e) => eprintln!("{key} = {value} (not saved: {e})"),
+    }
+    if std::env::var_os(env).is_some() {
+        eprintln!("note: {env} is set and overrides the saved value on the next start");
+    }
+}
+
+fn command(cfg: &mut Cfg, msgs: &mut Vec<Value>, line: &str) -> Cmd {
+    let Some(rest) = line.strip_prefix('/') else {
+        return Cmd::No;
+    };
+    let (name, arg) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let arg = arg.trim();
+    match name {
+        "help" => eprintln!("{HELP}"),
+        "exit" | "quit" => return Cmd::Exit,
+        "clear" => {
+            msgs.truncate(1);
+            eprintln!("history cleared");
+        }
+        "model" if arg.is_empty() => {
+            let cur = cfg.model.clone().unwrap_or_default();
+            eprintln!(
+                "model: {}",
+                if cur.is_empty() {
+                    "(server default)"
+                } else {
+                    &cur
+                }
+            );
+            for m in list_models(&cfg.base, &cfg.key) {
+                eprintln!("  {} {m}", if m == cur { "*" } else { " " });
+            }
+        }
+        "model" => {
+            let known = list_models(&cfg.base, &cfg.key);
+            if !known.is_empty() && !known.iter().any(|m| m == arg) {
+                eprintln!("`{arg}` is not in /models; try `/model` to list them");
+            } else {
+                cfg.model = Some(arg.to_string());
+                saved("model", "REVEX_MODEL", arg);
+            }
+        }
+        "route" if arg.is_empty() => eprintln!("route: {}", route_name(cfg.route)),
+        "route" => match parse_route(arg) {
+            Some(r) => {
+                cfg.route = r;
+                saved("route", "REVEX_ROUTE", arg);
+            }
+            None => eprintln!("route must be off, auto, local or remote"),
+        },
+        "status" => {
+            eprintln!(
+                "api:      {}",
+                if cfg.api == Api::Chat {
+                    "chat"
+                } else {
+                    "responses"
+                }
+            );
+            eprintln!("base:     {}", cfg.base);
+            eprintln!(
+                "model:    {}",
+                cfg.model.as_deref().unwrap_or("(server default)")
+            );
+            eprintln!("route:    {}", route_name(cfg.route));
+            eprintln!("frontier: {}", cfg.frontier.as_deref().unwrap_or("(none)"));
+            eprintln!(
+                "api key:  {}",
+                if cfg.key.is_empty() { "not set" } else { "set" }
+            );
+        }
+        _ => eprintln!("unknown command `/{name}`; {HELP}"),
+    }
+    Cmd::Done
+}
+
+fn main() {
+    let file = load_settings();
+    let get = |key: &str, env: &str| setting(&file, key, env);
+    let api = match get("api", "REVEX_API") {
+        None => Api::Chat,
+        Some(v) => parse_api(&v)
+            .unwrap_or_else(|| die(&format!("api must be `chat` or `responses`, got `{v}`"))),
+    };
+    let route = match get("route", "REVEX_ROUTE") {
+        None => Route::Off,
+        Some(v) => parse_route(&v).unwrap_or_else(|| {
+            die(&format!(
+                "route must be off, auto, local or remote, got `{v}`"
+            ))
+        }),
     };
     let mut cfg = Cfg {
         temperature: None,
         max_tokens: None,
         quiet: false,
-        frontier: std::env::var("REVEX_FRONTIER")
-            .ok()
-            .filter(|f| !f.trim().is_empty()),
-        route: match std::env::var("REVEX_ROUTE").as_deref() {
-            Ok("auto") => Route::Auto,
-            _ => Route::Off,
-        },
+        frontier: get("frontier", "REVEX_FRONTIER"),
+        route,
         api,
-        base: need("REVEX_BASE_URL"),
+        base: get("base_url", "REVEX_BASE_URL")
+            .unwrap_or_else(|| die("REVEX_BASE_URL is not set (or `base_url` in ~/.revex)")),
         key: std::env::var("REVEX_API_KEY").unwrap_or_default(),
-        model: std::env::var("REVEX_MODEL").ok(),
+        model: get("model", "REVEX_MODEL"),
         yes: false,
     };
     if cfg.model.is_none() {
@@ -502,10 +713,16 @@ fn main() {
         if std::io::stdin().read_line(&mut s).unwrap_or(0) == 0 {
             break;
         }
-        if s.trim().is_empty() {
+        let line = s.trim();
+        if line.is_empty() {
             continue;
         }
-        if let Err(e) = agent(&cfg, &mut msgs, s.trim()) {
+        match command(&mut cfg, &mut msgs, line) {
+            Cmd::Exit => break,
+            Cmd::Done => continue,
+            Cmd::No => {}
+        }
+        if let Err(e) = agent(&cfg, &mut msgs, line) {
             eprintln!("error: {e}");
         }
     }
