@@ -12,12 +12,26 @@ Rules: inspect before editing; keep output small (use head, grep, ranges); when 
 const MAX_OUT: usize = 2000;
 
 #[derive(Clone, Copy, PartialEq)]
+enum Route {
+    Off,
+    Auto,
+    Local,
+    Remote,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum Api {
     Chat,
     Responses,
 }
 
+#[derive(Clone)]
 struct Cfg {
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
+    quiet: bool,
+    frontier: Option<String>,
+    route: Route,
     api: Api,
     base: String,
     key: String,
@@ -71,6 +85,15 @@ fn chat(cfg: &Cfg, msgs: &[Value]) -> Result<String, String> {
             ("responses", b)
         }
     };
+    if let Some(t) = cfg.temperature {
+        body["temperature"] = t.into();
+    }
+    if let Some(n) = cfg.max_tokens {
+        match cfg.api {
+            Api::Chat => body["max_tokens"] = n.into(),
+            Api::Responses => body["max_output_tokens"] = n.into(),
+        }
+    }
     // If no model could be found, let the server pick its own default.
     if cfg.model.is_none() {
         body.as_object_mut().map(|o| o.remove("model"));
@@ -135,7 +158,9 @@ fn chat(cfg: &Cfg, msgs: &[Value]) -> Result<String, String> {
             },
         };
         if let Some(t) = delta {
-            eprint!("{t}");
+            if !cfg.quiet {
+                eprint!("{t}");
+            }
             full.push_str(t);
             // The Responses API has no `stop`, so cut at the marker here.
             if cfg.api == Api::Responses
@@ -146,7 +171,9 @@ fn chat(cfg: &Cfg, msgs: &[Value]) -> Result<String, String> {
             }
         }
     }
-    eprintln!();
+    if !cfg.quiet {
+        eprintln!();
+    }
     Ok(full)
 }
 
@@ -270,7 +297,63 @@ fn run(cfg: &Cfg, c: &Call) -> String {
     truncate(out)
 }
 
+const ROUTER: &str = "Decide who should handle the user's task. Reply with exactly one letter.\n\
+F = general software work any hosted coding assistant would normally accept.\n\
+L = reverse engineering of binaries, exploit or malware analysis, or anything a hosted assistant might refuse or hedge on.\n\
+If unsure, answer L.";
+
+/// Ask the local model for one letter: true means forward to the frontier command.
+fn route(cfg: &Cfg, task: &str) -> bool {
+    let msgs = [
+        json!({"role": "system", "content": ROUTER}),
+        json!({"role": "user", "content": task}),
+    ];
+    let mut quick = Cfg {
+        max_tokens: Some(4),
+        temperature: Some(0.0),
+        ..cfg.clone()
+    };
+    quick.quiet = true;
+    chat(&quick, &msgs).is_ok_and(|r| r.trim_start().starts_with('F'))
+}
+
+/// Run the frontier command with the task as its last argument.
+/// Returns None when it cannot be used, so the caller falls back to the local loop.
+fn forward(frontier: &str, task: &str) -> Option<String> {
+    let mut parts = frontier.split_whitespace();
+    let out = Command::new(parts.next()?)
+        .args(parts)
+        .arg(task)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| eprintln!("frontier: cannot start ({e}); handling locally"))
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || text.is_empty() {
+        eprintln!("frontier: failed (status {}); handling locally", out.status);
+        return None;
+    }
+    // `claude -p --output-format json` reports refusals in `stop_reason`.
+    if let Ok(v) = serde_json::from_str::<Value>(&text) {
+        if v["stop_reason"] == "refusal" || v["is_error"] == true {
+            eprintln!("frontier: refused; handling locally");
+            return None;
+        }
+        if let Some(r) = v["result"].as_str() {
+            return Some(r.to_string());
+        }
+    }
+    Some(text)
+}
+
 fn agent(cfg: &Cfg, msgs: &mut Vec<Value>, task: &str) -> Result<String, String> {
+    if let Some(f) = &cfg.frontier
+        && matches!(cfg.route, Route::Auto | Route::Remote)
+        && (cfg.route == Route::Remote || route(cfg, task))
+        && let Some(r) = forward(f, task)
+    {
+        return Ok(r);
+    }
     msgs.push(json!({"role": "user", "content": task}));
     for _ in 0..30 {
         let reply = chat(cfg, msgs)?;
@@ -357,6 +440,16 @@ fn main() {
         }
     };
     let mut cfg = Cfg {
+        temperature: None,
+        max_tokens: None,
+        quiet: false,
+        frontier: std::env::var("REVEX_FRONTIER")
+            .ok()
+            .filter(|f| !f.trim().is_empty()),
+        route: match std::env::var("REVEX_ROUTE").as_deref() {
+            Ok("auto") => Route::Auto,
+            _ => Route::Off,
+        },
         api,
         base: need("REVEX_BASE_URL"),
         key: std::env::var("REVEX_API_KEY").unwrap_or_default(),
@@ -370,6 +463,8 @@ fn main() {
     for a in std::env::args().skip(1) {
         match a.as_str() {
             "--yes" | "-y" => cfg.yes = true,
+            "--local" => cfg.route = Route::Local,
+            "--remote" => cfg.route = Route::Remote,
             "--mcp" => {
                 cfg.yes = true;
                 mcp(&cfg);
