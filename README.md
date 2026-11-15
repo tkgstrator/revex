@@ -22,11 +22,15 @@ Code or Codex and take over the part of the work that suits a local model.
 
 Typical jobs to hand over:
 
-- Reverse engineering and binary analysis with `objdump`, `otool`, `radare2` or `lldb`
-- Security research and tooling on software you are authorized to analyze, where a
-  hosted model may decline or hedge
-- Long, repetitive tasks that you do not want to pay for per token or send off your
-  machine
+- Working out how a feature is implemented in a binary or application you have no
+  source for, using `objdump`, `otool`, `radare2` or `lldb`
+- Documenting a file format or protocol, and reimplementing it for interoperability
+- Comparing two builds of the same program to find what changed
+- Long, repetitive analysis that you do not want to pay for per token or send off
+  your machine
+
+`revex` is for understanding software, not for scanning it for vulnerabilities or
+exploiting it. Use it only on software you own or are authorized to analyze.
 
 Running every step on a local model is slow, so the intended split is: the hosted
 agent plans and reviews, and `revex` does the targeted work through the `delegate`
