@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{BufRead, Read};
 use std::process::Command;
 
@@ -34,7 +34,10 @@ fn chat(cfg: &Cfg, msgs: &[Value]) -> Result<String, String> {
         "model": cfg.model, "messages": msgs, "stream": true,
         "stop": ["<out>"], "cache_prompt": true
     });
-    if let Some(Ok(Value::Object(extra))) = std::env::var("REVEX_EXTRA").ok().map(|e| serde_json::from_str::<Value>(&e)) {
+    if let Some(Ok(Value::Object(extra))) = std::env::var("REVEX_EXTRA")
+        .ok()
+        .map(|e| serde_json::from_str::<Value>(&e))
+    {
         for (k, v) in extra {
             body[k] = v;
         }
@@ -50,12 +53,18 @@ fn chat(cfg: &Cfg, msgs: &[Value]) -> Result<String, String> {
         if std::env::var_os("REVEX_DEBUG").is_some() {
             eprintln!("[raw] {line}");
         }
-        let Some(data) = line.strip_prefix("data: ") else { continue };
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
         if data == "[DONE]" {
             break;
         }
-        let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
-        if v["choices"][0]["finish_reason"] == "content_filter" || v["choices"][0]["delta"]["refusal"].is_string() {
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        if v["choices"][0]["finish_reason"] == "content_filter"
+            || v["choices"][0]["delta"]["refusal"].is_string()
+        {
             return Err("refused by model/provider (content_filter)".into());
         }
         if let Some(t) = v["choices"][0]["delta"]["content"].as_str() {
@@ -78,7 +87,9 @@ fn parse(reply: &str) -> Vec<Call> {
     let mut calls = vec![];
     let mut lines = reply.lines();
     while let Some(l) = lines.next() {
-        let Some(cmd) = l.trim_start().strip_prefix(">> ") else { continue };
+        let Some(cmd) = l.trim_start().strip_prefix(">> ") else {
+            continue;
+        };
         let (verb, rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
         match verb {
             "read" => {
@@ -101,7 +112,11 @@ fn parse(reply: &str) -> Vec<Call> {
                     body.push(b);
                 }
                 let body = body.join("\n");
-                calls.push(if verb == "write" { Call::Write(path, body) } else { Call::Replace(path, body) });
+                calls.push(if verb == "write" {
+                    Call::Write(path, body)
+                } else {
+                    Call::Replace(path, body)
+                });
             }
             _ => calls.push(Call::Sh(cmd.to_string())),
         }
@@ -124,8 +139,13 @@ fn run(cfg: &Cfg, c: &Call) -> String {
         Call::Read(p, range) => match std::fs::read_to_string(p) {
             Ok(t) => {
                 let (a, b) = range.unwrap_or((1, usize::MAX));
-                t.lines().enumerate().skip(a.saturating_sub(1)).take(b.saturating_sub(a) + 1)
-                    .map(|(i, l)| format!("{}\t{}", i + 1, l)).collect::<Vec<_>>().join("\n")
+                t.lines()
+                    .enumerate()
+                    .skip(a.saturating_sub(1))
+                    .take(b.saturating_sub(a) + 1)
+                    .map(|(i, l)| format!("{}\t{}", i + 1, l))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             }
             Err(e) => format!("error: {e}"),
         },
@@ -134,7 +154,11 @@ fn run(cfg: &Cfg, c: &Call) -> String {
                 return "denied".into();
             }
             match Command::new("sh").arg("-c").arg(cmd).output() {
-                Ok(o) => format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)),
+                Ok(o) => format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
                 Err(e) => format!("error: {e}"),
             }
         }
@@ -161,7 +185,10 @@ fn run(cfg: &Cfg, c: &Call) -> String {
                         Err(e) => format!("error: {e}"),
                     }
                 }
-                Ok(t) => format!("error: old text matched {} times (need 1)", t.matches(old).count()),
+                Ok(t) => format!(
+                    "error: old text matched {} times (need 1)",
+                    t.matches(old).count()
+                ),
                 Err(e) => format!("error: {e}"),
             }
         }
@@ -182,7 +209,9 @@ fn agent(cfg: &Cfg, msgs: &mut Vec<Value>, task: &str) -> Result<String, String>
             return Ok(reply.trim().to_string());
         }
         let outs: Vec<String> = calls.iter().map(|c| run(cfg, c)).collect();
-        msgs.push(json!({"role": "user", "content": format!("<out>\n{}\n</out>", outs.join("\n---\n"))}));
+        msgs.push(
+            json!({"role": "user", "content": format!("<out>\n{}\n</out>", outs.join("\n---\n"))}),
+        );
     }
     Err("step limit reached".into())
 }
@@ -191,14 +220,20 @@ fn mcp(cfg: &Cfg) {
     let reply = |id: Value, r: Result<Value, (i64, &str)>| {
         let m = match r {
             Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-            Err((code, msg)) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}}),
+            Err((code, msg)) => {
+                json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}})
+            }
         };
         println!("{m}");
     };
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
-        let Ok(req) = serde_json::from_str::<Value>(&line) else { continue };
-        let Some(id) = req.get("id").cloned() else { continue };
+        let Ok(req) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(id) = req.get("id").cloned() else {
+            continue;
+        };
         let r = match req["method"].as_str().unwrap_or("") {
             "initialize" => Ok(json!({
                 "protocolVersion": req["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),
