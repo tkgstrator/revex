@@ -107,6 +107,8 @@ All configuration is through environment variables.
 | `REVEX_API`      | no       | `chat` (default, `/chat/completions`) or `responses` (`/responses`)                                                    |
 | `REVEX_MODEL`    | no       | Model ID. If unset, the first model from `/models` is used; if that fails, the field is omitted and the server decides |
 | `REVEX_API_KEY`  | no       | Sent as `Authorization: Bearer <key>`                                                                                  |
+| `REVEX_FRONTIER` | no | Command that handles a task instead of the local model, for example `claude -p`. The task is appended as the last argument |
+| `REVEX_ROUTE` | no | Set to `auto` to let the local model decide per task whether to forward it. Off by default |
 | `REVEX_EXTRA`    | no       | JSON object merged into every request body                                                                             |
 | `REVEX_DEBUG`    | no       | Set to print raw SSE lines to stderr                                                                                   |
 
@@ -157,6 +159,47 @@ the answer. The loop stops after 30 steps.
 
 Because `sh` is the escape hatch, reverse-engineering tools need no dedicated
 wrappers. `objdump`, `otool`, `nm`, `strings`, `radare2` and `lldb` work as they are.
+
+## Forwarding to a hosted agent
+
+`revex` can also act as a thin gateway. When `REVEX_FRONTIER` is set, a task can be
+handed to another agent CLI and its answer returned unchanged. This is optional:
+without it, `revex` never starts another program, and Claude Code, Codex or
+OpenCode do not need to be installed.
+
+```sh
+export REVEX_FRONTIER='claude -p --output-format json'
+revex --remote "Write unit tests for src/parse.ts"   # always forward
+revex --local  "Disassemble main in ./a.out"         # never forward
+```
+
+| Mode | How | Behavior |
+| --- | --- | --- |
+| Off | default | Everything runs on the local model |
+| `--remote` | flag | Forward the task to `REVEX_FRONTIER` |
+| `--local` | flag | Run locally even if `REVEX_ROUTE=auto` |
+| Auto | `REVEX_ROUTE=auto` | The local model answers `F` (forward) or `L` (local) at temperature 0 |
+
+If the command cannot start, exits with an error, returns nothing, or reports a
+refusal, `revex` says so on stderr and handles the task locally. The task is never
+reworded or retried against the forwarded agent.
+
+The command receives the task as its last argument and must print the answer to
+stdout. Examples:
+
+| Agent | Command | Status |
+| --- | --- | --- |
+| Claude Code | `claude -p --output-format json` | Tried: the answer is read from `result`, and `stop_reason: "refusal"` is detected |
+| Codex | `codex exec --skip-git-repo-check` | Tried: the answer is printed on stdout. Refusals are detected only by a non-zero exit |
+| OpenCode | `opencode run` | Not tried |
+
+Notes:
+
+- Forwarded tasks are sent to that agent's provider and subject to its policies.
+- Each forwarded call has the cost of a full agent run. A one-line question to
+  `claude -p` used about 15k input tokens in a test.
+- Automatic routing was checked on six clear-cut tasks only. A borderline task can
+  go either way, so use `--remote` and `--local` when it matters.
 
 ## Use from Claude Code or Codex
 
