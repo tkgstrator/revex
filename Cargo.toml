@@ -6,6 +6,13 @@ edition = "2024"
 [dependencies]
 serde_json = "1.0.154"
 ureq = "2"
+libc = "0.2"
+ratatui = "0.29"
+crossterm = "0.28"
+rmcp = { version = "3.10", default-features = false, features = ["client", "reqwest", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "process"] }
+http = "1"
+jsonschema = { version = "0.61", default-features = false }
 
 [profile.release]
 opt-level = "z"

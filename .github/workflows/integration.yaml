@@ -51,6 +51,17 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
+  installer:
+    name: Installer smoke
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test installer with local release fixtures
+        run: sh tests/install_smoke.sh
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
