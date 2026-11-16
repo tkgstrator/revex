@@ -37,8 +37,13 @@ pub(crate) struct View {
     pub(crate) model: String,
     pub(crate) reasoning: Option<String>,
     pub(crate) connection: String,
+    pub(crate) context_usage: Option<String>,
+    pub(crate) compacting: bool,
+    pub(crate) approval_mode: String,
     pub(crate) transcript: Vec<String>,
     pub(crate) model_in_flight: bool,
+    pub(crate) thinking_started: Option<Instant>,
+    pub(crate) thinking_text: String,
     pub(crate) activity_tick: u64,
     pub(crate) turn_started: Option<Instant>,
     pub(crate) turn_usage_before: UsageTotal,
@@ -46,6 +51,8 @@ pub(crate) struct View {
     pub(crate) last_turn_rate: Option<f64>,
     pub(crate) input: String,
     pub(crate) cursor: usize,
+    pub(crate) slash_suggestions_open: bool,
+    pub(crate) slash_suggestion_selected: usize,
     pub(crate) scroll: usize,
     pub(crate) status: String,
     pub(crate) workspace_selected: usize,
@@ -68,7 +75,11 @@ pub(crate) struct View {
     pub(crate) setup_reasoning_manual: bool,
     pub(crate) setup_decision_model_selected: usize,
     pub(crate) setup_response_language_selected: usize,
+    pub(crate) setup_limit_values: [String; 3],
+    pub(crate) setup_limit_dirty: [bool; 3],
     pub(crate) setup_helpers: [bool; 3],
+    pub(crate) setup_approval_mode_selected: usize,
+    pub(crate) setup_approval_mode_dirty: bool,
     pub(crate) setup_helper_selected: usize,
     pub(crate) setup_helper_available: [bool; 3],
     pub(crate) setup_status: String,
@@ -87,6 +98,90 @@ const ACTIVE_BG: Color = Color::Rgb(22, 51, 63);
 const CODE_BG: Color = Color::Rgb(39, 45, 52);
 const MAX_TRANSCRIPT_LINE_CHARS: usize = 2_048;
 const MAX_CODE_TOKENS_PER_ROW: usize = 256;
+pub(crate) struct SlashCommand {
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) takes_argument: bool,
+}
+
+const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "/help",
+        description: "Show commands",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/agents",
+        description: "Show agents",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/status",
+        description: "Show status",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/config",
+        description: "Open settings",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/model",
+        description: "Choose model or enter ID",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/approval",
+        description: "Set approval mode",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/goal",
+        description: "Set or inspect a goal",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/compact",
+        description: "Summarize older context",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/steer",
+        description: "Add to active task",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/queue",
+        description: "Run after active task",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/route",
+        description: "Set helper route",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/clear",
+        description: "Clear history",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/exit",
+        description: "Exit Revex",
+        takes_argument: false,
+    },
+];
+
+pub(crate) fn slash_matches(input: &str) -> Vec<&'static SlashCommand> {
+    if !input.starts_with('/') || input.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+    let prefix = input.to_ascii_lowercase();
+    SLASH_COMMANDS
+        .iter()
+        .filter(|command| command.name.starts_with(&prefix))
+        .collect()
+}
 const ASCII_BORDER: border::Set = border::Set {
     top_left: "+",
     top_right: "+",
@@ -235,6 +330,9 @@ fn draw_footer(frame: &mut Frame, view: &View, area: Rect) {
         Page::Setup if view.setup_tab_focus => {
             "Tab/Shift+Tab or Left/Right screens  |  Enter fields  |  Ctrl+S save"
         }
+        Page::Setup if view.setup_editing && view.setup_field == 9 => {
+            "Up/Down mode  |  Enter done  |  Ctrl+S save"
+        }
         Page::Setup if view.setup_editing && view.setup_tab == 2 && area.width < 60 => {
             "Up/Down Space Enter Ctrl+S"
         }
@@ -246,6 +344,18 @@ fn draw_footer(frame: &mut Frame, view: &View, area: Rect) {
         }
         Page::Setup => "Up/Down items  |  Enter edit/select  |  Ctrl+S save  |  Esc tabs",
         Page::Chat => "Enter send  |  /agents  /status  /config  /exit",
+    };
+    let hint = if view.page == Page::Chat {
+        format!(
+            "Mode: {}  |  {hint}",
+            if view.approval_mode.is_empty() {
+                "manual"
+            } else {
+                &view.approval_mode
+            }
+        )
+    } else {
+        hint.to_owned()
     };
     let status = if view.status.is_empty() {
         "Ready"
@@ -523,6 +633,34 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
                 "    Up/Down choose response language",
                 Style::default().fg(MUTED),
             )));
+            for (index, (label, unit)) in [
+                ("Context budget", "tokens"),
+                ("Max output", "tokens"),
+                ("Request deadline", "seconds"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let field = 10 + index;
+                let prefix = label.len() + 4;
+                let (value, cursor) = field_window(
+                    &single(view, &view.setup_limit_values[index]),
+                    if view.setup_editing && view.setup_field == field {
+                        view.cursor
+                    } else {
+                        0
+                    },
+                    inner.width.saturating_sub(prefix as u16) as usize,
+                );
+                if view.setup_field == field {
+                    active_row = lines.len();
+                    editable = view.setup_editing.then_some((prefix, cursor));
+                }
+                lines.push(focused(
+                    format!("{label}: {value} {unit}"),
+                    !view.setup_tab_focus && view.setup_field == field,
+                ));
+            }
         }
         _ => {
             lines.push(Line::from(Span::styled(
@@ -549,6 +687,19 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
                         && view.setup_helper_selected == index,
                 ));
             }
+            let modes = ["Manual", "Auto", "Bypass", "Plan"];
+            let selected = view.setup_approval_mode_selected.min(modes.len() - 1);
+            if view.setup_field == 9 {
+                active_row = lines.len();
+            }
+            lines.push(focused(
+                format!("Approval mode: {}", modes[selected]),
+                !view.setup_tab_focus && view.setup_field == 9,
+            ));
+            lines.push(Line::from(Span::styled(
+                "    Manual asks; Auto checks; Bypass allows; Plan reads only",
+                Style::default().fg(MUTED),
+            )));
             if view.setup_field == 6 {
                 active_row = lines.len();
             }
@@ -1048,7 +1199,24 @@ fn helper_cost(agents: &[AgentInfo]) -> String {
     }
 }
 
+fn format_clock(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 3_600 {
+        format!("{:02}:{:02}", seconds / 60, seconds % 60)
+    } else {
+        format!(
+            "{:02}:{:02}:{:02}",
+            seconds / 3_600,
+            (seconds % 3_600) / 60,
+            seconds % 60
+        )
+    }
+}
+
 fn chat_activity(view: &View) -> Option<String> {
+    if view.compacting {
+        return Some("Compacting context...".into());
+    }
     if !view.model_in_flight {
         return None;
     }
@@ -1056,8 +1224,13 @@ fn chat_activity(view: &View) -> Option<String> {
     let status = status.trim();
     let frames = ["|", "/", "-", "\\"];
     let mut active = format!(
-        "{} Thinking",
-        frames[view.activity_tick as usize % frames.len()]
+        "{} Thinking {}",
+        frames[view.activity_tick as usize % frames.len()],
+        format_clock(
+            view.thinking_started
+                .map(|start| start.elapsed())
+                .unwrap_or_default()
+        )
     );
     let queued = status.rsplit('|').next().unwrap_or("").trim();
     if queued != "0 queued" && queued.ends_with(" queued") {
@@ -1067,6 +1240,11 @@ fn chat_activity(view: &View) -> Option<String> {
 }
 
 fn chat_footer(view: &View, agents: &[AgentInfo], width: usize) -> String {
+    let mode = (!view.approval_mode.is_empty())
+        .then(|| format!("Mode: {}", single(view, &view.approval_mode)));
+    let mode_width = mode
+        .as_ref()
+        .map_or(0, |value| Line::raw(value).width() + 3);
     let model = view.model.trim();
     let known_model = !model.is_empty() && model != "server default";
     let model = if known_model {
@@ -1087,12 +1265,13 @@ fn chat_footer(view: &View, agents: &[AgentInfo], width: usize) -> String {
         let effort_width = effort
             .as_ref()
             .map_or(0, |value| Line::raw(value).width() + 3);
-        let available = width.saturating_sub(3 + effort_width);
+        let available = width.saturating_sub(3 + effort_width + mode_width);
         let path_width = Line::raw(&cwd)
             .width()
             .min(available.saturating_sub(Line::raw(&model).width().min(16)));
         let model_width = available.saturating_sub(path_width);
         let parts = [
+            mode.unwrap_or_default(),
             clip_cells(&model, model_width),
             effort.unwrap_or_default(),
             middle_clip_cells(&cwd, path_width),
@@ -1101,7 +1280,7 @@ fn chat_footer(view: &View, agents: &[AgentInfo], width: usize) -> String {
             .into_iter()
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
-            .join(" . ");
+            .join(" | ");
     }
     let rate = view
         .last_turn_rate
@@ -1111,13 +1290,20 @@ fn chat_footer(view: &View, agents: &[AgentInfo], width: usize) -> String {
         .turn_started
         .map(|start| start.elapsed())
         .or(view.last_turn_elapsed)
-        .map(|duration| format!("{:.1}s", duration.as_secs_f64()));
+        .map(|duration| {
+            if duration.as_secs() >= 60 {
+                format_clock(duration)
+            } else {
+                format!("{:.1}s", duration.as_secs_f64())
+            }
+        });
     let time = elapsed.unwrap_or_else(|| "-".into());
     let cost = helper_cost(agents);
     let effort_width = effort
         .as_ref()
         .map_or(0, |value| Line::raw(value).width() + 3);
-    let fixed_width = effort_width
+    let fixed_width = mode_width
+        + effort_width
         + 4 * 3
         + Line::raw(&rate).width()
         + Line::raw(&time).width()
@@ -1128,12 +1314,16 @@ fn chat_footer(view: &View, agents: &[AgentInfo], width: usize) -> String {
         .width()
         .min(available.saturating_sub(model_reserve));
     let model_width = available.saturating_sub(path_width);
-    let mut parts = vec![clip_cells(&model, model_width)];
+    let mut parts = Vec::new();
+    if let Some(mode) = mode {
+        parts.push(mode);
+    }
+    parts.push(clip_cells(&model, model_width));
     if let Some(effort) = effort {
         parts.push(effort);
     }
     parts.extend([middle_clip_cells(&cwd, path_width), rate, time, cost]);
-    parts.join(" . ")
+    parts.join(" | ")
 }
 
 fn draw_chat(frame: &mut Frame, view: &View, agents: &[AgentInfo], area: Rect) {
@@ -1154,6 +1344,21 @@ fn draw_chat(frame: &mut Frame, view: &View, agents: &[AgentInfo], area: Rect) {
                 format!("* {activity}"),
                 Style::default().fg(SECONDARY),
             ));
+            if !view.thinking_text.is_empty() {
+                let mut text_rows = Vec::new();
+                for line in safe(view, &view.thinking_text).lines() {
+                    text_rows.extend(wrap_visual(
+                        line,
+                        transcript_area.width.saturating_sub(2) as usize,
+                    ));
+                }
+                for line in text_rows.iter().skip(text_rows.len().saturating_sub(4)) {
+                    lines.push(Line::styled(
+                        format!("  {line}"),
+                        Style::default().fg(SECONDARY),
+                    ));
+                }
+            }
         }
         let top_padding = (transcript_area.height as usize)
             .saturating_sub(lines.len())
@@ -1171,6 +1376,30 @@ fn draw_chat(frame: &mut Frame, view: &View, agents: &[AgentInfo], area: Rect) {
                 transcript_area.height.saturating_sub(top_padding),
             ),
         );
+    }
+
+    if view.slash_suggestions_open && view.overlay == Overlay::None {
+        let matches = slash_matches(&view.input);
+        let count = matches.len().min(transcript_area.height.min(6) as usize);
+        if count > 0 {
+            let selected = view.slash_suggestion_selected.min(matches.len() - 1);
+            let start = selected.saturating_sub(count - 1);
+            let menu_y = divider_y.saturating_sub(count as u16);
+            frame.render_widget(Clear, rect(area, menu_y, count as u16));
+            for (row, command) in matches.iter().skip(start).take(count).enumerate() {
+                let active = start + row == selected;
+                let marker = if active { ">" } else { " " };
+                let text = format!("{marker} {:<11} {}", command.name, command.description);
+                frame.render_widget(
+                    Paragraph::new(text).style(if active {
+                        Style::default().fg(Color::White).bg(ACTIVE_BG)
+                    } else {
+                        Style::default().fg(SECONDARY).bg(CODE_BG)
+                    }),
+                    rect(area, menu_y + row as u16, 1),
+                );
+            }
+        }
     }
 
     frame.render_widget(
@@ -1482,11 +1711,15 @@ fn draw_overlay(frame: &mut Frame, view: &View, agents: &[AgentInfo], area: Rect
                 Line::raw(format!("Workspace: {}", single(view, &view.cwd))),
                 Line::raw(format!("Model: {}", single(view, &view.model))),
                 Line::raw(format!("Connection: {}", single(view, &view.connection))),
+                Line::raw(format!(
+                    "Context: {}",
+                    single(view, view.context_usage.as_deref().unwrap_or("unavailable"))
+                )),
                 Line::raw(format!("Session: {}", single(view, &view.status))),
                 Line::raw(""),
                 Line::from(Span::styled("Esc close", Style::default().fg(MUTED))),
             ];
-            (" Status ", 70, 9, lines)
+            (" Status ", 70, 10, lines)
         }
         Overlay::Approval => unreachable!(),
     };
@@ -1572,6 +1805,30 @@ mod tests {
             .join("\n");
         let cursor = terminal.backend_mut().get_cursor_position().unwrap();
         (output, (cursor.x, cursor.y))
+    }
+
+    #[test]
+    fn slash_suggestions_filter_and_render_in_narrow_chat() {
+        assert_eq!(slash_matches("/").len(), 13);
+        assert_eq!(slash_matches("/go")[0].name, "/goal");
+        assert_eq!(slash_matches("/com")[0].name, "/compact");
+        assert_eq!(slash_matches("/q")[0].name, "/queue");
+        assert_eq!(slash_matches("/mo")[0].name, "/model");
+        assert!(slash_matches("/model ").is_empty());
+        assert!(slash_matches("hello").is_empty());
+        let view = View {
+            input: "/".into(),
+            cursor: 1,
+            slash_suggestions_open: true,
+            slash_suggestion_selected: 1,
+            ..View::default()
+        };
+        let wide = screen(&view, &[], 52, 24);
+        assert!(wide.contains("> /agents"));
+        assert!(wide.contains("Show agents"));
+        let narrow = screen(&view, &[], 20, 12);
+        assert!(narrow.contains("/agents"));
+        assert!(narrow.contains("-- INPUT"));
     }
 
     fn print_snapshot_if_requested(name: &str, output: &str) {
@@ -1670,6 +1927,32 @@ mod tests {
         let output = screen(&view, &[], 80, 24);
         assert!(output.contains("> Response language: Japanese"));
         assert!(!output.contains("HELPER PROVIDERS"));
+    }
+
+    #[test]
+    fn model_tab_shows_individually_editable_request_limits() {
+        let view = View {
+            page: Page::Setup,
+            setup_tab: 1,
+            setup_field: 10,
+            setup_limit_values: ["32000".into(), "8192".into(), "180".into()],
+            ..View::default()
+        };
+        let output = screen(&view, &[], 80, 24);
+        assert!(output.contains("> Context budget: 32000 tokens"));
+        assert!(output.contains("Max output: 8192 tokens"));
+        assert!(output.contains("Request deadline: 180 seconds"));
+    }
+
+    #[test]
+    fn status_overlay_shows_estimated_context_usage() {
+        let view = View {
+            overlay: Overlay::Status,
+            context_usage: Some("~12000/32000 tokens (estimated, compacted)".into()),
+            ..View::default()
+        };
+        let output = screen(&view, &[], 80, 24);
+        assert!(output.contains("Context: ~12000/32000 tokens (estimated, compacted)"));
     }
 
     #[test]
@@ -1773,8 +2056,8 @@ mod tests {
             assert!(output.contains(expected), "missing {expected}:\n{output}");
         }
         let footer = output.lines().last().unwrap().trim_end();
-        assert!(footer.starts_with("  my-model . /tmp/project"));
-        assert!(footer.ends_with(". - . - . -"));
+        assert!(footer.starts_with("  my-model | /tmp/project"));
+        assert!(footer.ends_with("| - | - | -"));
         assert!(!footer.contains("connected"));
         assert!(!footer.contains("Revex"));
         assert!(!output.contains("+---"));
@@ -1885,7 +2168,7 @@ mod tests {
         let output = screen(&view, &[], 80, 24);
         let footer = output.lines().last().unwrap().trim_end();
         assert!(footer.starts_with("  deepseek"), "{footer}");
-        assert!(footer.ends_with(" . 12.7 tok/s . 22.9s . -"), "{footer}");
+        assert!(footer.ends_with(" | 12.7 tok/s | 22.9s | -"), "{footer}");
         assert_eq!(Line::raw(footer).width(), 80);
     }
 
@@ -2048,7 +2331,7 @@ mod tests {
             ..View::default()
         };
         let wide = screen(&view, &[], 80, 20);
-        assert!(wide.contains("* | Thinking 2 queued"));
+        assert!(wide.contains("* | Thinking 00:00 2 queued"));
         assert!(
             wide.lines()
                 .find(|line| line.starts_with("-- INPUT"))
@@ -2074,7 +2357,7 @@ mod tests {
         let output = screen(&view, &[], 80, 20);
         let lines: Vec<_> = output.lines().collect();
         assert!(lines[0].trim().is_empty());
-        assert!(lines[19].starts_with("  local-model . high . /tmp/project"));
+        assert!(lines[19].starts_with("  local-model | high | /tmp/project"));
         assert!(!lines[19].contains("connected"));
     }
 
@@ -2107,10 +2390,10 @@ mod tests {
         let footer = chat_footer(&view, &[], 80);
         assert!(footer.starts_with("deepseek-v4.1"), "{footer}");
         assert!(
-            footer.contains(" . high . ~/Developer/revex/target/release"),
+            footer.contains(" | high | ~/Developer/revex/target/release"),
             "{footer}"
         );
-        assert!(footer.ends_with(" . - . - . -"), "{footer}");
+        assert!(footer.ends_with(" | - | - | -"), "{footer}");
         assert!(!footer.contains("Revex"));
         assert!(!footer.contains("connected"));
         assert!(!footer.contains("0 agents"));
@@ -2155,13 +2438,13 @@ mod tests {
             ..claude.clone()
         };
         let footer = chat_footer(&view, &[main.clone(), claude.clone()], 80);
-        assert!(footer.ends_with(" . ~$0.125"), "{footer}");
+        assert!(footer.ends_with(" | ~$0.125"), "{footer}");
         let known = claude.clone();
         claude.provider = crate::agents::Provider::Codex;
         claude.id = "a2".into();
         claude.cost_usd = None;
         let mixed = chat_footer(&view, &[main.clone(), claude, known.clone()], 80);
-        assert!(mixed.ends_with(" . -"), "{mixed}");
+        assert!(mixed.ends_with(" | -"), "{mixed}");
         let local = AgentInfo {
             id: "a3".into(),
             provider: crate::agents::Provider::Local,
@@ -2169,7 +2452,7 @@ mod tests {
             ..known.clone()
         };
         let mixed_local = chat_footer(&view, &[main, known, local], 80);
-        assert!(mixed_local.ends_with(" . -"), "{mixed_local}");
+        assert!(mixed_local.ends_with(" | -"), "{mixed_local}");
     }
 
     #[test]
@@ -2584,18 +2867,66 @@ mod tests {
     fn model_in_flight_indicator_animates_and_disappears() {
         let mut view = View {
             model_in_flight: true,
+            thinking_text: "Inspecting the request.\nChecking details.".into(),
             activity_tick: 0,
             status: "running  |  1 queued".into(),
             ..View::default()
         };
         let first = screen(&view, &[], 80, 20);
-        assert!(first.contains("| Thinking 1 queued"));
+        assert!(first.contains("| Thinking 00:00 1 queued"));
+        assert!(first.contains("Inspecting the request."));
+        assert!(first.contains("Checking details."));
         view.activity_tick = 1;
         let second = screen(&view, &[], 80, 20);
-        assert!(second.contains("/ Thinking"));
+        assert!(second.contains("/ Thinking 00:00"));
         view.model_in_flight = false;
         let done = screen(&view, &[], 80, 20);
         assert!(!done.contains("Thinking"));
+        assert!(!done.contains("Inspecting the request."));
+    }
+
+    #[test]
+    fn thinking_elapsed_formats_minute_and_hour_boundaries() {
+        for (seconds, clock) in [
+            (7, "00:07"),
+            (59, "00:59"),
+            (60, "01:00"),
+            (3_599, "59:59"),
+            (3_600, "01:00:00"),
+            (360_000, "100:00:00"),
+        ] {
+            assert_eq!(format_clock(Duration::from_secs(seconds)), clock);
+        }
+    }
+
+    #[test]
+    fn thinking_elapsed_appears_in_chat_transcript() {
+        let view = View {
+            model_in_flight: true,
+            thinking_started: Some(Instant::now() - Duration::from_secs(7)),
+            ..View::default()
+        };
+        let output = screen(&view, &[], 80, 20);
+        assert!(output.contains("* | Thinking 00:07"), "{output}");
+    }
+
+    #[test]
+    fn long_turn_duration_uses_clock_in_footer() {
+        let mut view = View {
+            model: "test-model".into(),
+            cwd: "/tmp/revex".into(),
+            ..View::default()
+        };
+        for (seconds, expected) in [
+            (59, "59.0s"),
+            (60, "01:00"),
+            (3_599, "59:59"),
+            (3_600, "01:00:00"),
+        ] {
+            view.last_turn_elapsed = Some(Duration::from_secs(seconds));
+            let footer = chat_footer(&view, &[], 78);
+            assert!(footer.contains(expected), "{footer}");
+        }
     }
 
     #[test]

@@ -136,6 +136,8 @@ struct State {
     provider_cursor: usize,
     external_pids: HashMap<String, i32>,
     external_threads: Vec<std::thread::JoinHandle<()>>,
+    reviewed: HashMap<String, String>,
+    next_review: u64,
     next: u64,
     stopped: bool,
 }
@@ -321,22 +323,70 @@ fn parse_external_output(
     }
 }
 
-fn external_command(provider: Provider, cwd: &Path, program: &Path) -> Result<Command, String> {
+struct ReviewAnswer {
+    can_take: bool,
+    approved: bool,
+    comments: String,
+}
+
+fn parse_review_answer(answer: &str, expected_scope: &str) -> Result<ReviewAnswer, String> {
+    let value: Value = serde_json::from_str(answer.trim())
+        .map_err(|_| "response was not a JSON object".to_string())?;
+    let object = value.as_object().ok_or("response was not a JSON object")?;
+    let can_take = object
+        .get("canTake")
+        .and_then(Value::as_bool)
+        .ok_or("canTake must be boolean")?;
+    let approved = object
+        .get("approved")
+        .and_then(Value::as_bool)
+        .ok_or("approved must be boolean")?;
+    if object.get("scope").and_then(Value::as_str) != Some(expected_scope) {
+        return Err("scope differs from the submitted scope".into());
+    }
+    let comments = object
+        .get("comments")
+        .and_then(Value::as_str)
+        .ok_or("comments must be a string")?;
+    if comments.len() > 1024 {
+        return Err("comments exceed 1024 bytes".into());
+    }
+    Ok(ReviewAnswer {
+        can_take,
+        approved,
+        comments: comments.to_string(),
+    })
+}
+
+fn external_command(
+    provider: Provider,
+    cwd: &Path,
+    program: &Path,
+    review: bool,
+) -> Result<Command, String> {
     let mut command = Command::new(program);
     match provider {
         Provider::Codex => {
+            command.arg("exec");
+            if review {
+                command.args([
+                    "--sandbox",
+                    "read-only",
+                    "--ephemeral",
+                    "--ignore-user-config",
+                ]);
+            } else {
+                command.arg("--dangerously-bypass-approvals-and-sandbox");
+            }
             command
-                .args([
-                    "exec",
-                    "--dangerously-bypass-approvals-and-sandbox",
-                    "--skip-git-repo-check",
-                    "--json",
-                    "-C",
-                ])
+                .args(["--skip-git-repo-check", "--json", "-C"])
                 .arg(cwd)
                 .arg("-");
         }
         Provider::Claude => {
+            if review {
+                return Err("read-only review is only available through Codex".into());
+            }
             command.args([
                 "-p",
                 "--dangerously-skip-permissions",
@@ -426,6 +476,8 @@ impl Agents {
                 provider_cursor: 0,
                 external_pids: HashMap::new(),
                 external_threads: Vec::new(),
+                reviewed: HashMap::new(),
+                next_review: 1,
                 next,
                 stopped: false,
             }),
@@ -599,6 +651,7 @@ impl Agents {
         s.parent.usage = UsageTotal::default();
         s.children.clear();
         s.queue.clear();
+        s.reviewed.clear();
         s.next = 1;
         s.provider_cursor = 0;
         if let Some((_, moved)) = backup
@@ -647,6 +700,9 @@ impl Agents {
 
     /// Start a child on `task` in the parent's cwd, or queue it when both slots are busy.
     pub(crate) fn spawn(self: &Arc<Self>, cfg: &Cfg, task: &str) -> String {
+        if cfg.approval_mode == ApprovalMode::Plan {
+            return "error: helper agents are unavailable in plan mode".into();
+        }
         let mut g = self.lock();
         if g.stopped {
             return "error: the session is ending; no agent was started".into();
@@ -660,7 +716,24 @@ impl Agents {
             Ok(selected) => selected,
             Err(e) => return format!("error: {e}"),
         };
-        match self.start_selected(&mut g, cfg, provider, task) {
+        let reviewed_id = (provider == Provider::Codex)
+            .then(|| task.strip_prefix("reviewed:"))
+            .flatten();
+        let exact_scope = if let Some(id) = reviewed_id {
+            let Some(scope) = g.reviewed.get(id) else {
+                return format!("error: unknown or already used review ID `{id}`");
+            };
+            scope.clone()
+        } else {
+            task.to_string()
+        };
+        let started = self.start_selected(&mut g, cfg, provider, &exact_scope);
+        if started.is_ok()
+            && let Some(id) = reviewed_id
+        {
+            g.reviewed.remove(id);
+        }
+        match started {
             Ok((id, Status::Running)) => format!("{id} started"),
             Ok((id, Status::Queued)) => format!(
                 "{id} queued: {MAX_RUNNING} agents are running; it starts when one finishes"
@@ -678,6 +751,9 @@ impl Agents {
         provider: Provider,
         task: &str,
     ) -> Result<String, String> {
+        if cfg.approval_mode == ApprovalMode::Plan {
+            return Err("helper agents are unavailable in plan mode".into());
+        }
         if provider == Provider::Local {
             return Err("direct invocation requires an external helper".into());
         }
@@ -712,6 +788,83 @@ impl Agents {
         self.save(c)
             .map_err(|e| format!("agent record not saved: {e}"))?;
         result
+    }
+
+    /// Read-only advisory review. The returned ID binds a later spawn to the
+    /// exact reviewed scope; a declined or malformed verdict creates no ID.
+    pub(crate) fn review_codex(&self, cfg: &Cfg, request: &str) -> String {
+        self.review_codex_program(cfg, request, Path::new("codex"))
+    }
+
+    fn review_codex_program(&self, cfg: &Cfg, request: &str, program: &Path) -> String {
+        if cfg.approval_mode == ApprovalMode::Plan {
+            return "error: external review is unavailable in plan mode".into();
+        }
+        let Some(scope) = request.strip_prefix("@codex ").map(str::trim) else {
+            return "error: review requires `@codex SCOPE`".into();
+        };
+        if scope.is_empty() || scope.len() > 8 * 1024 {
+            return "error: review scope must be nonempty and at most 8192 bytes".into();
+        }
+        let id = {
+            let mut state = self.lock();
+            if state.stopped {
+                return "error: the session is ending; no review was started".into();
+            }
+            if !state.providers[Provider::Codex.index()] {
+                return "error: helper provider `codex` is not enabled".into();
+            }
+            let id = format!("r{}", state.next_review);
+            state.next_review += 1;
+            id
+        };
+        let prompt = format!(
+            "Review this proposed reverse-engineering analysis scope without editing files. Read only what you need. Assess whether the approach is sound and whether you can take this exact scope. Reply with only a JSON object with boolean canTake, boolean approved, string scope equal to the supplied scope, and short string comments. A refusal or uncertainty must use false; do not suggest bypassing a refusal. Do not include credentials or configuration contents.\n\nScope:\n{scope}"
+        );
+        let result =
+            self.run_external_program_inner(&id, Provider::Codex, &cfg.cwd, &prompt, program, true);
+        self.lock().external_pids.remove(&id);
+        let answer = match result {
+            Ok(answer) => answer,
+            Err(error) => return format!("error: Codex read-only review failed: {error}"),
+        };
+        let review = match parse_review_answer(&answer, scope) {
+            Ok(review) => review,
+            Err(error) => {
+                return format!(
+                    "error: Codex review had no valid verdict ({error}); no delegation was authorized"
+                );
+            }
+        };
+        if !review.can_take || !review.approved {
+            return json!({
+                "canTake": review.can_take,
+                "approved": review.approved,
+                "scope": scope,
+                "comments": review.comments,
+                "spawn": null,
+                "note": "Codex review is advisory. No delegation was authorized."
+            })
+            .to_string();
+        }
+        let mut state = self.lock();
+        if state.stopped {
+            return "error: session ended before review completed; no delegation was authorized"
+                .into();
+        }
+        state.reviewed.insert(id.clone(), scope.to_string());
+        let details = json!({
+            "canTake": true,
+            "approved": true,
+            "scope": scope,
+            "comments": review.comments,
+            "spawn": format!("@codex reviewed:{id}"),
+            "note": "Codex review is advisory, not user approval. Verify its work after delegation."
+        })
+        .to_string();
+        // Tool outputs are capped at 2 KiB. Keep the single-use ID visible
+        // even when the reviewed scope is long.
+        format!("reviewed:{id}\n{details}")
     }
 
     fn start_selected(
@@ -883,7 +1036,7 @@ impl Agents {
         task: &str,
         program: &Path,
     ) -> Result<String, String> {
-        let result = self.run_external_program_inner(id, provider, cwd, task, program);
+        let result = self.run_external_program_inner(id, provider, cwd, task, program, false);
         self.lock().external_pids.remove(id);
         result
     }
@@ -895,8 +1048,9 @@ impl Agents {
         cwd: &Path,
         task: &str,
         program: &Path,
+        review: bool,
     ) -> Result<String, String> {
-        let mut command = external_command(provider, cwd, program)?;
+        let mut command = external_command(provider, cwd, program, review)?;
         let child = command
             .spawn()
             .map_err(|e| format!("cannot launch {} helper: {e}", provider.name()))?;
@@ -932,10 +1086,11 @@ impl Agents {
             .map_err(|_| "helper stderr reader crashed")??;
         let parsed = parse_external_output(provider, &output);
         self.add_usage(
-            Some(id),
+            if review { None } else { Some(id) },
             parsed.as_ref().ok().and_then(|(_, usage, _)| *usage),
         );
-        if status.success()
+        if !review
+            && status.success()
             && let Ok((_, _, Some(cost))) = &parsed
         {
             let mut state = self.lock();
@@ -1068,6 +1223,7 @@ impl Agents {
         let mut g = self.lock();
         g.stopped = true;
         g.queue.clear();
+        g.reviewed.clear();
         for pid in g.external_pids.values() {
             kill_process_group(*pid);
         }
@@ -1319,6 +1475,9 @@ mod tests {
             model: Some("m".into()),
             decision_model: "clef".into(),
             response_language: ResponseLanguage::English,
+            approval_mode: ApprovalMode::Manual,
+            max_steps: DEFAULT_MAX_STEPS,
+            limits: RequestLimits::default(),
             reasoning: None,
             yes: false,
             history: None,
@@ -1396,7 +1555,7 @@ mod tests {
             )
             .unwrap();
             std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let command = external_command(provider, &dir, &executable).unwrap();
+            let command = external_command(provider, &dir, &executable, false).unwrap();
             assert!(
                 command
                     .get_envs()
@@ -1420,6 +1579,105 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn codex_review_is_read_only_and_only_exact_positive_verdict_grants_scope() {
+        let dir = tmp("fake-review");
+        let executable = dir.join("fake-codex");
+        let args = dir.join("args");
+        let input = dir.join("input");
+        let scope = "Inspect the binary parser control flow";
+        let agents = Agents::memory(model_fn(|_, _| reply("unused", None, None)));
+        agents.set_providers([true, true, false]).unwrap();
+        let mut config = cfg(&dir, &agents);
+        config.key = "never-send-key".into();
+        for (can_take, approved) in [(false, true), (true, true)] {
+            let verdict = json!({
+                "canTake": can_take,
+                "approved": approved,
+                "scope": scope,
+                "comments": "bounded static analysis"
+            });
+            let event = json!({"type":"item.completed", "item":{
+                "type":"agent_message", "text":verdict.to_string()
+            }});
+            std::fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\nprintf '%s\\n' '{}' '{{\"type\":\"turn.completed\"}}'\n",
+                    args.display(), input.display(), event
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let result =
+                agents.review_codex_program(&config, &format!("@codex {scope}"), &executable);
+            if can_take {
+                assert!(result.starts_with("reviewed:r2\n"), "{result}");
+                assert_eq!(
+                    agents.lock().reviewed.get("r2").map(String::as_str),
+                    Some(scope)
+                );
+            } else {
+                assert!(result.contains("No delegation was authorized"), "{result}");
+                assert!(agents.lock().reviewed.is_empty());
+            }
+            let passed = std::fs::read_to_string(&args).unwrap();
+            assert!(passed.contains("read-only"));
+            assert!(passed.contains("--ephemeral"));
+            assert!(passed.contains("--ignore-user-config"));
+            assert!(!passed.contains("--dangerously-bypass-approvals-and-sandbox"));
+            let prompt = std::fs::read_to_string(&input).unwrap();
+            assert!(prompt.contains(scope));
+            assert!(!prompt.contains("never-send-key"));
+        }
+        assert!(
+            parse_review_answer(
+                r#"{"canTake":true,"approved":true,"scope":"changed scope","comments":"fine"}"#,
+                scope
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn incomplete_or_wrongly_typed_review_verdict_fails_closed() {
+        let scope = "inspect parser";
+        for (answer, expected_error) in [
+            (r#"{}"#, "canTake must be boolean"),
+            (r#"{"canTake":true}"#, "approved must be boolean"),
+            (
+                r#"{"canTake":true,"approved":true}"#,
+                "scope differs from the submitted scope",
+            ),
+            (
+                r#"{"canTake":true,"approved":true,"scope":"inspect parser"}"#,
+                "comments must be a string",
+            ),
+            (
+                r#"{"canTake":"yes","approved":true,"scope":"inspect parser","comments":"ok"}"#,
+                "canTake must be boolean",
+            ),
+            (
+                r#"{"canTake":true,"approved":1,"scope":"inspect parser","comments":"ok"}"#,
+                "approved must be boolean",
+            ),
+            (
+                r#"{"canTake":true,"approved":true,"scope":1,"comments":"ok"}"#,
+                "scope differs from the submitted scope",
+            ),
+            (
+                r#"{"canTake":true,"approved":true,"scope":"inspect parser","comments":false}"#,
+                "comments must be a string",
+            ),
+        ] {
+            assert_eq!(
+                parse_review_answer(answer, scope).err().as_deref(),
+                Some(expected_error)
+            );
+        }
     }
 
     #[test]
@@ -1557,7 +1815,9 @@ mod tests {
     }
 
     fn is_child(msgs: &[Value]) -> bool {
-        msgs[0]["content"] == CHILD_SYSTEM
+        msgs[0]["content"]
+            .as_str()
+            .is_some_and(|prompt| prompt.starts_with(CHILD_SYSTEM))
     }
 
     fn last(msgs: &[Value]) -> String {

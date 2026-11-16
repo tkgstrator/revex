@@ -2,6 +2,7 @@
 //! model and helper threads communicate through events and never read stdin.
 
 use super::*;
+use crate::goals::{self, GoalStatus, GoalStore, GoalVerdict, IdleGate, TurnPermit};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     self as terminal_event, Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -17,18 +18,20 @@ use std::collections::VecDeque;
 #[cfg(test)]
 use std::io::BufRead;
 use std::io::Stdout;
+#[cfg(unix)]
+use std::sync::Condvar;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::{self, Sender};
-#[cfg(unix)]
-use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 #[derive(Clone)]
 pub(crate) struct UiHandle {
     events: Sender<Event>,
     cancelled: Arc<AtomicBool>,
+    steering: Arc<Mutex<VecDeque<String>>>,
     suppress_routine: bool,
     #[cfg(unix)]
     shell: Arc<ShellTracker>,
@@ -44,6 +47,29 @@ struct ShellTracker {
 impl UiHandle {
     pub(crate) fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn queue_steering(&self, task: String) {
+        self.steering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(task);
+    }
+
+    pub(crate) fn has_steering(&self) -> bool {
+        !self
+            .steering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    pub(crate) fn take_steering(&self) -> Vec<String> {
+        self.steering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect()
     }
 
     #[cfg(unix)]
@@ -108,6 +134,18 @@ impl UiHandle {
         let _ = self.events.send(Event::Progress(display));
     }
 
+    pub(crate) fn reasoning_chunk(&self, chunk: &str) {
+        if !self.cancelled() && !chunk.is_empty() {
+            let _ = self.events.send(Event::ReasoningChunk(chunk.into()));
+        }
+    }
+
+    pub(crate) fn commentary(&self, text: &str) {
+        if !self.cancelled() && !text.trim().is_empty() {
+            let _ = self.events.send(Event::Commentary(text.into()));
+        }
+    }
+
     pub(crate) fn approve(&self, what: &str, preview: &str) -> bool {
         if self.cancelled() {
             return false;
@@ -128,6 +166,19 @@ impl UiHandle {
     }
 }
 
+#[cfg(test)]
+pub(super) fn steering_test_handle() -> UiHandle {
+    let (events, _) = mpsc::channel();
+    UiHandle {
+        events,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        steering: Arc::new(Mutex::new(VecDeque::new())),
+        suppress_routine: false,
+        #[cfg(unix)]
+        shell: Arc::new(ShellTracker::default()),
+    }
+}
+
 enum Event {
     #[cfg(test)]
     Input(String),
@@ -135,13 +186,21 @@ enum Event {
     #[allow(dead_code)]
     Eof,
     Progress(String),
+    Commentary(String),
     ModelPhase(bool),
+    ReasoningChunk(String),
     Approval {
         what: String,
         preview: String,
         answer: Sender<bool>,
     },
     Finished(Result<AgentAnswer, String>, Vec<Value>),
+    Compacted(Result<context::CompactionReport, String>),
+    GoalEvaluated {
+        revision: u64,
+        turn: u32,
+        result: Result<GoalVerdict, String>,
+    },
     ModelsFetched {
         request: u64,
         result: Result<Vec<String>, String>,
@@ -347,6 +406,12 @@ fn setup_view(view: &mut tui::View, cfg: &Cfg) {
         ResponseLanguage::English => 0,
         ResponseLanguage::Japanese => 1,
     };
+    view.setup_limit_values = [
+        cfg.limits.context_budget_tokens.to_string(),
+        cfg.limits.max_output_tokens.to_string(),
+        cfg.limits.request_deadline_secs.to_string(),
+    ];
+    view.setup_limit_dirty = [false; 3];
     let helper_status = match stored_helper_selection() {
         Ok(selected) => {
             view.setup_helpers = selected;
@@ -358,6 +423,13 @@ fn setup_view(view: &mut tui::View, cfg: &Cfg) {
         }
     };
     view.setup_helper_selected = 0;
+    view.setup_approval_mode_selected = match cfg.approval_mode {
+        ApprovalMode::Manual => 0,
+        ApprovalMode::Auto => 1,
+        ApprovalMode::Bypass => 2,
+        ApprovalMode::Plan => 3,
+    };
+    view.setup_approval_mode_dirty = false;
     view.setup_helper_available = [true, cli_available("codex"), cli_available("claude")];
     view.setup_models.clear();
     view.setup_model_selected = 0;
@@ -403,6 +475,15 @@ fn activate_chat(
         .map_err(|e| format!("workspace {}: {e}", cfg.cwd.display()))?;
     let history = history_for(&state_dir()?, &cwd);
     let prompt_history = PromptHistory::load(&history)?;
+    let (goal, goal_warning) = match GoalStore::load(&history.path, &history.cwd) {
+        Ok(goal) => (Some(goal), None),
+        Err(error) => (
+            None,
+            Some(format!(
+                "Goal state unavailable; normal chat remains usable. Saved goal file left unchanged: {error}"
+            )),
+        ),
+    };
     let agents = Agents::open(agents_dir(&history), model_fn(chat))?;
     let helper_selection = stored_helper_selection()?;
     agents.set_providers(helper_selection)?;
@@ -424,11 +505,30 @@ fn activate_chat(
     view.transcript.clear();
     seed_transcript(&msgs, view);
     let mut active = Session::new(cfg.clone(), msgs, agents, tx.clone());
+    active.goal = goal;
     active.prompt_history = Some(prompt_history);
     active.helper_selection = helper_selection;
     active.tui = true;
     if let Some(ui) = active.cfg.ui.as_mut() {
         ui.suppress_routine = true;
+    }
+    if let Some(msgs) = active.msgs.as_ref() {
+        refresh_context_usage(view, &active.cfg, msgs);
+    }
+    if let Some(state) = active.goal.as_ref().and_then(GoalStore::status) {
+        append(
+            view,
+            &format!(
+                "Goal {} ({}/{}): {}",
+                state.status.name(),
+                state.turns_used,
+                state.max_turns,
+                state.detail.as_deref().unwrap_or(&state.objective)
+            ),
+        );
+    }
+    if let Some(warning) = goal_warning {
+        append(view, &warning);
     }
     *session = Some(active);
     Ok(())
@@ -441,6 +541,39 @@ fn append(view: &mut tui::View, message: &str) {
         view.transcript.drain(..view.transcript.len() - 2000);
     }
     view.scroll = 0;
+}
+
+fn refresh_context_usage(view: &mut tui::View, cfg: &Cfg, msgs: &[Value]) {
+    view.context_usage = Some(match context_usage(cfg, msgs) {
+        Ok(usage) => {
+            let mut label = format!(
+                "~{}/{} tokens (estimated",
+                usage.estimated_tokens, usage.budget_tokens
+            );
+            if usage.compacted {
+                label.push_str(", compacted");
+            }
+            if usage.omitted_messages > 0 {
+                label.push_str(&format!(", {} older omitted", usage.omitted_messages));
+            }
+            label.push(')');
+            label
+        }
+        Err(error) => format!("unavailable ({error})"),
+    });
+}
+
+const MAX_THINKING_BYTES: usize = 16 * 1024;
+
+fn append_reasoning(view: &mut tui::View, chunk: &str) {
+    view.thinking_text.push_str(&terminal_safe(chunk));
+    if view.thinking_text.len() > MAX_THINKING_BYTES {
+        let mut start = view.thinking_text.len() - MAX_THINKING_BYTES;
+        while !view.thinking_text.is_char_boundary(start) {
+            start += 1;
+        }
+        view.thinking_text.drain(..start);
+    }
 }
 
 fn byte_at(value: &str, scalar: usize) -> usize {
@@ -614,6 +747,33 @@ fn save_setup(
         1 => ResponseLanguage::Japanese,
         _ => return Err("Choose English or Japanese for response language".into()),
     };
+    let approval_mode = match view.setup_approval_mode_selected {
+        0 => ApprovalMode::Manual,
+        1 => ApprovalMode::Auto,
+        2 => ApprovalMode::Bypass,
+        3 => ApprovalMode::Plan,
+        _ => return Err("Choose a valid approval mode".into()),
+    };
+    let limits = RequestLimits {
+        context_budget_tokens: parse_bounded_number(
+            &Value::String(view.setup_limit_values[0].clone()),
+            "contextBudgetTokens",
+            4_096,
+            800_000,
+        )? as usize,
+        max_output_tokens: parse_bounded_number(
+            &Value::String(view.setup_limit_values[1].clone()),
+            "maxOutputTokens",
+            256,
+            32_768,
+        )? as u32,
+        request_deadline_secs: parse_bounded_number(
+            &Value::String(view.setup_limit_values[2].clone()),
+            "requestDeadlineSeconds",
+            10,
+            3_600,
+        )?,
+    };
     if view.setup_provider_committed.is_none() {
         return Err("Choose a model server provider with Enter".into());
     }
@@ -639,6 +799,29 @@ fn save_setup(
         "helper_providers".into(),
         Value::String(helper_selection_csv(view.setup_helpers)?),
     );
+    if view.setup_approval_mode_dirty {
+        settings.insert(
+            "approval_mode".into(),
+            Value::String(approval_mode_name(approval_mode).into()),
+        );
+    }
+    for (index, key) in [
+        "contextBudgetTokens",
+        "maxOutputTokens",
+        "requestDeadlineSeconds",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if view.setup_limit_dirty[index] {
+            let value = match index {
+                0 => limits.context_budget_tokens as u64,
+                1 => limits.max_output_tokens as u64,
+                _ => limits.request_deadline_secs,
+            };
+            settings.insert(key.into(), json!(value));
+        }
+    }
     cfg.model = (!view.setup_model.trim().is_empty()).then(|| view.setup_model.trim().into());
     let effort = view.setup_reasoning.trim();
     cfg.reasoning = Some(effort.into());
@@ -661,6 +844,11 @@ fn save_setup(
         );
     }
     save_home_config(&settings)?;
+    cfg.limits = limits;
+    if view.setup_approval_mode_dirty {
+        cfg.approval_mode = approval_mode;
+        cfg.yes = false; // an explicit UI selection replaces the startup --yes override
+    }
     if project_has_settings {
         save_project_model_settings(
             &project_path,
@@ -675,6 +863,7 @@ fn save_setup(
     view.setup_clear_key = false;
     view.model = cfg.model.clone().unwrap_or_else(|| "server default".into());
     view.reasoning = effective_reasoning(cfg);
+    view.approval_mode = approval_mode_name(cfg.approval_mode).into();
     view.connection = "checking API".into();
     if let Some(session) = session.as_mut() {
         session.agents.set_providers(view.setup_helpers)?;
@@ -685,18 +874,236 @@ fn save_setup(
         session.cfg.reasoning = cfg.reasoning.clone();
         session.cfg.decision_model = cfg.decision_model.clone();
         session.cfg.response_language = cfg.response_language;
+        session.cfg.limits = cfg.limits;
+        if view.setup_approval_mode_dirty {
+            session.cfg.approval_mode = cfg.approval_mode;
+            session.cfg.yes = false;
+        }
         view.page = tui::Page::Chat;
         view.overlay = tui::Overlay::None;
         append(
             view,
             "Settings saved. New requests will use the updated provider.",
         );
+        if let Some(msgs) = session.msgs.as_ref() {
+            refresh_context_usage(view, &session.cfg, msgs);
+        }
+        maybe_start_goal(view, session);
     } else {
         activate_chat(cfg, view, session, tx)?;
     }
     *request += 1;
     fetch_models(tx, *request, cfg.base.clone(), cfg.key.clone());
     Ok(())
+}
+
+fn set_approval_mode(
+    mode: ApprovalMode,
+    cfg: &mut Cfg,
+    view: &mut tui::View,
+    session: &mut Session,
+) {
+    let value = approval_mode_name(mode);
+    cfg.approval_mode = mode;
+    cfg.yes = false;
+    session.cfg.approval_mode = mode;
+    session.cfg.yes = false;
+    view.approval_mode = value.into();
+    let result = (|| {
+        let mut settings = load_home_config()?;
+        settings.insert("approval_mode".into(), Value::String(value.into()));
+        save_home_config(&settings)
+    })();
+    match result {
+        Ok(()) => append(view, &format!("Approval mode: {value} (saved)")),
+        Err(e) => append(
+            view,
+            &format!("Approval mode: {value} for this session; not saved: {e}"),
+        ),
+    }
+    if session.busy {
+        append(view, "The new approval mode applies to the next task.");
+    } else {
+        maybe_start_goal(view, session);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SubmissionMode {
+    Steer,
+    Queue,
+}
+
+enum GoalCommand {
+    Status,
+    Pause,
+    Resume(Option<u32>),
+    Clear,
+    Set {
+        objective: String,
+        max_turns: Option<u32>,
+    },
+}
+
+fn parse_goal_turn_limit(text: &str) -> Result<(Option<u32>, &str), String> {
+    let Some(rest) = text.strip_prefix("--max-turns") else {
+        return Ok((None, text));
+    };
+    let rest = rest.trim_start();
+    let (number, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let count = number
+        .parse::<u32>()
+        .map_err(|_| format!("--max-turns needs a number from 1 to {}", goals::MAX_TURNS))?;
+    if !(1..=goals::MAX_TURNS).contains(&count) {
+        return Err(format!(
+            "--max-turns must be from 1 to {}",
+            goals::MAX_TURNS
+        ));
+    }
+    Ok((Some(count), tail.trim()))
+}
+
+fn parse_goal_command(rest: &str) -> Result<GoalCommand, String> {
+    let rest = rest.trim();
+    match rest {
+        "" | "status" => return Ok(GoalCommand::Status),
+        "pause" => return Ok(GoalCommand::Pause),
+        "clear" => return Ok(GoalCommand::Clear),
+        "resume" => return Ok(GoalCommand::Resume(None)),
+        _ => {}
+    }
+    if let Some(arg) = rest.strip_prefix("resume ") {
+        let (max_turns, tail) = parse_goal_turn_limit(arg.trim())?;
+        return if max_turns.is_some() && tail.is_empty() {
+            Ok(GoalCommand::Resume(max_turns))
+        } else {
+            Err("Usage: /goal resume [--max-turns N]".into())
+        };
+    }
+    let (max_turns, objective) = parse_goal_turn_limit(rest)?;
+    if objective.is_empty() {
+        return Err("Usage: /goal [--max-turns N] OBJECTIVE".into());
+    }
+    Ok(GoalCommand::Set {
+        objective: objective.into(),
+        max_turns,
+    })
+}
+
+fn submit_task(task: &str, mode: SubmissionMode, view: &mut tui::View, session: &mut Session) {
+    if (matches!(mode, SubmissionMode::Queue) || !session.busy)
+        && (session.goal_turn.is_some() || session.goal_pending.is_some())
+    {
+        session.pause_goal(
+            "User task took priority; use /goal resume to continue.",
+            &mut |message| append(view, message),
+        );
+    }
+    append(view, &format!("You  {task}"));
+    if session.busy {
+        if session.interrupted || session.compacting || matches!(mode, SubmissionMode::Queue) {
+            session.queued.push_back(task.into());
+            append(
+                view,
+                &format!(
+                    "Task queued for after {} ({}).",
+                    if session.compacting {
+                        "compaction"
+                    } else {
+                        "this task"
+                    },
+                    session.queued.len()
+                ),
+            );
+        } else if let Some(ui) = &session.cfg.ui {
+            ui.queue_steering(task.into());
+            append(view, "Instruction added; applying at next step.");
+        }
+    } else {
+        begin_turn(view, session);
+        session.start(task.into(), &mut |message| append(view, message));
+    }
+}
+
+fn handle_goal_command(rest: &str, view: &mut tui::View, session: &mut Session) {
+    let command = match parse_goal_command(rest) {
+        Ok(command) => command,
+        Err(error) => {
+            append(view, &error);
+            return;
+        }
+    };
+    let Some(goal) = session.goal.as_mut() else {
+        append(view, "Goal state is unavailable for this session.");
+        return;
+    };
+    match command {
+        GoalCommand::Status => {
+            if let Some(state) = goal.status() {
+                append(
+                    view,
+                    &format!(
+                        "Goal {} ({}/{}): {}",
+                        state.status.name(),
+                        state.turns_used,
+                        state.max_turns,
+                        state.detail.as_deref().unwrap_or(&state.objective)
+                    ),
+                );
+            } else {
+                append(view, "No goal is set. Use /goal OBJECTIVE.");
+            }
+        }
+        GoalCommand::Pause => {
+            if goal.status().is_none() {
+                append(view, "No goal is set.");
+            } else {
+                session.pause_goal("Paused by user; use /goal resume.", &mut |message| {
+                    append(view, message)
+                });
+            }
+        }
+        GoalCommand::Resume(max_turns) => {
+            if session.busy {
+                append(view, "Wait for the current task before resuming the goal.");
+                return;
+            }
+            match goal.resume(max_turns) {
+                Ok(()) => {
+                    session.goal_revision = session.goal_revision.wrapping_add(1);
+                    session.goal_schedule_blocked = false;
+                    append(view, "Goal resumed.");
+                    maybe_start_goal(view, session);
+                }
+                Err(error) => append(view, &format!("Goal not resumed: {error}")),
+            }
+        }
+        GoalCommand::Clear => match goal.clear() {
+            Ok(()) => {
+                session.goal_revision = session.goal_revision.wrapping_add(1);
+                session.goal_pending = None;
+                session.goal_schedule_blocked = false;
+                append(view, "Goal cleared.");
+            }
+            Err(error) => append(view, &format!("Goal not cleared: {error}")),
+        },
+        GoalCommand::Set {
+            objective,
+            max_turns,
+        } => match goal.set(&objective, max_turns) {
+            Ok(()) => {
+                session.goal_revision = session.goal_revision.wrapping_add(1);
+                session.goal_pending = None;
+                session.goal_schedule_blocked = false;
+                append(view, "Goal saved.");
+                if session.cfg.approval_mode == ApprovalMode::Plan {
+                    append(view, "Goal will start after leaving plan mode.");
+                }
+                maybe_start_goal(view, session);
+            }
+            Err(error) => append(view, &format!("Goal not set: {error}")),
+        },
+    }
 }
 
 fn submit_chat(
@@ -706,6 +1113,27 @@ fn submit_chat(
     session: &mut Session,
     request: &mut u64,
     exit: &mut bool,
+) {
+    submit_chat_mode(
+        line,
+        cfg,
+        view,
+        session,
+        request,
+        exit,
+        SubmissionMode::Steer,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_chat_mode(
+    line: String,
+    cfg: &mut Cfg,
+    view: &mut tui::View,
+    session: &mut Session,
+    request: &mut u64,
+    exit: &mut bool,
+    normal_mode: SubmissionMode,
 ) {
     let line = line.trim();
     if line.is_empty() {
@@ -717,7 +1145,7 @@ fn submit_chat(
         append(view, &format!("Input history not saved: {e}"));
     }
     match line {
-        "/exit" | "/quit" | "exit" => {
+        "/exit" | "exit" => {
             session.close(&mut |message| append(view, message));
             *exit = true;
         }
@@ -750,17 +1178,39 @@ fn submit_chat(
                 *request += 1; // invalidate any pending connection check
             }
         }
+        "/compact" => {
+            session.start_compaction(&mut |message| append(view, message));
+            view.compacting = session.compacting;
+        }
         "/clear" => {
             if session.busy {
                 append(view, "Finish the current task before /clear.");
             } else if let Some(msgs) = session.msgs.as_mut() {
                 match clear_history(&session.cfg, msgs) {
                     Ok(()) => {
+                        let goal_error = if let Some(goal) = session.goal.as_mut() {
+                            match goal.clear() {
+                                Ok(()) => {
+                                    session.goal_revision = session.goal_revision.wrapping_add(1);
+                                    session.goal_pending = None;
+                                    session.goal_schedule_blocked = false;
+                                    None
+                                }
+                                Err(error) => Some(error),
+                            }
+                        } else {
+                            None
+                        };
                         view.transcript.clear();
                         view.turn_started = None;
+                        view.thinking_started = None;
                         view.last_turn_elapsed = None;
                         view.last_turn_rate = None;
                         append(view, "Session history and agent records cleared.");
+                        refresh_context_usage(view, &session.cfg, msgs);
+                        if let Some(error) = goal_error {
+                            append(view, &format!("Goal state remains: {error}"));
+                        }
                     }
                     Err(e) => append(view, &format!("History not cleared: {e}")),
                 }
@@ -768,8 +1218,19 @@ fn submit_chat(
         }
         "/help" => append(
             view,
-            "/agents  /status  /config  /model [ID] (choose reasoning)  /clear  /exit or exit  Ctrl+D exit  Alt+Enter newline  Ctrl+R retry models",
+            "/agents  /status  /config  /compact  /model [ID]  /approval [manual|auto|bypass|plan]  /goal [--max-turns N] OBJECTIVE  /goal status|pause|resume|clear  /steer TEXT  /queue TEXT  /clear  /exit or exit  Ctrl+D exit  Alt+Enter newline  Ctrl+R retry models",
         ),
+        _ if line == "/goal" || line.starts_with("/goal ") => {
+            handle_goal_command(line.strip_prefix("/goal").unwrap_or(""), view, session)
+        }
+        "/steer" => append(view, "Usage: /steer TEXT"),
+        "/queue" => append(view, "Usage: /queue TEXT"),
+        _ if line.starts_with("/steer ") => {
+            submit_task(line[7..].trim(), SubmissionMode::Steer, view, session)
+        }
+        _ if line.starts_with("/queue ") => {
+            submit_task(line[7..].trim(), SubmissionMode::Queue, view, session)
+        }
         _ if line.starts_with("/model") => {
             let id = line.strip_prefix("/model").unwrap_or("").trim();
             if session.busy
@@ -804,6 +1265,18 @@ fn submit_chat(
                 *request += 1;
             }
         }
+        "/approval" => append(
+            view,
+            &format!("Approval mode: {}", approval_mode_name(cfg.approval_mode)),
+        ),
+        _ if line.starts_with("/approval ") => {
+            let value = line.trim_start_matches("/approval ").trim();
+            if let Some(mode) = parse_approval_mode(value) {
+                set_approval_mode(mode, cfg, view, session);
+            } else {
+                append(view, "Approval mode must be manual, auto, bypass or plan.");
+            }
+        }
         _ if line.starts_with("/route") => {
             let value = line.strip_prefix("/route").unwrap_or("").trim();
             if value.is_empty() {
@@ -825,20 +1298,13 @@ fn submit_chat(
         _ if line.starts_with('/') => {
             append(view, "Unknown command. Type /help for available commands.")
         }
-        task => {
-            append(view, &format!("You  {task}"));
-            if session.busy {
-                session.queued.push_back(task.into());
-                append(view, &format!("Task queued ({})", session.queued.len()));
-            } else {
-                begin_turn(view, session);
-                session.start(task.into(), &mut |message| append(view, message));
-            }
-        }
+        task => submit_task(task, normal_mode, view, session),
     }
 }
 
 fn begin_turn(view: &mut tui::View, session: &Session) {
+    view.thinking_text.clear();
+    view.thinking_started = None;
     view.turn_usage_before = session.agents.snapshot()[0].usage;
     view.turn_started = Some(std::time::Instant::now());
     view.last_turn_elapsed = None;
@@ -857,6 +1323,191 @@ fn complete_turn(view: &mut tui::View, session: &Session) {
     view.last_turn_rate = (requests > 0 && missing == 0 && !elapsed.is_zero())
         .then(|| after.output.saturating_sub(before.output) as f64 / elapsed.as_secs_f64());
     view.last_turn_elapsed = Some(elapsed);
+}
+
+fn goal_idle_gate(session: &Session) -> IdleGate {
+    IdleGate {
+        idle: !session.busy && !session.closed && session.msgs.is_some(),
+        pending_user_work: !session.queued.is_empty()
+            || session.cfg.ui.as_ref().is_some_and(UiHandle::has_steering)
+            || session.goal_pending.is_some()
+            || session.goal_turn.is_some(),
+        pending_approval: session.pending.is_some(),
+        plan_mode: session.cfg.approval_mode == ApprovalMode::Plan,
+        interrupted: session.interrupted || session.cancelled.load(Ordering::Acquire),
+    }
+}
+
+fn maybe_start_goal(view: &mut tui::View, session: &mut Session) {
+    if session.goal_schedule_blocked {
+        return;
+    }
+    let mut gate = goal_idle_gate(session);
+    gate.pending_user_work |= !view.input.trim().is_empty()
+        || view.overlay != tui::Overlay::None
+        || view.page != tui::Page::Chat;
+    let Some(goal) = session.goal.as_mut() else {
+        return;
+    };
+    let previous_status = goal.status().map(|state| state.status);
+    let detail = goal
+        .status()
+        .and_then(|state| state.detail.clone())
+        .unwrap_or_default();
+    let permit = match goal.reserve_turn(gate) {
+        Ok(Some(permit)) => permit,
+        Ok(None) => {
+            if previous_status != goal.status().map(|state| state.status)
+                && goal
+                    .status()
+                    .is_some_and(|state| state.status == GoalStatus::BudgetLimited)
+            {
+                append(
+                    view,
+                    "Goal turn budget reached. Use /goal resume --max-turns N to extend it.",
+                );
+            }
+            return;
+        }
+        Err(error) => {
+            session.goal_schedule_blocked = true;
+            append(view, &format!("Goal could not reserve a turn: {error}"));
+            return;
+        }
+    };
+    let automatic = permit.turn > 1;
+    let task = if automatic {
+        format!(
+            "Continue the goal: {}\nAssessed progress: {}\nMake concrete progress, verify the result, and report what changed.",
+            permit.objective, detail
+        )
+    } else {
+        permit.objective.clone()
+    };
+    let history_start = session.msgs.as_ref().map_or(0, Vec::len);
+    session.goal_turn = Some(GoalTurn {
+        permit,
+        revision: session.goal_revision,
+        history_start,
+        automatic,
+    });
+    let turn = session.goal_turn.as_ref().unwrap().permit.turn;
+    let total = turn + session.goal_turn.as_ref().unwrap().permit.remaining;
+    append(view, &format!("Goal turn {turn}/{total} started."));
+    begin_turn(view, session);
+    session.start(task, &mut |message| append(view, message));
+    if !session.busy {
+        session.goal_turn = None;
+        session.pause_goal(
+            "Could not start goal worker; use /goal resume.",
+            &mut |message| append(view, message),
+        );
+    }
+}
+
+fn prepare_goal_judgement(
+    session: &mut Session,
+    result: &Result<AgentAnswer, String>,
+    msgs: &[Value],
+    view: &mut tui::View,
+) -> Option<(u64, u32, Cfg, String, String, Vec<Value>)> {
+    let turn = session.goal_turn.take()?;
+    let active = turn.revision == session.goal_revision
+        && session
+            .goal
+            .as_ref()
+            .and_then(GoalStore::status)
+            .is_some_and(|state| {
+                state.status == GoalStatus::Active
+                    && state.in_flight
+                    && state.turns_used == turn.permit.turn
+            });
+    if !active || session.interrupted {
+        return None;
+    }
+    let answer = match result {
+        Ok(answer) => answer.text().to_string(),
+        Err(error) => {
+            session.pause_goal(
+                &format!("Goal turn failed: {error}. Use /goal resume to continue."),
+                &mut |message| append(view, message),
+            );
+            return None;
+        }
+    };
+    let turn_messages = msgs.get(turn.history_start..).unwrap_or_default().to_vec();
+    let had_tool_activity = turn_messages.iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|content| content.starts_with("<out>\n"))
+    });
+    let revision = turn.revision;
+    let number = turn.permit.turn;
+    let objective = turn.permit.objective.clone();
+    session.goal_pending = Some(GoalPending {
+        turn,
+        had_tool_activity,
+    });
+    let mut cfg = session.cfg.clone();
+    cfg.ui = None;
+    Some((revision, number, cfg, objective, answer, turn_messages))
+}
+
+fn apply_goal_judgement(
+    session: &mut Session,
+    revision: u64,
+    turn: u32,
+    result: Result<GoalVerdict, String>,
+    view: &mut tui::View,
+) {
+    let valid = session.goal_pending.as_ref().is_some_and(|pending| {
+        pending.turn.revision == revision
+            && pending.turn.permit.turn == turn
+            && session.goal_revision == revision
+    });
+    if !valid {
+        return;
+    }
+    let pending = session.goal_pending.take().unwrap();
+    let Some(goal) = session.goal.as_mut() else {
+        return;
+    };
+    match result {
+        Ok(verdict) => {
+            if let Err(error) =
+                goal.finish_turn(verdict, pending.had_tool_activity, pending.turn.automatic)
+            {
+                append(
+                    view,
+                    &format!("Goal evaluation could not be saved: {error}"),
+                );
+                session.pause_goal(
+                    "Evaluation save failed; use /goal resume.",
+                    &mut |message| append(view, message),
+                );
+                return;
+            }
+            if let Some(state) = goal.status() {
+                append(
+                    view,
+                    &format!(
+                        "Goal {} ({}/{}): {}",
+                        state.status.name(),
+                        state.turns_used,
+                        state.max_turns,
+                        state.detail.as_deref().unwrap_or("")
+                    ),
+                );
+            }
+        }
+        Err(error) => {
+            session.pause_goal(
+                &format!("Evaluation failed: {error}. Use /goal resume to continue."),
+                &mut |message| append(view, message),
+            );
+        }
+    }
+    maybe_start_goal(view, session);
 }
 
 fn handle_setup_key(
@@ -914,6 +1565,9 @@ fn handle_setup_key(
                     2 => view.setup_key.chars().count(),
                     3 => view.setup_model.chars().count(),
                     4 => view.setup_reasoning.chars().count(),
+                    10..=12 => view.setup_limit_values[view.setup_field - 10]
+                        .chars()
+                        .count(),
                     _ => 0,
                 };
                 if view.setup_field == 3 && view.setup_models.is_empty() {
@@ -927,8 +1581,8 @@ fn handle_setup_key(
     if !view.setup_editing {
         let fields: &[usize] = match view.setup_tab {
             0 => &[0, 1, 2],
-            1 => &[3, 4, 7, 8],
-            _ => &[5, 6],
+            1 => &[3, 4, 7, 8, 10, 11, 12],
+            _ => &[5, 9, 6],
         };
         let index = fields
             .iter()
@@ -949,6 +1603,9 @@ fn handle_setup_key(
                     2 => view.setup_key.chars().count(),
                     3 => view.setup_model.chars().count(),
                     4 => view.setup_reasoning.chars().count(),
+                    10..=12 => view.setup_limit_values[view.setup_field - 10]
+                        .chars()
+                        .count(),
                     _ => 0,
                 };
             }
@@ -1104,6 +1761,18 @@ fn handle_setup_key(
             }
             _ => {}
         },
+        10..=12 => {
+            if key.code == KeyCode::Enter {
+                view.setup_editing = false;
+            } else {
+                let index = view.setup_field - 10;
+                let previous = view.setup_limit_values[index].clone();
+                edit_buffer(&mut view.setup_limit_values[index], &mut view.cursor, key);
+                if view.setup_limit_values[index] != previous {
+                    view.setup_limit_dirty[index] = true;
+                }
+            }
+        }
         5 => match key.code {
             KeyCode::Up => view.setup_helper_selected = (view.setup_helper_selected + 2) % 3,
             KeyCode::Down => view.setup_helper_selected = (view.setup_helper_selected + 1) % 3,
@@ -1121,6 +1790,18 @@ fn handle_setup_key(
             KeyCode::Enter => {
                 view.setup_editing = false;
             }
+            _ => {}
+        },
+        9 => match key.code {
+            KeyCode::Up => {
+                view.setup_approval_mode_selected = (view.setup_approval_mode_selected + 3) % 4;
+                view.setup_approval_mode_dirty = true;
+            }
+            KeyCode::Down => {
+                view.setup_approval_mode_selected = (view.setup_approval_mode_selected + 1) % 4;
+                view.setup_approval_mode_dirty = true;
+            }
+            KeyCode::Enter => view.setup_editing = false,
             _ => {}
         },
         _ => match key.code {
@@ -1274,15 +1955,62 @@ fn handle_chat_key(
         }
         return;
     }
+    if key.code == KeyCode::BackTab
+        || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+    {
+        if session.pending.is_none() {
+            let next = match cfg.approval_mode {
+                ApprovalMode::Manual => ApprovalMode::Auto,
+                ApprovalMode::Auto => ApprovalMode::Bypass,
+                ApprovalMode::Bypass => ApprovalMode::Plan,
+                ApprovalMode::Plan => ApprovalMode::Manual,
+            };
+            set_approval_mode(next, cfg, view, session);
+        }
+        return;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
         session.close(&mut |message| append(view, message));
         *exit = true;
         return;
     }
+    if view.slash_suggestions_open {
+        let matches = tui::slash_matches(&view.input);
+        if !matches.is_empty() {
+            match key.code {
+                KeyCode::Up => {
+                    view.slash_suggestion_selected =
+                        view.slash_suggestion_selected.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    view.slash_suggestion_selected =
+                        (view.slash_suggestion_selected + 1).min(matches.len() - 1);
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Enter if key.modifiers.is_empty() => {
+                    let command = matches[view.slash_suggestion_selected.min(matches.len() - 1)];
+                    view.input = command.name.into();
+                    if command.takes_argument {
+                        view.input.push(' ');
+                    }
+                    view.cursor = view.input.chars().count();
+                    view.slash_suggestions_open = false;
+                    return;
+                }
+                KeyCode::Esc => {
+                    view.slash_suggestions_open = false;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
     match key.code {
         KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             view.input.insert(byte_at(&view.input, view.cursor), '\n');
             view.cursor += 1;
+            view.slash_suggestions_open = false;
         }
         KeyCode::Enter
             if key
@@ -1291,11 +2019,32 @@ fn handle_chat_key(
         {
             view.input.insert(byte_at(&view.input, view.cursor), '\n');
             view.cursor += 1;
+            view.slash_suggestions_open = false;
         }
         KeyCode::Enter => {
             let line = std::mem::take(&mut view.input);
             view.cursor = 0;
+            view.slash_suggestions_open = false;
             submit_chat(line, cfg, view, session, request, exit);
+        }
+        KeyCode::Tab
+            if key.modifiers.is_empty()
+                && session.busy
+                && !view.input.trim().is_empty()
+                && !view.input.trim_start().starts_with('/') =>
+        {
+            let line = std::mem::take(&mut view.input);
+            view.cursor = 0;
+            view.slash_suggestions_open = false;
+            submit_chat_mode(
+                line,
+                cfg,
+                view,
+                session,
+                request,
+                exit,
+                SubmissionMode::Queue,
+            );
         }
         KeyCode::PageUp => view.scroll = view.scroll.saturating_add(8),
         KeyCode::PageDown => view.scroll = view.scroll.saturating_sub(8),
@@ -1318,9 +2067,17 @@ fn handle_chat_key(
         KeyCode::Esc => {
             view.input.clear();
             view.cursor = 0;
+            view.slash_suggestions_open = false;
         }
         _ => {
+            let previous = view.input.clone();
             edit_buffer(&mut view.input, &mut view.cursor, key);
+            if view.input != previous {
+                let matches = tui::slash_matches(&view.input);
+                view.slash_suggestions_open =
+                    !matches.is_empty() && !(matches.len() == 1 && matches[0].name == view.input);
+                view.slash_suggestion_selected = 0;
+            }
         }
     }
 }
@@ -1333,7 +2090,37 @@ fn handle_worker_event(
 ) {
     match event {
         Event::Progress(message) => append(view, &message),
-        Event::ModelPhase(active) => view.model_in_flight = active,
+        Event::Commentary(message) => {
+            if session
+                .as_ref()
+                .is_some_and(|session| session.busy && !session.interrupted && !session.closed)
+            {
+                let prose = truncate(terminal_safe(&message));
+                append(view, &format!("Revex  {prose}"));
+            }
+        }
+        Event::ModelPhase(active) => {
+            let in_flight = active
+                && session
+                    .as_ref()
+                    .is_some_and(|session| session.busy && !session.interrupted && !session.closed);
+            if in_flight && !view.model_in_flight {
+                view.thinking_started = Some(std::time::Instant::now());
+            } else if !in_flight {
+                view.thinking_started = None;
+            }
+            view.model_in_flight = in_flight;
+            view.thinking_text.clear();
+        }
+        Event::ReasoningChunk(chunk) => {
+            if view.model_in_flight
+                && session
+                    .as_ref()
+                    .is_some_and(|session| session.busy && !session.interrupted && !session.closed)
+            {
+                append_reasoning(view, &chunk);
+            }
+        }
         Event::Approval {
             what,
             preview,
@@ -1361,12 +2148,64 @@ fn handle_worker_event(
         }
         Event::Finished(result, msgs) => {
             view.model_in_flight = false;
+            view.thinking_started = None;
+            view.thinking_text.clear();
             if let Some(session) = session.as_mut() {
                 complete_turn(view, session);
+                refresh_context_usage(view, &session.cfg, &msgs);
+                let judgement = prepare_goal_judgement(session, &result, &msgs, view);
                 session.finished(result, msgs, &mut |message| append(view, message));
                 if session.busy {
                     begin_turn(view, session);
                 }
+                if let Some((revision, turn, cfg, objective, answer, turn_messages)) = judgement {
+                    let events = session.events.clone();
+                    let spawned = std::thread::Builder::new()
+                        .name("revex-goal-judge".into())
+                        .spawn(move || {
+                            let result = judge_goal(&cfg, &objective, &answer, &turn_messages);
+                            let _ = events.send(Event::GoalEvaluated {
+                                revision,
+                                turn,
+                                result,
+                            });
+                        });
+                    if let Err(error) = spawned {
+                        session.goal_pending = None;
+                        session.pause_goal(
+                            &format!("Evaluation could not start: {error}. Use /goal resume."),
+                            &mut |message| append(view, message),
+                        );
+                    }
+                } else {
+                    maybe_start_goal(view, session);
+                }
+            }
+        }
+        Event::Compacted(result) => {
+            view.compacting = false;
+            view.model_in_flight = false;
+            view.thinking_started = None;
+            view.thinking_text.clear();
+            if let Some(session) = session.as_mut() {
+                session.compact_finished(result, &mut |message| append(view, message));
+                if let Some(msgs) = session.msgs.as_ref() {
+                    refresh_context_usage(view, &session.cfg, msgs);
+                }
+                if session.busy {
+                    begin_turn(view, session);
+                } else {
+                    maybe_start_goal(view, session);
+                }
+            }
+        }
+        Event::GoalEvaluated {
+            revision,
+            turn,
+            result,
+        } => {
+            if let Some(session) = session.as_mut() {
+                apply_goal_judgement(session, revision, turn, result, view);
             }
         }
         Event::ModelsFetched {
@@ -1428,6 +2267,7 @@ pub(crate) fn run_tui(mut cfg: Cfg) -> Result<(), String> {
     let mut view = tui::View {
         cwd: launch.display().to_string(),
         model: cfg.model.clone().unwrap_or_else(|| "server default".into()),
+        approval_mode: approval_mode_name(cfg.approval_mode).into(),
         connection: if cfg.base.is_empty() {
             "setup required".into()
         } else {
@@ -1471,6 +2311,8 @@ pub(crate) fn run_tui(mut cfg: Cfg) -> Result<(), String> {
         }
         if SIGINT_REQUESTED.swap(false, Ordering::AcqRel) {
             view.model_in_flight = false;
+            view.thinking_started = None;
+            view.thinking_text.clear();
             if let Some(session) = session.as_mut() {
                 session.interrupt_turn(&mut |message| append(&mut view, message));
                 view.overlay = tui::Overlay::None;
@@ -1483,12 +2325,36 @@ pub(crate) fn run_tui(mut cfg: Cfg) -> Result<(), String> {
             handle_worker_event(event, &mut view, &mut session, request);
             dirty = true;
         }
+        if let Some(active) = session.as_mut() {
+            let before = view.transcript.len();
+            let was_busy = active.busy;
+            maybe_start_goal(&mut view, active);
+            if view.transcript.len() != before || active.busy != was_busy {
+                dirty = true;
+            }
+        }
         if session.as_ref().is_some_and(|s| s.closed) {
             break;
         }
         if let Some(session) = session.as_ref() {
             let main = &session.agents.snapshot()[0];
-            let status = format!("{}  |  {} queued", main.status.name(), session.queued.len());
+            let mut status = format!(
+                "{}  |  {} queued",
+                if session.compacting {
+                    "compacting"
+                } else {
+                    main.status.name()
+                },
+                session.queued.len()
+            );
+            if let Some(goal) = session.goal.as_ref().and_then(GoalStore::status) {
+                status.push_str(&format!(
+                    "  |  goal {} {}/{}",
+                    goal.status.name(),
+                    goal.turns_used,
+                    goal.max_turns
+                ));
+            }
             if view.status != status {
                 view.status = status;
                 dirty = true;
@@ -1549,6 +2415,8 @@ pub(crate) fn run_tui(mut cfg: Cfg) -> Result<(), String> {
         dirty = true;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             view.model_in_flight = false;
+            view.thinking_started = None;
+            view.thinking_text.clear();
             if let Some(session) = session.as_mut() {
                 session.interrupt_turn(&mut |message| append(&mut view, message));
                 view.overlay = tui::Overlay::None;
@@ -1902,7 +2770,7 @@ fn first_run_with(
         let Some(raw) = ask("  1/3  API base URL (or /exit): ", false)? else {
             return Ok(None);
         };
-        if raw == "/exit" || raw == "/quit" {
+        if raw == "/exit" {
             return Ok(None);
         }
         let value = raw.trim().trim_end_matches('/');
@@ -1919,7 +2787,7 @@ fn first_run_with(
     let Some(key) = ask("  2/3  API key (optional, hidden; Enter to skip): ", true)? else {
         return Ok(None);
     };
-    if key == "/exit" || key == "/quit" {
+    if key == "/exit" {
         return Ok(None);
     }
     let Some(model) = ask(
@@ -1929,7 +2797,7 @@ fn first_run_with(
     else {
         return Ok(None);
     };
-    if model == "/exit" || model == "/quit" {
+    if model == "/exit" {
         return Ok(None);
     }
     let mut settings = read_settings(path)?;
@@ -2161,6 +3029,8 @@ struct Session {
     events: Sender<Event>,
     cancelled: Arc<AtomicBool>,
     busy: bool,
+    compacting: bool,
+    compact_cancel: Option<Arc<AtomicBool>>,
     pending: Option<Sender<bool>>,
     queued: VecDeque<String>,
     closed: bool,
@@ -2168,6 +3038,23 @@ struct Session {
     prompt_history: Option<PromptHistory>,
     helper_selection: [bool; 3],
     tui: bool,
+    goal: Option<GoalStore>,
+    goal_revision: u64,
+    goal_turn: Option<GoalTurn>,
+    goal_pending: Option<GoalPending>,
+    goal_schedule_blocked: bool,
+}
+
+struct GoalTurn {
+    permit: TurnPermit,
+    revision: u64,
+    history_start: usize,
+    automatic: bool,
+}
+
+struct GoalPending {
+    turn: GoalTurn,
+    had_tool_activity: bool,
 }
 
 impl Session {
@@ -2177,6 +3064,7 @@ impl Session {
         cfg.ui = Some(UiHandle {
             events: events.clone(),
             cancelled: cancelled.clone(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
             suppress_routine: false,
             #[cfg(unix)]
             shell: Arc::new(ShellTracker::default()),
@@ -2188,6 +3076,8 @@ impl Session {
             events,
             cancelled,
             busy: false,
+            compacting: false,
+            compact_cancel: None,
             pending: None,
             queued: VecDeque::new(),
             closed: false,
@@ -2195,14 +3085,57 @@ impl Session {
             prompt_history: None,
             helper_selection: [true, false, false],
             tui: false,
+            goal: None,
+            goal_revision: 0,
+            goal_turn: None,
+            goal_pending: None,
+            goal_schedule_blocked: false,
+        }
+    }
+
+    fn pause_goal(&mut self, reason: &str, out: &mut dyn FnMut(&str)) {
+        let Some(goal) = self.goal.as_mut() else {
+            return;
+        };
+        if goal
+            .status()
+            .is_some_and(|state| state.status == GoalStatus::Active)
+        {
+            match goal.pause(reason) {
+                Ok(()) => {
+                    self.goal_revision = self.goal_revision.wrapping_add(1);
+                    self.goal_pending = None;
+                    out(&format!("Goal paused: {reason}"));
+                }
+                Err(error) => out(&format!("Goal could not be paused: {error}")),
+            }
         }
     }
 
     fn interrupt_turn(&mut self, out: &mut dyn FnMut(&str)) {
-        if !self.busy {
-            out("No task is running. Ctrl+D exits Revex.");
+        if self.compacting {
+            self.queued.clear();
+            if let Some(cancel) = &self.compact_cancel
+                && !cancel.swap(true, Ordering::AcqRel)
+            {
+                out("Stopping compaction; waiting for the summarizer to finish.");
+            }
             return;
         }
+        if !self.busy {
+            if self
+                .goal
+                .as_ref()
+                .and_then(GoalStore::status)
+                .is_some_and(|state| state.status == GoalStatus::Active)
+            {
+                self.pause_goal("Interrupted; use /goal resume to continue.", out);
+            } else {
+                out("No task is running. Ctrl+D exits Revex.");
+            }
+            return;
+        }
+        self.pause_goal("Interrupted; use /goal resume to continue.", out);
         self.cancelled.store(true, Ordering::Release);
         #[cfg(unix)]
         if let Some(ui) = &self.cfg.ui
@@ -2217,6 +3150,9 @@ impl Session {
             out(&format!("error: {e}"));
         }
         self.agents.shutdown();
+        if let Some(ui) = &self.cfg.ui {
+            ui.take_steering();
+        }
         self.queued.clear();
         self.interrupted = true;
         out("Interrupt requested; waiting for the current model request to stop.");
@@ -2245,6 +3181,7 @@ impl Session {
                 self.cfg.ui = Some(UiHandle {
                     events: self.events.clone(),
                     cancelled: self.cancelled.clone(),
+                    steering: Arc::new(Mutex::new(VecDeque::new())),
                     suppress_routine: self.tui,
                     #[cfg(unix)]
                     shell: Arc::new(ShellTracker::default()),
@@ -2259,6 +3196,10 @@ impl Session {
     }
 
     fn close(&mut self, out: &mut dyn FnMut(&str)) {
+        if let Some(cancel) = &self.compact_cancel {
+            cancel.store(true, Ordering::Release);
+        }
+        self.pause_goal("Session ended; use /goal resume to continue.", out);
         self.cancelled.store(true, Ordering::Release);
         #[cfg(unix)]
         if let Some(ui) = &self.cfg.ui
@@ -2301,9 +3242,81 @@ impl Session {
         }
     }
 
+    fn start_compaction(&mut self, out: &mut dyn FnMut(&str)) {
+        if self.busy || self.pending.is_some() {
+            out("Finish the active task before /compact.");
+            return;
+        }
+        let Some(msgs) = self.msgs.as_ref() else {
+            out("Conversation history is unavailable for /compact.");
+            return;
+        };
+        let msgs = msgs.clone();
+        let mut cfg = self.cfg.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(ui) = cfg.ui.as_mut() {
+            ui.cancelled = cancel.clone();
+        }
+        self.busy = true;
+        self.compacting = true;
+        self.compact_cancel = Some(cancel);
+        let events = self.events.clone();
+        let spawned = std::thread::Builder::new()
+            .name("revex-compact".into())
+            .spawn(move || {
+                let result = compact_context(&cfg, &msgs, true);
+                let _ = events.send(Event::Compacted(result));
+            });
+        if let Err(error) = spawned {
+            self.busy = false;
+            self.compacting = false;
+            self.compact_cancel = None;
+            out(&format!("Could not start compaction: {error}"));
+        } else {
+            out("Compacting older context...");
+        }
+    }
+
+    fn compact_finished(
+        &mut self,
+        result: Result<context::CompactionReport, String>,
+        out: &mut dyn FnMut(&str),
+    ) {
+        if !self.compacting {
+            return;
+        }
+        self.busy = false;
+        self.compacting = false;
+        self.compact_cancel = None;
+        match result {
+            Ok(report) => {
+                out(&format!(
+                    "Context compacted: {} older messages summarized, {} recent kept; estimated ~{}/{} tokens.",
+                    report.summarized_messages,
+                    report.kept_messages,
+                    report.estimated_tokens,
+                    report.budget_tokens
+                ));
+                if report.omitted_messages > 0 {
+                    out(&format!(
+                        "{} older messages remain outside the request view; run /compact again if needed.",
+                        report.omitted_messages
+                    ));
+                }
+            }
+            Err(error) => out(&format!("Context not compacted: {error}")),
+        }
+        while !self.busy && !self.closed {
+            let Some(task) = self.queued.pop_front() else {
+                break;
+            };
+            self.line(&task, out);
+        }
+    }
+
     fn line(&mut self, line: &str, out: &mut dyn FnMut(&str)) {
         let line = line.trim();
-        if matches!(line, "/exit" | "/quit") {
+        if line == "/exit" {
             self.close(out);
             return;
         }
@@ -2387,9 +3400,21 @@ impl Session {
     ) {
         self.busy = false;
         self.msgs = Some(msgs);
+        if let Some(ui) = &self.cfg.ui {
+            self.queued.extend(ui.take_steering());
+        }
         if self.interrupted {
             self.interrupted = false;
             self.reset_after_interrupt(out);
+            if self.closed {
+                return;
+            }
+            while !self.busy {
+                let Some(line) = self.queued.pop_front() else {
+                    break;
+                };
+                self.line(&line, out);
+            }
             return;
         }
         match result {
@@ -2440,7 +3465,8 @@ fn run_loop(
             Ok(Event::Input(line)) => session.line(&line, out),
             Ok(Event::Eof) => session.close(out),
             Ok(Event::Progress(message)) => out(&message),
-            Ok(Event::ModelPhase(_)) => {}
+            Ok(Event::Commentary(_)) => {}
+            Ok(Event::ModelPhase(_)) | Ok(Event::ReasoningChunk(_)) => {}
             Ok(Event::Approval {
                 what,
                 preview,
@@ -2458,6 +3484,8 @@ fn run_loop(
                 }
             }
             Ok(Event::Finished(result, msgs)) => session.finished(result, msgs, out),
+            Ok(Event::Compacted(result)) => session.compact_finished(result, out),
+            Ok(Event::GoalEvaluated { .. }) => {}
             Ok(Event::ModelsFetched { .. }) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => session.close(out),
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -2517,6 +3545,7 @@ pub(crate) fn call_summary(call: &Call) -> String {
         Call::Search(pattern, _) => format!("search {}", short(pattern, 100)),
         Call::Sh(cmd) => format!("sh {}", short(cmd, 100)),
         Call::Mcp(server, tool, _) => format!("mcp {} {}", short(server, 50), short(tool, 50)),
+        Call::Review(scope) => format!("review {}", short(scope, 100)),
         Call::Spawn(task) => format!("spawn {}", short(task, 100)),
         Call::Wait(ids) => format!("wait {}", short(&ids.join(" "), 100)),
         Call::Invalid(message) => format!("invalid {}", short(message, 100)),
@@ -2605,6 +3634,9 @@ mod tests {
             route: Route::Off,
             decision_model: "clef".into(),
             response_language: ResponseLanguage::English,
+            approval_mode: ApprovalMode::Manual,
+            max_steps: 100,
+            limits: RequestLimits::default(),
             api: Api::Chat,
             base,
             key: String::new(),
@@ -2617,6 +3649,208 @@ mod tests {
             role: Role::Parent(Some(agents.clone())),
             ui: None,
         }
+    }
+
+    #[test]
+    fn goal_command_parses_controls_and_turn_limit() {
+        assert!(matches!(parse_goal_command(""), Ok(GoalCommand::Status)));
+        assert!(matches!(
+            parse_goal_command("status"),
+            Ok(GoalCommand::Status)
+        ));
+        assert!(matches!(
+            parse_goal_command("pause"),
+            Ok(GoalCommand::Pause)
+        ));
+        assert!(matches!(
+            parse_goal_command("resume --max-turns 30"),
+            Ok(GoalCommand::Resume(Some(30)))
+        ));
+        assert!(matches!(
+            parse_goal_command("clear"),
+            Ok(GoalCommand::Clear)
+        ));
+        assert!(matches!(
+            parse_goal_command("--max-turns 4 inspect parser"),
+            Ok(GoalCommand::Set { objective, max_turns: Some(4) }) if objective == "inspect parser"
+        ));
+        assert!(parse_goal_command("--max-turns nope inspect parser").is_err());
+        assert!(parse_goal_command("--max-turns 4").is_err());
+    }
+
+    #[test]
+    fn compact_rejects_busy_without_touching_history_or_queue() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let mut config = cfg(PathBuf::from("/tmp"), "http://unused".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut session = Session::new(config.clone(), fresh_history(), agents, tx);
+        session.busy = true;
+        session.queued.push_back("later".into());
+        let mut view = tui::View::default();
+        let mut request = 0;
+        let mut exit = false;
+        submit_chat(
+            "/compact".into(),
+            &mut config,
+            &mut view,
+            &mut session,
+            &mut request,
+            &mut exit,
+        );
+        assert!(!session.compacting);
+        assert_eq!(session.msgs.as_ref().unwrap().len(), 1);
+        assert_eq!(session.queued.front().map(String::as_str), Some("later"));
+        assert!(
+            view.transcript
+                .iter()
+                .any(|line| line.contains("Finish the active task before /compact"))
+        );
+    }
+
+    #[test]
+    fn queued_user_task_pauses_goal_and_skips_old_turn_judgement() {
+        let dir = temp_dir("goal-queue-priority");
+        let history = history_for(&dir, Path::new("/work/goal-queue-priority"));
+        let mut goal = GoalStore::load(&history.path, &history.cwd).unwrap();
+        goal.set("Inspect parser", Some(3)).unwrap();
+        let permit = goal
+            .reserve_turn(IdleGate {
+                idle: true,
+                ..IdleGate::default()
+            })
+            .unwrap()
+            .unwrap();
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let config = cfg(dir.clone(), "http://unused".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut session = Session::new(config, fresh_history(), agents, tx);
+        session.goal = Some(goal);
+        session.goal_turn = Some(GoalTurn {
+            permit,
+            revision: 0,
+            history_start: 1,
+            automatic: false,
+        });
+        session.busy = true;
+        let mut view = tui::View::default();
+        submit_task(
+            "User's next task",
+            SubmissionMode::Queue,
+            &mut view,
+            &mut session,
+        );
+        assert_eq!(
+            session.queued.front().map(String::as_str),
+            Some("User's next task")
+        );
+        assert_eq!(
+            session.goal.as_ref().unwrap().status().unwrap().status,
+            GoalStatus::Paused
+        );
+        assert_eq!(session.goal_revision, 1);
+        assert!(
+            prepare_goal_judgement(
+                &mut session,
+                &Ok(AgentAnswer::Streamed("old answer".into())),
+                &fresh_history(),
+                &mut view
+            )
+            .is_none()
+        );
+        assert!(session.goal_pending.is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn paused_goal_ignores_late_evaluator_result() {
+        let dir = temp_dir("goal-stale-evaluator");
+        let history = history_for(&dir, Path::new("/work/goal-stale-evaluator"));
+        let mut goal = GoalStore::load(&history.path, &history.cwd).unwrap();
+        goal.set("Inspect parser", Some(3)).unwrap();
+        let permit = goal
+            .reserve_turn(IdleGate {
+                idle: true,
+                ..IdleGate::default()
+            })
+            .unwrap()
+            .unwrap();
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let config = cfg(dir.clone(), "http://unused".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut session = Session::new(config, fresh_history(), agents, tx);
+        session.goal = Some(goal);
+        session.goal_pending = Some(GoalPending {
+            turn: GoalTurn {
+                permit,
+                revision: 0,
+                history_start: 1,
+                automatic: false,
+            },
+            had_tool_activity: true,
+        });
+        let mut view = tui::View::default();
+        handle_goal_command("pause", &mut view, &mut session);
+        apply_goal_judgement(
+            &mut session,
+            0,
+            1,
+            Ok(GoalVerdict::Complete {
+                evidence: "stale conclusion".into(),
+            }),
+            &mut view,
+        );
+        let state = session.goal.as_ref().unwrap().status().unwrap();
+        assert_eq!(state.status, GoalStatus::Paused);
+        assert_eq!(state.turns_used, 1);
+        assert!(session.goal_pending.is_none());
+        handle_goal_command("clear", &mut view, &mut session);
+        apply_goal_judgement(
+            &mut session,
+            0,
+            1,
+            Ok(GoalVerdict::Complete {
+                evidence: "another stale conclusion".into(),
+            }),
+            &mut view,
+        );
+        assert!(session.goal.as_ref().unwrap().status().is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn failed_goal_reservation_reports_once_and_never_starts_worker() {
+        let dir = temp_dir("goal-reservation-error");
+        let history = history_for(&dir, Path::new("/work/goal-reservation-error"));
+        let mut goal = GoalStore::load(&history.path, &history.cwd).unwrap();
+        goal.set("Inspect parser", Some(2)).unwrap();
+        let sidecar = history.path.with_extension("goal.json");
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::create_dir(&sidecar).unwrap();
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let config = cfg(dir.clone(), "http://unused".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut session = Session::new(config, fresh_history(), agents, tx);
+        session.goal = Some(goal);
+        let mut view = tui::View {
+            page: tui::Page::Chat,
+            ..tui::View::default()
+        };
+        maybe_start_goal(&mut view, &mut session);
+        maybe_start_goal(&mut view, &mut session);
+        assert!(!session.busy);
+        assert!(session.goal_schedule_blocked);
+        assert_eq!(
+            view.transcript
+                .iter()
+                .filter(|line| line.contains("Goal could not reserve a turn"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            session.goal.as_ref().unwrap().status().unwrap().turns_used,
+            0
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -3220,6 +4454,7 @@ mod tests {
             &mut exit,
         );
         assert!(view.transcript.last().unwrap().contains("/exit or exit"));
+        assert!(!view.transcript.last().unwrap().contains("/quit"));
         assert!(
             view.transcript
                 .last()
@@ -3230,6 +4465,16 @@ mod tests {
         assert!(!view.transcript.last().unwrap().contains("Shift+Enter"));
         assert!(!exit);
         submit_chat(
+            "/quit".into(),
+            &mut config,
+            &mut view,
+            &mut session,
+            &mut request,
+            &mut exit,
+        );
+        assert!(!exit);
+        assert!(view.transcript.last().unwrap().contains("Unknown command"));
+        submit_chat(
             "exit".into(),
             &mut config,
             &mut view,
@@ -3238,6 +4483,189 @@ mod tests {
             &mut exit,
         );
         assert!(exit);
+    }
+
+    #[test]
+    fn provider_reasoning_stays_bounded_and_sanitized() {
+        let mut view = tui::View::default();
+        append_reasoning(&mut view, "\x1b[31mfirst\n");
+        append_reasoning(&mut view, &"あ".repeat(MAX_THINKING_BYTES));
+        assert!(view.thinking_text.len() <= MAX_THINKING_BYTES);
+        assert!(!view.thinking_text.contains('\x1b'));
+        assert!(view.thinking_text.ends_with('あ'));
+        assert!(view.transcript.is_empty());
+    }
+
+    #[test]
+    fn model_phase_timer_starts_once_and_clears_when_generation_ends() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut active = Session::new(config, fresh_history(), agents, tx);
+        active.busy = true;
+        let mut session = Some(active);
+        let mut view = tui::View::default();
+
+        handle_worker_event(Event::ModelPhase(true), &mut view, &mut session, 0);
+        assert!(view.model_in_flight);
+        let started = view.thinking_started.expect("model phase starts timer");
+        handle_worker_event(Event::ModelPhase(true), &mut view, &mut session, 0);
+        assert_eq!(view.thinking_started, Some(started));
+
+        handle_worker_event(Event::ModelPhase(false), &mut view, &mut session, 0);
+        assert!(!view.model_in_flight);
+        assert!(view.thinking_started.is_none());
+    }
+
+    #[test]
+    fn interrupted_turn_ignores_late_reasoning_and_model_phase() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut active = Session::new(config, fresh_history(), agents, tx);
+        active.busy = true;
+        let mut session = Some(active);
+        let mut view = tui::View::default();
+        handle_worker_event(Event::ModelPhase(true), &mut view, &mut session, 0);
+        handle_worker_event(
+            Event::ReasoningChunk("visible".into()),
+            &mut view,
+            &mut session,
+            0,
+        );
+        assert_eq!(view.thinking_text, "visible");
+        session.as_mut().unwrap().interrupted = true;
+        view.model_in_flight = false;
+        view.thinking_text.clear();
+        handle_worker_event(Event::ModelPhase(true), &mut view, &mut session, 0);
+        handle_worker_event(
+            Event::ReasoningChunk("stale".into()),
+            &mut view,
+            &mut session,
+            0,
+        );
+        assert!(!view.model_in_flight);
+        assert!(view.thinking_text.is_empty());
+    }
+
+    #[test]
+    fn busy_chat_steering_keeps_every_instruction_in_order() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let mut config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut session = Session::new(config.clone(), fresh_history(), agents, tx);
+        session.busy = true;
+        let mut view = tui::View {
+            model_in_flight: true,
+            ..tui::View::default()
+        };
+        let mut request = 0;
+        let mut exit = false;
+        for instruction in ["use the smaller file", "then explain the result"] {
+            submit_chat(
+                instruction.into(),
+                &mut config,
+                &mut view,
+                &mut session,
+                &mut request,
+                &mut exit,
+            );
+        }
+        let ui = session.cfg.ui.as_ref().unwrap();
+        assert!(ui.has_steering());
+        assert_eq!(
+            ui.take_steering(),
+            vec!["use the smaller file", "then explain the result"]
+        );
+        assert!(session.queued.is_empty());
+        assert!(
+            view.transcript
+                .iter()
+                .any(|line| line.contains("Instruction added; applying at next step"))
+        );
+        assert!(!exit);
+    }
+
+    #[test]
+    fn busy_tab_queues_whole_task_without_steering_and_commands_choose_mode() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let mut config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut active = Session::new(config.clone(), fresh_history(), agents, tx);
+        active.busy = true;
+        let mut session = Some(active);
+        let mut view = tui::View {
+            input: "run this afterward".into(),
+            cursor: "run this afterward".chars().count(),
+            ..tui::View::default()
+        };
+        let mut request = 0;
+        let mut exit = false;
+        handle_chat_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut config,
+            &mut view,
+            &mut session,
+            &mut request,
+            &mut exit,
+        );
+        let active = session.as_mut().unwrap();
+        assert_eq!(
+            active.queued.front().map(String::as_str),
+            Some("run this afterward")
+        );
+        assert!(!active.cfg.ui.as_ref().unwrap().has_steering());
+        assert!(view.input.is_empty());
+        assert!(view.transcript.last().unwrap().contains("Task queued"));
+        submit_chat(
+            "/queue another task".into(),
+            &mut config,
+            &mut view,
+            active,
+            &mut request,
+            &mut exit,
+        );
+        submit_chat(
+            "/steer correction".into(),
+            &mut config,
+            &mut view,
+            active,
+            &mut request,
+            &mut exit,
+        );
+        assert_eq!(
+            active.queued.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["run this afterward", "another task"]
+        );
+        assert_eq!(
+            active.cfg.ui.as_ref().unwrap().take_steering(),
+            ["correction"]
+        );
+    }
+
+    #[test]
+    fn commentary_event_is_assistant_prose_only_during_active_turn() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut active = Session::new(config, fresh_history(), agents, tx);
+        active.busy = true;
+        let mut session = Some(active);
+        let mut view = tui::View::default();
+        handle_worker_event(
+            Event::Commentary(format!("\x1b[31mchecking {}", "x".repeat(10_000))),
+            &mut view,
+            &mut session,
+            0,
+        );
+        let shown = view.transcript.last().unwrap();
+        assert!(shown.starts_with("Revex  "));
+        assert!(shown.contains("checking"));
+        assert!(!shown.contains('\x1b'));
+        assert!(shown.len() <= MAX_OUT + 100);
+        session.as_mut().unwrap().busy = false;
+        handle_worker_event(Event::Commentary("late".into()), &mut view, &mut session, 0);
+        assert_eq!(view.transcript.len(), 1);
     }
 
     #[test]
@@ -3559,6 +4987,8 @@ mod tests {
         assert_eq!(view.setup_helpers, [false, true, true]);
         key!(KeyCode::Enter);
         assert!(!view.setup_editing);
+        key!(KeyCode::Down);
+        assert_eq!(view.setup_field, 9);
         key!(KeyCode::Down);
         assert_eq!(view.setup_field, 6);
     }
@@ -4107,6 +5537,7 @@ mod tests {
         cfg.ui = Some(UiHandle {
             events,
             cancelled,
+            steering: Arc::new(Mutex::new(VecDeque::new())),
             suppress_routine: false,
             #[cfg(unix)]
             shell: Arc::new(ShellTracker::default()),
@@ -4152,6 +5583,7 @@ mod tests {
             config.ui = Some(UiHandle {
                 events,
                 cancelled: Arc::new(AtomicBool::new(false)),
+                steering: Arc::new(Mutex::new(VecDeque::new())),
                 suppress_routine: false,
                 #[cfg(unix)]
                 shell: Arc::new(ShellTracker::default()),

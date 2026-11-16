@@ -35,6 +35,36 @@ def auth_file(home):
     return pathlib.Path(home, ".revex", "auth.json")
 
 
+def goal_file(home, cwd):
+    identity = str(pathlib.Path(cwd).resolve()).encode()
+    value = 0xCBF29CE484222325
+    for byte in identity:
+        value = ((value ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return pathlib.Path(home, ".local/state/revex", f"history-{value:016x}.goal.json")
+
+
+def history_file(home, cwd):
+    path = goal_file(home, cwd)
+    return path.with_name(path.name.replace(".goal.json", ".json"))
+
+
+def seed_long_history(home, cwd):
+    path = history_file(home, cwd)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    messages = [{"role": "system", "content": "old system prompt"}]
+    for index in range(48):
+        messages.append({"role": "user", "content": f"archive-{index} " + "x" * 150})
+        messages.append({"role": "assistant", "content": f"finding-{index} " + "y" * 150})
+    body = json.dumps({
+        "version": 1,
+        "cwd": str(pathlib.Path(cwd).resolve()),
+        "messages": messages,
+    }).encode()
+    path.write_bytes(body)
+    path.chmod(0o600)
+    return path, body
+
+
 def seed_settings(home, data):
     path = settings_file(home)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -65,7 +95,7 @@ def seed_settings(home, data):
 
 
 class Terminal:
-    def __init__(self, cwd, home, extra=None, columns=100):
+    def __init__(self, cwd, home, extra=None, columns=100, args=()):
         self.columns = columns
         self.master, self.slave = pty.openpty()
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, columns, 0, 0))
@@ -80,11 +110,15 @@ class Terminal:
             "REVEX_BASE_URL", "REVEX_MODEL", "REVEX_API_KEY", "REVEX_API",
             "REVEX_ROUTE", "REVEX_FRONTIER", "REVEX_EXTRA",
             "REVEX_RESPONSE_LANGUAGE",
+            "REVEX_APPROVAL_MODE",
+            "REVEX_CONTEXT_BUDGET_TOKENS",
+            "REVEX_MAX_OUTPUT_TOKENS",
+            "REVEX_REQUEST_DEADLINE_SECONDS",
         ):
             env.pop(key, None)
         env.update(extra or {})
         self.child = subprocess.Popen(
-            [str(BIN)], cwd=cwd, stdin=self.slave, stdout=self.slave,
+            [str(BIN), *args], cwd=cwd, stdin=self.slave, stdout=self.slave,
             stderr=self.slave, env=env,
         )
         self.output = b""
@@ -197,7 +231,11 @@ class Terminal:
         )
 
     def exit(self):
-        self.child.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while self.child.poll() is None and time.monotonic() < deadline:
+            self.read_for(0.05)
+        if self.child.poll() is None:
+            raise subprocess.TimeoutExpired(self.child.args, 5)
         self.read_for(0.1)
         assert self.child.returncode == 0, self.output[-1200:]
         assert b"\x1b[?1049l" in self.output, "alternate screen not restored"
@@ -225,7 +263,7 @@ def sse(conn, text):
 
 
 class FakeServer:
-    def __init__(self):
+    def __init__(self, first_reply=None, later_replies=("done",), hold_second=False):
         self.listener = socket.socket()
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen(8)
@@ -235,13 +273,19 @@ class FakeServer:
         self.release = threading.Event()
         self.finished = threading.Event()
         self.error = None
+        self.requests = []
+        self.first_reply = first_reply or ">> write edited.txt <<EOF\nchanged\nEOF"
+        self.later_replies = later_replies
+        self.hold_second = hold_second
+        self.second_started = threading.Event()
+        self.release_second = threading.Event()
         self.thread = threading.Thread(target=self.serve, daemon=True)
         self.thread.start()
 
     def serve(self):
         try:
             posts = 0
-            while posts < 2:
+            while posts < 1 + len(self.later_replies):
                 conn, _ = self.listener.accept()
                 conn.settimeout(4)
                 with conn:
@@ -264,19 +308,29 @@ class FakeServer:
                         )
                         continue
                     assert b"POST /chat/completions" in headers
+                    while len(body_read) < length:
+                        body_read += conn.recv(4096)
+                    self.requests.append(json.loads(body_read[:length]))
                     posts += 1
                     if posts == 1:
                         self.blocked.set()
                         assert self.release.wait(5), "first model reply was never released"
-                        sse(conn, ">> write edited.txt <<EOF\nchanged\nEOF")
+                        try:
+                            sse(conn, self.first_reply)
+                        except BrokenPipeError:
+                            pass  # steering may abort the old model response
                     else:
-                        sse(conn, "done")
+                        if posts == 2 and self.hold_second:
+                            self.second_started.set()
+                            assert self.release_second.wait(5), "second model reply was never released"
+                        sse(conn, self.later_replies[posts - 2])
             self.finished.set()
         except Exception as exc:
             self.error = exc
 
     def close(self):
         self.release.set()
+        self.release_second.set()
         self.thread.join(timeout=7)
         self.listener.close()
         if self.error:
@@ -284,16 +338,92 @@ class FakeServer:
         assert self.finished.is_set(), "fake server did not finish"
 
 
+class FakeHeldResponseSteeringServer:
+    """Hold the first response until the test releases it, then serve the next request."""
+
+    def __init__(self):
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(8)
+        self.listener.settimeout(0.05)
+        self.base = f"http://127.0.0.1:{self.listener.getsockname()[1]}"
+        self.first_started = threading.Event()
+        self.release_first = threading.Event()
+        self.first_finished = threading.Event()
+        self.second_finished = threading.Event()
+        self.stopping = threading.Event()
+        self.requests = []
+        self.first_conn = None
+        self.error = None
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        try:
+            while len(self.requests) < 2 and not self.stopping.is_set():
+                if self.first_conn is not None and self.release_first.is_set() and not self.first_finished.is_set():
+                    sse(self.first_conn, "completed first response")
+                    self.first_conn.close()
+                    self.first_conn = None
+                    self.first_finished.set()
+                try:
+                    conn, _ = self.listener.accept()
+                except socket.timeout:
+                    continue
+                conn.settimeout(4)
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    data += conn.recv(4096)
+                headers, body = data.split(b"\r\n\r\n", 1)
+                length = 0
+                for line in headers.split(b"\r\n"):
+                    if line.lower().startswith(b"content-length:"):
+                        length = int(line.split(b":", 1)[1].strip())
+                while len(body) < length:
+                    body += conn.recv(4096)
+                if b"GET /models" in headers:
+                    payload = b'{"data":[{"id":"fake-model"}]}'
+                    conn.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        + f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode()
+                        + payload
+                    )
+                    conn.close()
+                    continue
+                assert b"POST /chat/completions" in headers
+                self.requests.append(json.loads(body[:length]))
+                if len(self.requests) == 1:
+                    self.first_conn = conn
+                    self.first_started.set()
+                    continue  # Deliberately delay response headers until released.
+                sse(conn, "steered final answer")
+                conn.close()
+                self.second_finished.set()
+        except Exception as exc:
+            self.error = exc
+
+    def close(self):
+        self.stopping.set()
+        self.release_first.set()
+        if self.first_conn is not None:
+            self.first_conn.close()
+        self.thread.join(timeout=7)
+        self.listener.close()
+        if self.error:
+            raise self.error
+
+
 class FakeHelperDispatchServer:
     """Parent SSE sequence that asks for two helpers, waits, then finishes."""
 
-    def __init__(self, interrupt_first=False):
+    def __init__(self, interrupt_first=False, review_handoff_marker=None):
         self.listener = socket.socket()
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen(8)
         self.listener.settimeout(7)
         self.base = f"http://127.0.0.1:{self.listener.getsockname()[1]}"
         self.interrupt_first = interrupt_first
+        self.review_handoff_marker = review_handoff_marker
         self.blocked = threading.Event()
         self.release = threading.Event()
         self.finished = threading.Event()
@@ -329,7 +459,22 @@ class FakeHelperDispatchServer:
                     assert b"POST /chat/completions" in headers
                     posts += 1
                     body = json.loads(body_read[:length])
-                    if self.interrupt_first:
+                    if self.review_handoff_marker is not None:
+                        if posts == 1:
+                            assert "Analyze sample.bin parser validation." in body["messages"][-1]["content"]
+                            reply = ">> review @codex Analyze sample.bin parser validation."
+                        elif posts == 2:
+                            last = body["messages"][-1]["content"]
+                            assert "reviewed:r1" in last, last
+                            assert not self.review_handoff_marker.exists(), "execution began before review acceptance"
+                            reply = ">> spawn @codex reviewed:r1"
+                        elif posts == 3:
+                            reply = ">> wait a1"
+                        else:
+                            last = body["messages"][-1]["content"]
+                            assert "parser finding: parse_header checks magic" in last, last
+                            reply = "The parser validates the magic in parse_header."
+                    elif self.interrupt_first:
                         if posts == 1:
                             self.blocked.set()
                             assert self.release.wait(5), "interrupted request was never released"
@@ -367,8 +512,161 @@ class FakeHelperDispatchServer:
         assert self.finished.is_set(), "helper dispatch server did not finish"
 
 
+class FakeGoalServer:
+    """Two tool-bearing turns and independent tool-free goal judgements."""
+
+    def __init__(self):
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(8)
+        self.listener.settimeout(8)
+        self.base = f"http://127.0.0.1:{self.listener.getsockname()[1]}"
+        self.requests = []
+        self.finished = threading.Event()
+        self.error = None
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        try:
+            while len(self.requests) < 6:
+                conn, _ = self.listener.accept()
+                conn.settimeout(5)
+                with conn:
+                    head = b""
+                    while b"\r\n\r\n" not in head:
+                        head += conn.recv(4096)
+                    headers, body_read = head.split(b"\r\n\r\n", 1)
+                    length = next(
+                        (int(line.split(b":", 1)[1].strip()) for line in headers.split(b"\r\n")
+                         if line.lower().startswith(b"content-length:")), 0
+                    )
+                    while len(body_read) < length:
+                        body_read += conn.recv(4096)
+                    if b"GET /models" in headers:
+                        body = b'{"data":[{"id":"fake-goal"}]}'
+                        conn.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                            + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                            + body
+                        )
+                        continue
+                    assert b"POST /chat/completions" in headers
+                    request = json.loads(body_read[:length])
+                    self.requests.append(request)
+                    number = len(self.requests)
+                    is_judge = "tool-free evaluator" in request["messages"][0]["content"]
+                    if number == 1:
+                        assert not is_judge
+                        reply = ">> read evidence.txt"
+                    elif number == 2:
+                        assert not is_judge
+                        reply = "Initial parser trace collected."
+                    elif number == 3:
+                        assert is_judge
+                        reply = json.dumps({
+                            "status": "continue", "progress": True,
+                            "evidence": "Parser trace collected; verify it once more.", "quote": "",
+                        })
+                    elif number == 4:
+                        assert not is_judge
+                        assert "Continue the goal" in request["messages"][-1]["content"]
+                        reply = ">> read evidence.txt"
+                    elif number == 5:
+                        assert not is_judge
+                        reply = "Validated parser trace."
+                    else:
+                        assert is_judge
+                        reply = json.dumps({
+                            "status": "complete", "progress": True,
+                            "evidence": "The evidence file confirms the parser behavior.",
+                            "quote": "parser verified in evidence file",
+                        })
+                    sse(conn, reply)
+            self.finished.set()
+        except Exception as exc:
+            self.error = exc
+
+    def close(self):
+        self.thread.join(timeout=8)
+        self.listener.close()
+        if self.error:
+            raise self.error
+        assert self.finished.is_set(), "goal server did not finish"
+
+
+class FakeContextServer:
+    """Serve bounded context summaries and one ordinary chat reply."""
+
+    def __init__(self, hold_summary=False):
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(8)
+        self.listener.settimeout(8)
+        self.base = f"http://127.0.0.1:{self.listener.getsockname()[1]}"
+        self.summaries = []
+        self.chats = []
+        self.summary_started = threading.Event()
+        self.release_summary = threading.Event()
+        if not hold_summary:
+            self.release_summary.set()
+        self.finished = threading.Event()
+        self.error = None
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        try:
+            while not self.finished.is_set():
+                conn, _ = self.listener.accept()
+                conn.settimeout(6)
+                with conn:
+                    head = b""
+                    while b"\r\n\r\n" not in head:
+                        head += conn.recv(4096)
+                    headers, body_read = head.split(b"\r\n\r\n", 1)
+                    length = next(
+                        (int(line.split(b":", 1)[1].strip()) for line in headers.split(b"\r\n")
+                         if line.lower().startswith(b"content-length:")), 0
+                    )
+                    while len(body_read) < length:
+                        body_read += conn.recv(4096)
+                    if b"GET /models" in headers:
+                        body = b'{"data":[{"id":"fake-context"}]}'
+                        conn.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                            + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                            + body
+                        )
+                        continue
+                    assert b"POST /chat/completions" in headers
+                    request = json.loads(body_read[:length])
+                    if "Summarize prior Revex conversation facts" in request["messages"][0]["content"]:
+                        self.summaries.append(request)
+                        self.summary_started.set()
+                        assert self.release_summary.wait(7), "summary was never released"
+                        try:
+                            sse(conn, "Archived parser evidence and open verification work.")
+                        except BrokenPipeError:
+                            pass  # Ctrl+C may close an in-flight summary request.
+                    else:
+                        self.chats.append(request)
+                        sse(conn, "bounded reply")
+                        self.finished.set()
+        except Exception as exc:
+            self.error = exc
+
+    def close(self):
+        self.release_summary.set()
+        self.thread.join(timeout=8)
+        self.listener.close()
+        if self.error:
+            raise self.error
+        assert self.finished.is_set(), "context server did not finish"
+
+
 class FakeSingleReplyServer:
-    def __init__(self, reply_count=1):
+    def __init__(self, reply_count=1, reasoning=None):
         self.listener = socket.socket()
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen(4)
@@ -376,6 +674,9 @@ class FakeSingleReplyServer:
         self.base = f"http://127.0.0.1:{self.listener.getsockname()[1]}"
         self.user_input = None
         self.reply_count = reply_count
+        self.reasoning = reasoning
+        self.reasoning_sent = threading.Event()
+        self.release_final = threading.Event()
         self.requests = []
         self.finished = threading.Event()
         self.error = None
@@ -410,12 +711,24 @@ class FakeSingleReplyServer:
                     request = json.loads(body[:length])
                     self.requests.append(request)
                     self.user_input = request["messages"][-1]["content"]
-                    sse(conn, "multiline done")
+                    if self.reasoning is None:
+                        sse(conn, "multiline done")
+                    else:
+                        delta = json.dumps({"choices": [{"delta": {"reasoning_content": self.reasoning}}]})
+                        conn.sendall((
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                            f"data: {delta}\n\n"
+                        ).encode())
+                        self.reasoning_sent.set()
+                        assert self.release_final.wait(5), "final reply was never released"
+                        final = json.dumps({"choices": [{"delta": {"content": "final-only reply"}}]})
+                        conn.sendall((f"data: {final}\n\ndata: [DONE]\n\n").encode())
             self.finished.set()
         except Exception as exc:
             self.error = exc
 
     def close(self):
+        self.release_final.set()
         self.thread.join(timeout=7)
         self.listener.close()
         if self.error:
@@ -619,6 +932,141 @@ class TuiPtyTests(unittest.TestCase):
             finally:
                 terminal.close()
 
+    def test_config_request_limit_only_persists_when_edited(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            seed_settings(home, {
+                "base_url": "http://127.0.0.1:9/v1",
+                "model": "saved-model",
+                "helper_providers": "local",
+            })
+            terminal = Terminal(cwd, home, {"REVEX_CONTEXT_BUDGET_TOKENS": "4096"})
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/config\r")
+                terminal.wait_for_screen("Provider:")
+                terminal.send(b"\x13")  # Save without editing a request limit.
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                self.assertNotIn("contextBudgetTokens", json.loads(settings_file(home).read_text()))
+                terminal.send(b"/config\r\t\r")  # Model tab, browse Model.
+                terminal.wait_for_screen("Context budget: 4096 tokens")
+                terminal.send(b"\x1b[B\x1b[B\x1b[B\x1b[B\r")  # Edit Context budget.
+                terminal.send(b"\x7f" * 4 + b"8192\r\x13")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                saved = json.loads(settings_file(home).read_text())
+                self.assertEqual(saved["contextBudgetTokens"], 8192)
+                self.assertNotIn("maxOutputTokens", saved)
+                self.assertNotIn("requestDeadlineSeconds", saved)
+                terminal.send(b"/exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+
+    def test_config_approval_mode_and_runtime_command_save_to_home(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            seed_settings(home, {
+                "base_url": "http://127.0.0.1:9/v1",
+                "model": "fake-model",
+                "helper_providers": "local",
+            })
+            terminal = Terminal(cwd, home)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/config\r")
+                terminal.wait_for_screen("Provider:")
+                terminal.send(b"\t\t\r\x1b[B\r\x1b[B\r\x13")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                self.assertEqual(json.loads(settings_file(home).read_text())["approvalMode"], "auto")
+                project = pathlib.Path(cwd, ".revex")
+                project.write_text('{"model":"project-only"}')
+                terminal.send(b"/approval bypass\r")
+                terminal.wait_for_screen("Approval mode: bypass")
+                self.assertEqual(json.loads(settings_file(home).read_text())["approvalMode"], "bypass")
+                self.assertEqual(json.loads(project.read_text()), {"model": "project-only"})
+                terminal.send(b"/approval manual\r")
+                terminal.wait_for_screen("Approval mode: manual")
+                self.assertEqual(json.loads(settings_file(home).read_text())["approvalMode"], "manual")
+                for mode in ("auto", "bypass", "plan", "manual"):
+                    terminal.send(b"\x1b[Z")  # Shift+Tab cycles chat approval modes.
+                    terminal.wait_for_screen(f"Mode: {mode}")
+                    self.assertEqual(json.loads(settings_file(home).read_text())["approvalMode"], mode)
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                terminal.close()
+
+    def test_config_unrelated_save_does_not_persist_yes_override(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            seed_settings(home, {
+                "base_url": "http://127.0.0.1:9/v1",
+                "model": "fake-model",
+                "helper_providers": "local",
+                "approvalMode": "manual",
+            })
+            terminal = Terminal(cwd, home, args=("--yes",))
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("Mode: bypass")
+                terminal.send(b"/config\r")
+                terminal.wait_for_screen("Provider:")
+                terminal.send(b"\x13")
+                terminal.wait_for_screen("Mode: bypass")
+                self.assertEqual(json.loads(settings_file(home).read_text())["approvalMode"], "manual")
+                terminal.send(b"/config\r")
+                terminal.wait_for_screen("Provider:")
+                terminal.send(b"\t\t\r\x1b[B\r\x1b[B\r\x13")
+                terminal.wait_for_screen("Mode: plan")
+                self.assertEqual(json.loads(settings_file(home).read_text())["approvalMode"], "plan")
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                terminal.close()
+
+    def test_slash_suggestions_complete_without_submitting(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            seed_settings(home, {
+                "base_url": "http://127.0.0.1:9/v1",
+                "model": "fake-model",
+                "helper_providers": "local",
+            })
+            terminal = Terminal(cwd, home, columns=52)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/")
+                terminal.wait_for_screen("/agents")
+                self.assertIn("/help", terminal.screen_text())
+                self.assertNotIn("/quit", terminal.screen_text())
+                terminal.send(b"\x1b[B\r")  # Down, then Enter completes /agents.
+                terminal.wait_for_screen("> /agents")
+                self.assertNotIn(" Agents ", terminal.screen_text())
+                terminal.send(b"\r")  # A second Enter runs it.
+                terminal.wait_for_screen(" Agents ")
+                terminal.send(b"\x1b")  # Close overlay before typing a new command.
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/")
+                terminal.wait_for_screen("/agents")
+                terminal.send(b"\x1b[Z")  # Chat Shift+Tab still cycles mode.
+                terminal.wait_for_screen("Mode: auto")
+                self.assertIn("/agents", terminal.screen_text())
+                terminal.send(b"mo")
+                terminal.wait_for_screen("> /mo")
+                self.assertIn("/model", terminal.screen_text())
+                self.assertNotIn("/agents", terminal.screen_text())
+                terminal.send(b"\t")
+                terminal.wait_for_screen("> /model")
+                terminal.send(b"x")
+                terminal.wait_for_screen("> /model x")
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                terminal.close()
+
     def test_saved_japanese_reaches_next_request_after_english_history(self):
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
             server = FakeSingleReplyServer(reply_count=2)
@@ -659,6 +1107,36 @@ class TuiPtyTests(unittest.TestCase):
                         break
                 else:
                     self.fail("second reply did not return to chat")
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_provider_reasoning_is_transient_and_separate_from_answer(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            server = FakeSingleReplyServer(reasoning="Inspecting the request.\nChecking details.")
+            seed_settings(home, {
+                "base_url": server.base,
+                "model": "fake-model",
+                "helper_providers": "local",
+            })
+            terminal = Terminal(cwd, home)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"show reasoning\r")
+                self.assertTrue(server.reasoning_sent.wait(4), "reasoning SSE was not emitted")
+                terminal.wait_for_screen("Thinking")
+                terminal.wait_for_screen("Inspecting the request")
+                self.assertNotIn("final-only reply", terminal.screen_text())
+                server.release_final.set()
+                terminal.wait_for_screen("final-only reply")
+                self.assertNotIn("Inspecting the request", terminal.screen_text())
+                state = pathlib.Path(home, ".local/state/revex")
+                for path in state.rglob("*.json"):
+                    self.assertNotIn("Inspecting the request", path.read_text())
                 terminal.send(b"\x04")
                 terminal.exit()
             finally:
@@ -805,7 +1283,7 @@ class TuiPtyTests(unittest.TestCase):
                 first.send(b"/help\r")
                 first.wait_for(b"/model")
                 first.send(b"/route\r")
-                first.wait_for(b"Route:")
+                first.wait_for_screen("Route: off")
                 first.send(b"draft")
                 first.read_for(0.1)
                 first.send(b"\x1b[A")
@@ -957,7 +1435,8 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.wait_for_screen("> Ask Revex to do anything")
                 terminal.send("あなたのモデルは？\r".encode())
                 self.assertTrue(server.finished.wait(4), "identity question did not reach the model")
-                self.assertEqual(server.user_input, "あなたのモデルは？")
+                self.assertEqual(server.user_input.split("\n\n[Revex response language:")[0], "あなたのモデルは？")
+                self.assertIn("[Revex response language: English]", server.user_input)
                 terminal.wait_for_screen("multiline done")
                 messages = json.loads(next(pathlib.Path(home, ".local/state/revex").glob("history-*.json")).read_text())["messages"]
                 self.assertEqual(messages[-1]["content"], "multiline done")
@@ -1030,11 +1509,12 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.read_for(0.2)
                 terminal.send(b"\r")  # Plain Enter submits.
                 self.assertTrue(server.finished.wait(4), "multiline request was not sent")
-                self.assertEqual(server.user_input, "first\nsecond")
+                self.assertEqual(server.user_input.split("\n\n[Revex response language:")[0], "first\nsecond")
+                self.assertIn("[Revex response language: English]", server.user_input)
                 terminal.wait_for(b"multiline")
                 terminal.wait_for_screen("tok/s")
                 footer = terminal.screen_text().splitlines()[-1].strip()
-                self.assertRegex(footer, r"[0-9]+\.[0-9] tok/s \. [0-9]+\.[0-9]s \. -")
+                self.assertRegex(footer, r"[0-9]+\.[0-9] tok/s \| [0-9]+\.[0-9]s \| -")
                 terminal.send(b"exit\r")
                 terminal.exit()
             finally:
@@ -1060,7 +1540,8 @@ class TuiPtyTests(unittest.TestCase):
                 self.assertFalse(server.finished.is_set(), "Shift+Enter submitted early")
                 terminal.send(b"\x1b[13u")  # Unmodified Enter still submits in enhanced mode.
                 self.assertTrue(server.finished.wait(4), "multiline request was not sent")
-                self.assertEqual(server.user_input, "first\nsecond")
+                self.assertEqual(server.user_input.split("\n\n[Revex response language:")[0], "first\nsecond")
+                self.assertIn("[Revex response language: English]", server.user_input)
                 terminal.wait_for(b"multiline")
                 terminal.send(b"exit\r")
                 terminal.exit()
@@ -1085,7 +1566,8 @@ class TuiPtyTests(unittest.TestCase):
                 self.assertFalse(server.finished.is_set(), "Ctrl+J submitted early")
                 terminal.send(b"\r")
                 self.assertTrue(server.finished.wait(4), "multiline request was not sent")
-                self.assertEqual(server.user_input, "first\nsecond")
+                self.assertEqual(server.user_input.split("\n\n[Revex response language:")[0], "first\nsecond")
+                self.assertIn("[Revex response language: English]", server.user_input)
                 terminal.wait_for(b"multiline")
                 terminal.send(b"exit\r")
                 terminal.exit()
@@ -1151,6 +1633,228 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.send(b"\x1b")
                 terminal.read_for(0.15)
                 terminal.send(b"exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_codex_review_acceptance_hands_off_exact_scope_before_execution(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            marker = pathlib.Path(home, "codex-executed")
+            server = FakeHelperDispatchServer(review_handoff_marker=marker)
+            scripts = pathlib.Path(home, "bin")
+            scripts.mkdir()
+            codex = scripts / "codex"
+            codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, pathlib, sys\n"
+                "home = pathlib.Path(os.environ['HOME'])\n"
+                "scope = 'Analyze sample.bin parser validation.'\n"
+                "task = sys.stdin.read()\n"
+                "review = '--sandbox' in sys.argv\n"
+                "if review:\n"
+                "    assert sys.argv[sys.argv.index('--sandbox') + 1] == 'read-only'\n"
+                "    assert '--dangerously-bypass-approvals-and-sandbox' not in sys.argv\n"
+                "    assert scope in task\n"
+                "    (home / 'codex-review-args').write_text(json.dumps(sys.argv))\n"
+                "    answer = json.dumps({'canTake': True, 'approved': True, 'scope': scope,"
+                " 'comments': 'Scope is bounded.'})\n"
+                "else:\n"
+                "    assert '--dangerously-bypass-approvals-and-sandbox' in sys.argv\n"
+                "    assert task.strip() == scope\n"
+                "    (home / 'codex-executed').write_text(task)\n"
+                "    answer = 'parser finding: parse_header checks magic'\n"
+                "print(json.dumps({'type': 'item.completed', 'item':"
+                " {'type': 'agent_message', 'text': answer}}))\n"
+                "print(json.dumps({'type': 'turn.completed', 'usage':"
+                " {'input_tokens': 7, 'output_tokens': 3}}))\n"
+            )
+            codex.chmod(0o755)
+            seed_settings(home, {
+                "base_url": server.base,
+                "model": "fake-parent",
+                "helper_providers": "codex",
+            })
+            terminal = Terminal(cwd, home, {"PATH": str(scripts) + os.pathsep + os.environ.get("PATH", "")})
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"Analyze sample.bin parser validation.\r")
+                terminal.wait_for_screen("The parser validates the magic", seconds=12)
+                self.assertEqual(marker.read_text(), "Analyze sample.bin parser validation.")
+                review_args = json.loads(pathlib.Path(home, "codex-review-args").read_text())
+                self.assertIn("--ephemeral", review_args)
+                self.assertIn("--ignore-user-config", review_args)
+                self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", review_args)
+                terminal.send(b"/exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_goal_continues_once_then_completes_from_tool_evidence(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            pathlib.Path(cwd, "evidence.txt").write_text("parser verified in evidence file\n")
+            server = FakeGoalServer()
+            seed_settings(home, {"base_url": server.base, "model": "fake-goal"})
+            terminal = Terminal(cwd, home)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/goal Inspect parser evidence.\r")
+                terminal.wait_for_screen("Goal complete (2/20)", seconds=12)
+                self.assertTrue(server.finished.is_set())
+                self.assertEqual(len(server.requests), 6)
+                self.assertIn(
+                    "Inspect parser evidence.",
+                    server.requests[0]["messages"][-1]["content"],
+                )
+                goal_files = list(pathlib.Path(home, ".local/state/revex").rglob("*.goal.json"))
+                self.assertEqual(len(goal_files), 1)
+                state = json.loads(goal_files[0].read_text())["goal"]
+                self.assertEqual(state["status"], "complete")
+                self.assertEqual(state["turns_used"], 2)
+                terminal.send(b"/exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_corrupt_goal_sidecar_warns_but_normal_chat_still_works(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            sidecar = goal_file(home, cwd)
+            sidecar.parent.mkdir(parents=True)
+            sidecar.write_bytes(b"{malformed-goal")
+            server = FakeSingleReplyServer()
+            seed_settings(home, {"base_url": server.base, "model": "fake-model"})
+            terminal = Terminal(cwd, home)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("Goal state unavailable")
+                terminal.send(b"Normal chat still works\r")
+                terminal.wait_for_screen("multiline done")
+                self.assertEqual(sidecar.read_bytes(), b"{malformed-goal")
+                self.assertEqual(len(server.requests), 1)
+                terminal.send(b"/exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_compact_preserves_full_history_and_bounds_next_request(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            history, original = seed_long_history(home, cwd)
+            server = FakeContextServer()
+            seed_settings(home, {
+                "base_url": server.base,
+                "model": "fake-context",
+                "contextBudgetTokens": 8192,
+            })
+            terminal = Terminal(cwd, home)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/compact\r")
+                terminal.wait_for_screen("Context compacted:", seconds=15)
+                self.assertTrue(server.summaries)
+                self.assertEqual(history.read_bytes(), original)
+                self.assertTrue(history.with_suffix(".context.json").exists())
+                terminal.send(b"follow up\r")
+                terminal.wait_for_screen("bounded reply", seconds=10)
+                self.assertEqual(len(server.chats), 1)
+                messages = server.chats[0]["messages"]
+                encoded = json.dumps(messages, separators=(",", ":")).encode()
+                self.assertLessEqual(len(encoded), 8192 * 2)
+                joined = "\n".join(message["content"] for message in messages)
+                self.assertIn("Archived parser evidence", joined)
+                self.assertNotIn("archive-0", joined)
+                self.assertIn("follow up", joined)
+                terminal.send(b"/exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_chat_input_queues_during_compaction(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            seed_long_history(home, cwd)
+            server = FakeContextServer(hold_summary=True)
+            seed_settings(home, {
+                "base_url": server.base,
+                "model": "fake-context",
+                "contextBudgetTokens": 8192,
+            })
+            terminal = Terminal(cwd, home)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/compact\r")
+                until = time.monotonic() + 5
+                while not server.summary_started.is_set() and time.monotonic() < until:
+                    terminal.read_for(0.05)
+                self.assertTrue(server.summary_started.is_set(), "summary request never started")
+                terminal.wait_for_screen("Compacting context")
+                terminal.send(b"run after compaction\r")
+                terminal.wait_for_screen("Task queued")
+                self.assertEqual(len(server.chats), 0)
+                server.release_summary.set()
+                terminal.wait_for_screen("bounded reply", seconds=15)
+                self.assertEqual(len(server.chats), 1)
+                self.assertIn(
+                    "run after compaction",
+                    server.chats[0]["messages"][-1]["content"],
+                )
+                terminal.send(b"/exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_compact_ctrl_c_discards_queued_input_and_preserves_history(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            history, original = seed_long_history(home, cwd)
+            server = FakeContextServer(hold_summary=True)
+            seed_settings(home, {
+                "base_url": server.base,
+                "model": "fake-context",
+                "contextBudgetTokens": 8192,
+            })
+            terminal = Terminal(cwd, home)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/compact\r")
+                until = time.monotonic() + 5
+                while not server.summary_started.is_set() and time.monotonic() < until:
+                    terminal.read_for(0.05)
+                self.assertTrue(server.summary_started.is_set(), "summary request never started")
+                terminal.send(b"queued task must not run\r")
+                terminal.wait_for_screen("Task queued")
+                terminal.send(b"\x03")
+                terminal.wait_for_screen("Stopping compaction")
+                server.release_summary.set()
+                terminal.wait_for_screen("Context not compacted:", seconds=12)
+                self.assertIn("interrupted", terminal.screen_text())
+                self.assertEqual(history.read_bytes(), original)
+                self.assertFalse(history.with_suffix(".context.json").exists())
+                terminal.send(b"/status\r")
+                terminal.wait_for_screen("Session:")
+                self.assertEqual(server.chats, [], "queued task ran after cancellation")
+                terminal.send(b"\x1b")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"manual request after cancellation\r")
+                terminal.wait_for_screen("bounded reply", seconds=10)
+                self.assertEqual(len(server.chats), 1)
+                joined = "\n".join(message["content"] for message in server.chats[0]["messages"])
+                self.assertIn("manual request after cancellation", joined)
+                self.assertNotIn("queued task must not run", joined)
+                terminal.send(b"/exit\r")
                 terminal.exit()
             finally:
                 terminal.close()
@@ -1224,6 +1928,174 @@ class TuiPtyTests(unittest.TestCase):
                 self.assertFalse(pathlib.Path(cwd, "edited.txt").exists())
                 terminal.wait_for(b"done")
                 terminal.send(b"/exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_new_chat_steers_blocked_model_without_running_stale_tool(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            server = FakeServer()
+            terminal = Terminal(cwd, home, {"REVEX_BASE_URL": server.base, "REVEX_MODEL": "fake-model"})
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"edit file\r")
+                self.assertTrue(server.blocked.wait(4), "first model request did not start")
+                terminal.wait_for_screen("Thinking")
+                terminal.send(b"instead summarize\r")
+                terminal.wait_for_screen("Instruction added; applying at next step")
+                server.release.set()
+                self.assertTrue(server.finished.wait(5), "steered model request did not complete")
+                terminal.wait_for_screen("done")
+                self.assertFalse(pathlib.Path(cwd, "edited.txt").exists())
+                second = server.requests[1]["messages"]
+                contents = [m["content"] for m in second if m["role"] == "user"]
+                self.assertIn("edit file", contents[0])
+                self.assertIn("instead summarize", contents[-1])
+                self.assertTrue(any("write edited.txt" in m["content"] for m in second))
+                self.assertTrue(any("skipped after user steering" in m["content"] for m in second))
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_mixed_prose_and_tool_shows_progress_before_next_model_reply(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            pathlib.Path(cwd, "marker.txt").write_text("marker contents\n")
+            server = FakeServer(
+                first_reply="Checking marker before final answer.\n>> read marker.txt",
+                later_replies=("final-complete-marker",),
+                hold_second=True,
+            )
+            terminal = Terminal(cwd, home, {"REVEX_BASE_URL": server.base, "REVEX_MODEL": "fake-model"})
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"inspect marker\r")
+                self.assertTrue(server.blocked.wait(4))
+                server.release.set()
+                self.assertTrue(server.second_started.wait(4), "next model request did not start")
+                terminal.wait_for_screen("Checking marker before final answer")
+                visible = terminal.screen_text()
+                self.assertEqual(visible.count("Checking marker before final answer"), 1)
+                self.assertLess(visible.index("Checking marker before final answer"), visible.index("tool read"))
+                self.assertNotIn("final-complete-marker", visible)
+                self.assertTrue(any("Checking marker before final answer" in m["content"]
+                                    for m in server.requests[1]["messages"] if m["role"] == "assistant"))
+                server.release_second.set()
+                terminal.wait_for_screen("final-complete-marker")
+                self.assertEqual(terminal.screen_text().count("Checking marker before final answer"), 1)
+                self.assertEqual(terminal.screen_text().count("final-complete-marker"), 1)
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_new_chat_waits_for_current_response_before_next_request(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            server = FakeHeldResponseSteeringServer()
+            terminal = Terminal(cwd, home, {"REVEX_BASE_URL": server.base, "REVEX_MODEL": "fake-model"})
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"original task\r")
+                self.assertTrue(server.first_started.wait(4), "first HTTP request did not start")
+                terminal.send(b"new direction\r")
+                terminal.wait_for_screen("Instruction added; applying at next step")
+                self.assertFalse(server.second_finished.wait(0.25))
+                server.release_first.set()
+                self.assertTrue(server.first_finished.wait(3), "first response did not complete")
+                self.assertTrue(server.second_finished.wait(3), "next request did not complete")
+                terminal.wait_for_screen("steered final answer")
+                second = server.requests[1]["messages"]
+                users = [m["content"] for m in second if m["role"] == "user"]
+                self.assertIn("original task", users[0])
+                self.assertIn("new direction", users[-1])
+                self.assertTrue(any(m["content"] == "completed first response" for m in second))
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_steering_waits_for_active_tool_and_skips_later_calls(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            script = pathlib.Path(cwd, "hold-tool.sh")
+            script.write_text(
+                "#!/bin/sh\n"
+                "printf 'first\\n' >> trace.txt\n"
+                "while [ ! -f release-tool ]; do sleep 0.02; done\n"
+                "printf 'completed\\n' >> trace.txt\n"
+            )
+            script.chmod(0o755)
+            server = FakeServer(
+                first_reply=">> sh ./hold-tool.sh\n>> sh printf 'second\\n' >> trace.txt"
+            )
+            seed_settings(home, {"approvalMode": "bypass"})
+            terminal = Terminal(cwd, home, {"REVEX_BASE_URL": server.base, "REVEX_MODEL": "fake-model"})
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"do work\r")
+                self.assertTrue(server.blocked.wait(4))
+                server.release.set()
+                trace = pathlib.Path(cwd, "trace.txt")
+                deadline = time.monotonic() + 4
+                while not trace.exists() and time.monotonic() < deadline:
+                    terminal.read_for(0.05)
+                self.assertTrue(trace.exists(), "first tool never started")
+                terminal.send(b"change direction\r")
+                terminal.wait_for_screen("Instruction added; applying at next step")
+                pathlib.Path(cwd, "release-tool").touch()
+                self.assertTrue(server.finished.wait(5), "follow-up model request did not complete")
+                terminal.wait_for_screen("done")
+                self.assertEqual(trace.read_text().splitlines(), ["first", "completed"])
+                second = server.requests[1]["messages"]
+                self.assertIn("change direction", second[-1]["content"])
+                self.assertTrue(any("<out>" in m["content"] for m in second))
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                pathlib.Path(cwd, "release-tool").touch()
+                terminal.close()
+                server.close()
+
+    def test_tab_queues_next_task_without_steering_current_tool_loop(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            server = FakeServer(
+                first_reply=">> sh printf old > old.txt",
+                later_replies=("old task finished", "queued task finished"),
+            )
+            seed_settings(home, {"approvalMode": "bypass"})
+            terminal = Terminal(cwd, home, {"REVEX_BASE_URL": server.base, "REVEX_MODEL": "fake-model"})
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"do old task\r")
+                self.assertTrue(server.blocked.wait(4))
+                terminal.send(b"do new task\t")
+                terminal.wait_for_screen("Task queued for after this task")
+                server.release.set()
+                deadline = time.monotonic() + 5
+                while not server.finished.is_set() and time.monotonic() < deadline:
+                    terminal.read_for(0.05)
+                self.assertTrue(server.finished.is_set(), "queued follow-up never reached model")
+                terminal.wait_for_screen("queued task finished")
+                self.assertEqual(pathlib.Path(cwd, "old.txt").read_text(), "old")
+                self.assertEqual(len(server.requests), 3)
+                second_users = [m["content"] for m in server.requests[1]["messages"] if m["role"] == "user"]
+                self.assertFalse(any("do new task" in content for content in second_users))
+                third_users = [m["content"] for m in server.requests[2]["messages"] if m["role"] == "user"]
+                self.assertTrue(any("do new task" in content for content in third_users))
+                terminal.send(b"\x04")
                 terminal.exit()
             finally:
                 terminal.close()

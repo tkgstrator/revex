@@ -11,6 +11,7 @@ skips tool schemas entirely: the model calls tools by writing one-line commands.
 - Talks to any OpenAI-compatible endpoint with streaming, through either Chat Completions or the Responses API
 - One-shot, interactive and MCP server modes
 - Persistent interactive history, read-only helper agents and live `/agents` status with provider-reported token usage
+- Bounded request context with automatic and manual conversation summaries
 - Tool output is truncated to protect the context window
 - Refusals from the provider are detected and reported to the caller
 
@@ -52,10 +53,10 @@ agent assign a targeted task to Revex when that is useful.
 3. `revex` runs every call in order, truncates each output, and sends the results
    back inside `<out>` tags.
 4. This repeats until a reply contains no `>> ` line. That reply is the answer.
-   A step limit of 30 stops runaway loops.
+   The default limit is 100 model steps per task; `maxSteps` can set 1–500.
 
-The conversation is append-only and the system prompt never changes, so a server
-that caches the prompt prefix can reuse it between steps.
+The saved conversation remains complete. A long request can use a summary of
+older messages while keeping recent messages and the current task in context.
 
 ### Design choices
 
@@ -72,11 +73,6 @@ that caches the prompt prefix can reuse it between steps.
 ### What it deliberately does not do
 
 - **No sandbox.** Commands run with your user's permissions.
-- **No context management.** The saved history grows
-  until the model's window is full; there is no summarization or compaction.
-- **No built-in plan mode.** One model runs the loop; it may start read-only
-  [helper agents](#helper-agents), but only it edits files. Saved conversation
-  history is available in interactive and MCP sessions.
 - **No native tool calling or vision.** Only text over Chat Completions or the Responses API.
 - **No general retries or backoff.** A server that rejects streamed usage gets one
   compatibility retry without that option.
@@ -93,6 +89,7 @@ curl -fsSL https://raw.githubusercontent.com/tkgstrator/revex/master/install.sh 
 
 The installer verifies the release SHA-256 and installs to `~/.local/bin`
 (or `REVEX_INSTALL_DIR` if set). It supports macOS arm64 and Linux x86_64/arm64.
+For containerized development, see the [Dev Container Feature guide](docs/devcontainer-feature.md).
 If no release is available yet, install with Cargo:
 
 ```sh
@@ -140,6 +137,10 @@ Enter a task in the fixed input area; `/config` opens connection settings.
 | `REVEX_FRONTIER` | no | Command that handles a task instead of the local model, for example `claude -p`. The task is appended as the last argument |
 | `REVEX_ROUTE` | no | `auto` uses the local model's existing one-letter frontier route; `smart` uses a Clef Decisions score gate for Codex. Off by default |
 | `REVEX_DECISION_MODEL` | no | Decisions model for `smart`: `clef` (default), `clef-flash`, or `self` (the configured chat model). Saved as `decisionModel` |
+| `REVEX_MAX_STEPS` | no | Maximum model steps per task, from 1 to 500; default 100. Saved as `maxSteps` in `settings.json` |
+| `REVEX_CONTEXT_BUDGET_TOKENS` | no | Estimated request budget, 4,096–800,000 tokens; default 32,000. Saved as `contextBudgetTokens` |
+| `REVEX_MAX_OUTPUT_TOKENS` | no | Requested output cap, 256–32,768 tokens; default 8,192. Saved as `maxOutputTokens` |
+| `REVEX_REQUEST_DEADLINE_SECONDS` | no | Request deadline, 10–3,600 seconds; default 180. Saved as `requestDeadlineSeconds` |
 | `REVEX_EXTRA`    | no       | JSON object merged into every request body                                                                             |
 | `REVEX_DEBUG`    | no       | Set to print raw SSE lines to stderr                                                                                   |
 
@@ -186,6 +187,8 @@ API key for a different URL; set `REVEX_API_KEY` for that endpoint.
 | `model`, `decisionModel`, `reasoningEffort`, `language`, `route`, `api` | `model`, `decision_model`, `reasoning_effort`, `response_language` (`en`/`ja`), `route`, `api` | `REVEX_MODEL`, `REVEX_DECISION_MODEL`, `REVEX_REASONING_EFFORT`, `REVEX_RESPONSE_LANGUAGE`, `REVEX_ROUTE`, `REVEX_API` |
 | `frontier` | not allowed | `REVEX_FRONTIER` |
 | `helperProviders` (array) | not allowed | none |
+| `maxSteps` (integer, default 100) | not allowed | `REVEX_MAX_STEPS` |
+| `contextBudgetTokens`, `maxOutputTokens`, `requestDeadlineSeconds` | not allowed | `REVEX_CONTEXT_BUDGET_TOKENS`, `REVEX_MAX_OUTPUT_TOKENS`, `REVEX_REQUEST_DEADLINE_SECONDS` |
 | `baseUrl`, `apiKey` in `auth.json` | not allowed | `REVEX_BASE_URL`, `REVEX_API_KEY` |
 
 `frontier` runs a command, and `baseUrl` receives your API key. A cloned repository
@@ -221,20 +224,56 @@ In the interactive mode these slash commands are available:
 | `/agents` | Show the parent and helpers, their state, tasks, model and reported token usage |
 | `/config` | Edit the API URL, key, model and reasoning effort in the setup screen |
 | `/clear` | Clear parent and helper history, state and token totals when no helper is active |
+| `/compact` | Summarize older conversation context while keeping the saved history intact |
 | `/model [ID]` | Select a model (or provide its ID), then set an optional reasoning effort |
 | `/route [off\|auto\|smart\|local\|remote]` | Show or switch the forwarding mode |
+| `/steer TEXT` | Add an instruction to the active task at its next step |
+| `/queue TEXT` | Run a separate task after the active task finishes |
+| `/goal [--max-turns N] OBJECTIVE` | Save a workspace goal and start its first turn when idle |
+| `/goal status`, `/goal pause`, `/goal resume [--max-turns N]`, `/goal clear` | Inspect, pause, resume or remove the goal |
 | `/status` | Show the active API, model, route, parent state, queued tasks and directory |
-| `/exit` or `exit` | Quit |
+| `/exit` or `exit` | Exit |
 
 `/model` and `/route` save the choice: to `./.revex` if it exists, otherwise to
 `~/.revex/settings.json`. When writing a project file, keys that a project file may not set are
 dropped. If the matching environment variable is set, it still wins on the next start.
 
 The interactive input stays available while a model request or helper runs.
-`/agents` and `/status` work during a task; another natural-language task is queued.
+`/agents` and `/status` work during a task. While busy, Enter sends a new message
+as **Steer**: the current model response finishes, its result stays in the
+conversation, and the new instruction applies at the next model step. A tool
+already running finishes once; later calls from the old model reply are skipped.
+Tab sends a nonempty normal draft as **Queue**, a separate task that starts only
+after the current task finishes. Tab still completes a visible slash suggestion
+first. `/steer TEXT` and `/queue TEXT` choose either behavior explicitly. During
+an external helper CLI call, new messages wait until that call returns. Ctrl+C
+hard-cancels the active task and discards pending steering messages.
+
+`/compact` runs while idle; a request during an active task is rejected.
+Compaction runs in the background, and messages submitted while it runs are
+queued for afterward. Ctrl+C requests cancellation. Revex also compacts
+automatically when a model request would exceed the configured context budget.
+Each `/compact` invocation makes at most four summary model requests, each with
+a 40-second deadline. If older messages remain omitted, `/status` reports their
+count; run `/compact` again to summarize more. The full saved history remains
+intact throughout.
+`/status` shows estimated context use and whether a summary is active.
+These token counts are estimates from serialized request size, not provider
+usage or a guarantee of the model's actual context window.
+
+For example, `/goal --max-turns 5 Analyze the parser and verify its error paths`
+starts a saved goal. After each turn, a separate tool-free model check assesses
+the observed result before another turn starts. The default budget is 20 total
+turns (maximum 200). Automatic turns wait for an idle session and yield to
+queued user work; Plan mode does not start them. Ctrl+C and a restart pause the
+goal, and `/goal resume` continues it. Queueing another task during a goal
+turn pauses the goal until resumed. `/clear` removes its saved state too.
+Goal progress is stored beside this workspace's history. Use one active Revex
+session per workspace; concurrent sessions do not lock or reconcile goal state.
+
 Use Enter to send, Alt+Enter for a newline, PageUp/PageDown to scroll and Esc to
 close an overlay. Terminals that report Shift+Enter or Ctrl+J separately can use
-those for a newline too. Ctrl+C interrupts an active task; Ctrl+D, `/exit` or
+those for a newline too. Ctrl+D, `/exit` or
 `exit` quits.
 Up/Down recalls sent inputs for this workspace. Revex keeps the latest 100 inputs
 across restarts; Down past the newest restores the draft you were writing. The
@@ -256,8 +295,15 @@ not used for history.) The file is rewritten atomically (temp file and rename)
 after every message, including partial progress when a request fails. A save failure
 stops the current request and exits interactive mode. On start the
 messages are reloaded, tool outputs included, and the stored system prompt is replaced by
-the current one. `/clear` rewrites the saved conversation file as empty and removes
+the current one. Compaction stores a private summary beside this history and
+uses it in model requests; it does not shorten the saved conversation. `/clear`
+invalidates the summary, rewrites the saved conversation file as empty and removes
 the parent and helper records. It keeps the separate input recall history.
+
+This serves the same broad purpose as compaction in
+[Codex](https://github.com/openai/codex/blob/main/codex-rs/core/src/compact.rs)
+and [Claude Code](https://code.claude.com/docs/en/context-window); Revex keeps
+the original history and uses a separate summary for request context.
 
 Input recall is stored beside the conversation in a private `input-history-*.json`
 file, with the same workspace identity and Unix permissions. Only the latest 100
@@ -308,7 +354,9 @@ and replies with the result in `<out>` tags:
 
 An unknown verb is treated as a shell command, which absorbs the most common
 mistake of small models. A reply with no `>>` line ends the loop, and that reply is
-the answer. The loop stops after 30 steps.
+the answer. The loop stops after 100 steps by default. Set `maxSteps` in
+`~/.revex/settings.json` to an integer from 1 to 500. On a limit stop, the
+conversation retains completed tool results; send a follow-up to continue.
 
 ### Helper agents
 
@@ -353,6 +401,22 @@ ends are stopped and marked `interrupted`.
 
 Because `sh` is the escape hatch, reverse-engineering tools need no dedicated
 wrappers. `objdump`, `otool`, `nm`, `strings`, `radare2` and `lldb` work as they are.
+
+### Plans and reverse engineering reports
+
+For substantial reverse engineering or multistep work, ask Revex to make a plan
+before execution. When file writes are permitted, save it under `docs/plans/`
+in the selected workspace. Include the objective, scope, acceptance checks,
+steps, delegated work, and a read-only Codex scope review when applicable. In
+Plan approval mode, Revex can propose the plan in chat but cannot write the
+file until the mode changes. Trivial questions do not need an artifact.
+
+Save reverse engineering findings as Markdown under `docs/reports/` in the same
+workspace. Separate confirmed findings from uncertain interpretations, cite
+the commands, offsets, symbols or file excerpts behind each finding, and list
+the next checks. Link a related plan and update both documents as evidence
+changes. Keep credentials and other secrets out of these files; inspect the
+evidence before relying on a conclusion.
 
 ## Forwarding to a hosted agent
 
