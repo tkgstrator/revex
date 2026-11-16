@@ -40,6 +40,7 @@ pub(crate) struct View {
     pub(crate) approval_mode: String,
     pub(crate) transcript: Vec<String>,
     pub(crate) model_in_flight: bool,
+    pub(crate) thinking_started: Option<Instant>,
     pub(crate) thinking_text: String,
     pub(crate) activity_tick: u64,
     pub(crate) turn_started: Option<Instant>,
@@ -1146,6 +1147,20 @@ fn helper_cost(agents: &[AgentInfo]) -> String {
     }
 }
 
+fn format_clock(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 3_600 {
+        format!("{:02}:{:02}", seconds / 60, seconds % 60)
+    } else {
+        format!(
+            "{:02}:{:02}:{:02}",
+            seconds / 3_600,
+            (seconds % 3_600) / 60,
+            seconds % 60
+        )
+    }
+}
+
 fn chat_activity(view: &View) -> Option<String> {
     if !view.model_in_flight {
         return None;
@@ -1154,8 +1169,13 @@ fn chat_activity(view: &View) -> Option<String> {
     let status = status.trim();
     let frames = ["|", "/", "-", "\\"];
     let mut active = format!(
-        "{} Thinking",
-        frames[view.activity_tick as usize % frames.len()]
+        "{} Thinking {}",
+        frames[view.activity_tick as usize % frames.len()],
+        format_clock(
+            view.thinking_started
+                .map(|start| start.elapsed())
+                .unwrap_or_default()
+        )
     );
     let queued = status.rsplit('|').next().unwrap_or("").trim();
     if queued != "0 queued" && queued.ends_with(" queued") {
@@ -1215,7 +1235,13 @@ fn chat_footer(view: &View, agents: &[AgentInfo], width: usize) -> String {
         .turn_started
         .map(|start| start.elapsed())
         .or(view.last_turn_elapsed)
-        .map(|duration| format!("{:.1}s", duration.as_secs_f64()));
+        .map(|duration| {
+            if duration.as_secs() >= 60 {
+                format_clock(duration)
+            } else {
+                format!("{:.1}s", duration.as_secs_f64())
+            }
+        });
     let time = elapsed.unwrap_or_else(|| "-".into());
     let cost = helper_cost(agents);
     let effort_width = effort
@@ -2218,7 +2244,7 @@ mod tests {
             ..View::default()
         };
         let wide = screen(&view, &[], 80, 20);
-        assert!(wide.contains("* | Thinking 2 queued"));
+        assert!(wide.contains("* | Thinking 00:00 2 queued"));
         assert!(
             wide.lines()
                 .find(|line| line.starts_with("-- INPUT"))
@@ -2760,16 +2786,60 @@ mod tests {
             ..View::default()
         };
         let first = screen(&view, &[], 80, 20);
-        assert!(first.contains("| Thinking 1 queued"));
+        assert!(first.contains("| Thinking 00:00 1 queued"));
         assert!(first.contains("Inspecting the request."));
         assert!(first.contains("Checking details."));
         view.activity_tick = 1;
         let second = screen(&view, &[], 80, 20);
-        assert!(second.contains("/ Thinking"));
+        assert!(second.contains("/ Thinking 00:00"));
         view.model_in_flight = false;
         let done = screen(&view, &[], 80, 20);
         assert!(!done.contains("Thinking"));
         assert!(!done.contains("Inspecting the request."));
+    }
+
+    #[test]
+    fn thinking_elapsed_formats_minute_and_hour_boundaries() {
+        for (seconds, clock) in [
+            (7, "00:07"),
+            (59, "00:59"),
+            (60, "01:00"),
+            (3_599, "59:59"),
+            (3_600, "01:00:00"),
+            (360_000, "100:00:00"),
+        ] {
+            assert_eq!(format_clock(Duration::from_secs(seconds)), clock);
+        }
+    }
+
+    #[test]
+    fn thinking_elapsed_appears_in_chat_transcript() {
+        let view = View {
+            model_in_flight: true,
+            thinking_started: Some(Instant::now() - Duration::from_secs(7)),
+            ..View::default()
+        };
+        let output = screen(&view, &[], 80, 20);
+        assert!(output.contains("* | Thinking 00:07"), "{output}");
+    }
+
+    #[test]
+    fn long_turn_duration_uses_clock_in_footer() {
+        let mut view = View {
+            model: "test-model".into(),
+            cwd: "/tmp/revex".into(),
+            ..View::default()
+        };
+        for (seconds, expected) in [
+            (59, "59.0s"),
+            (60, "01:00"),
+            (3_599, "59:59"),
+            (3_600, "01:00:00"),
+        ] {
+            view.last_turn_elapsed = Some(Duration::from_secs(seconds));
+            let footer = chat_footer(&view, &[], 78);
+            assert!(footer.contains(expected), "{footer}");
+        }
     }
 
     #[test]

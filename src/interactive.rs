@@ -836,6 +836,7 @@ fn submit_chat(
                     Ok(()) => {
                         view.transcript.clear();
                         view.turn_started = None;
+                        view.thinking_started = None;
                         view.last_turn_elapsed = None;
                         view.last_turn_rate = None;
                         append(view, "Session history and agent records cleared.");
@@ -930,6 +931,7 @@ fn submit_chat(
 
 fn begin_turn(view: &mut tui::View, session: &Session) {
     view.thinking_text.clear();
+    view.thinking_started = None;
     view.turn_usage_before = session.agents.snapshot()[0].usage;
     view.turn_started = Some(std::time::Instant::now());
     view.last_turn_elapsed = None;
@@ -1494,10 +1496,16 @@ fn handle_worker_event(
     match event {
         Event::Progress(message) => append(view, &message),
         Event::ModelPhase(active) => {
-            view.model_in_flight = active
+            let in_flight = active
                 && session
                     .as_ref()
                     .is_some_and(|session| session.busy && !session.interrupted && !session.closed);
+            if in_flight && !view.model_in_flight {
+                view.thinking_started = Some(std::time::Instant::now());
+            } else if !in_flight {
+                view.thinking_started = None;
+            }
+            view.model_in_flight = in_flight;
             view.thinking_text.clear();
         }
         Event::ReasoningChunk(chunk) => {
@@ -1536,6 +1544,7 @@ fn handle_worker_event(
         }
         Event::Finished(result, msgs) => {
             view.model_in_flight = false;
+            view.thinking_started = None;
             view.thinking_text.clear();
             if let Some(session) = session.as_mut() {
                 complete_turn(view, session);
@@ -1648,6 +1657,7 @@ pub(crate) fn run_tui(mut cfg: Cfg) -> Result<(), String> {
         }
         if SIGINT_REQUESTED.swap(false, Ordering::AcqRel) {
             view.model_in_flight = false;
+            view.thinking_started = None;
             view.thinking_text.clear();
             if let Some(session) = session.as_mut() {
                 session.interrupt_turn(&mut |message| append(&mut view, message));
@@ -1727,6 +1737,7 @@ pub(crate) fn run_tui(mut cfg: Cfg) -> Result<(), String> {
         dirty = true;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             view.model_in_flight = false;
+            view.thinking_started = None;
             view.thinking_text.clear();
             if let Some(session) = session.as_mut() {
                 session.interrupt_turn(&mut |message| append(&mut view, message));
@@ -3441,6 +3452,27 @@ mod tests {
         assert!(!view.thinking_text.contains('\x1b'));
         assert!(view.thinking_text.ends_with('あ'));
         assert!(view.transcript.is_empty());
+    }
+
+    #[test]
+    fn model_phase_timer_starts_once_and_clears_when_generation_ends() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut active = Session::new(config, fresh_history(), agents, tx);
+        active.busy = true;
+        let mut session = Some(active);
+        let mut view = tui::View::default();
+
+        handle_worker_event(Event::ModelPhase(true), &mut view, &mut session, 0);
+        assert!(view.model_in_flight);
+        let started = view.thinking_started.expect("model phase starts timer");
+        handle_worker_event(Event::ModelPhase(true), &mut view, &mut session, 0);
+        assert_eq!(view.thinking_started, Some(started));
+
+        handle_worker_event(Event::ModelPhase(false), &mut view, &mut session, 0);
+        assert!(!view.model_in_flight);
+        assert!(view.thinking_started.is_none());
     }
 
     #[test]
