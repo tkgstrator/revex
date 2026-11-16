@@ -1,0 +1,14 @@
+{
+  "id": "revex",
+  "version": "1.0.0",
+  "name": "Revex",
+  "description": "Install a checksummed Revex release in a Linux dev container (x86_64 or arm64, glibc 2.39+).",
+  "documentationURL": "https://github.com/tkgstrator/revex/blob/master/docs/devcontainer-feature.md",
+  "options": {
+    "version": {
+      "type": "string",
+      "default": "latest",
+      "description": "Revex release to install: latest or a v-prefixed tag such as v0.1.0."
+    }
+  }
+}

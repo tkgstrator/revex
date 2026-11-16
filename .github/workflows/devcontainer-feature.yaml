@@ -1,0 +1,70 @@
+name: Dev Container Feature
+
+on:
+  pull_request:
+    paths:
+      - src/revex/**
+      - test/revex/**
+      - docs/devcontainer-feature.md
+      - .github/workflows/devcontainer-feature.yaml
+  push:
+    branches:
+      - master
+    paths:
+      - src/revex/**
+      - test/revex/**
+      - docs/devcontainer-feature.md
+      - .github/workflows/devcontainer-feature.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fixture:
+    name: Feature wrapper fixture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check metadata and shell scripts
+        run: |
+          python3 -m json.tool src/revex/devcontainer-feature.json >/dev/null
+          sh -n src/revex/install.sh test/revex/test.sh test/revex/smoke.sh
+      - name: Test wrapper without installing on host
+        run: sh test/revex/smoke.sh
+
+  container:
+    name: Feature install (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Dev Container CLI
+        run: npm install --global @devcontainers/cli
+      - name: Test release install in a container
+        run: devcontainer features test -f revex --base-image ubuntu:24.04 .
+
+  publish:
+    name: Publish to GHCR
+    needs: [fixture, container]
+    if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Publish ghcr.io/tkgstrator/revex
+        uses: devcontainers/action@v1
+        with:
+          publish-features: 'true'
+          base-path-to-features: ./src
+          features-namespace: tkgstrator
+          generate-docs: 'false'
+          disable-repo-tagging: 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
