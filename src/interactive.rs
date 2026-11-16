@@ -358,6 +358,13 @@ fn setup_view(view: &mut tui::View, cfg: &Cfg) {
         }
     };
     view.setup_helper_selected = 0;
+    view.setup_approval_mode_selected = match cfg.approval_mode {
+        ApprovalMode::Manual => 0,
+        ApprovalMode::Auto => 1,
+        ApprovalMode::Bypass => 2,
+        ApprovalMode::Plan => 3,
+    };
+    view.setup_approval_mode_dirty = false;
     view.setup_helper_available = [true, cli_available("codex"), cli_available("claude")];
     view.setup_models.clear();
     view.setup_model_selected = 0;
@@ -614,6 +621,13 @@ fn save_setup(
         1 => ResponseLanguage::Japanese,
         _ => return Err("Choose English or Japanese for response language".into()),
     };
+    let approval_mode = match view.setup_approval_mode_selected {
+        0 => ApprovalMode::Manual,
+        1 => ApprovalMode::Auto,
+        2 => ApprovalMode::Bypass,
+        3 => ApprovalMode::Plan,
+        _ => return Err("Choose a valid approval mode".into()),
+    };
     if view.setup_provider_committed.is_none() {
         return Err("Choose a model server provider with Enter".into());
     }
@@ -639,6 +653,12 @@ fn save_setup(
         "helper_providers".into(),
         Value::String(helper_selection_csv(view.setup_helpers)?),
     );
+    if view.setup_approval_mode_dirty {
+        settings.insert(
+            "approval_mode".into(),
+            Value::String(approval_mode_name(approval_mode).into()),
+        );
+    }
     cfg.model = (!view.setup_model.trim().is_empty()).then(|| view.setup_model.trim().into());
     let effort = view.setup_reasoning.trim();
     cfg.reasoning = Some(effort.into());
@@ -661,6 +681,10 @@ fn save_setup(
         );
     }
     save_home_config(&settings)?;
+    if view.setup_approval_mode_dirty {
+        cfg.approval_mode = approval_mode;
+        cfg.yes = false; // an explicit UI selection replaces the startup --yes override
+    }
     if project_has_settings {
         save_project_model_settings(
             &project_path,
@@ -675,6 +699,7 @@ fn save_setup(
     view.setup_clear_key = false;
     view.model = cfg.model.clone().unwrap_or_else(|| "server default".into());
     view.reasoning = effective_reasoning(cfg);
+    view.approval_mode = approval_mode_name(cfg.approval_mode).into();
     view.connection = "checking API".into();
     if let Some(session) = session.as_mut() {
         session.agents.set_providers(view.setup_helpers)?;
@@ -685,6 +710,10 @@ fn save_setup(
         session.cfg.reasoning = cfg.reasoning.clone();
         session.cfg.decision_model = cfg.decision_model.clone();
         session.cfg.response_language = cfg.response_language;
+        if view.setup_approval_mode_dirty {
+            session.cfg.approval_mode = cfg.approval_mode;
+            session.cfg.yes = false;
+        }
         view.page = tui::Page::Chat;
         view.overlay = tui::Overlay::None;
         append(
@@ -697,6 +726,35 @@ fn save_setup(
     *request += 1;
     fetch_models(tx, *request, cfg.base.clone(), cfg.key.clone());
     Ok(())
+}
+
+fn set_approval_mode(
+    mode: ApprovalMode,
+    cfg: &mut Cfg,
+    view: &mut tui::View,
+    session: &mut Session,
+) {
+    let value = approval_mode_name(mode);
+    cfg.approval_mode = mode;
+    cfg.yes = false;
+    session.cfg.approval_mode = mode;
+    session.cfg.yes = false;
+    view.approval_mode = value.into();
+    let result = (|| {
+        let mut settings = load_home_config()?;
+        settings.insert("approval_mode".into(), Value::String(value.into()));
+        save_home_config(&settings)
+    })();
+    match result {
+        Ok(()) => append(view, &format!("Approval mode: {value} (saved)")),
+        Err(e) => append(
+            view,
+            &format!("Approval mode: {value} for this session; not saved: {e}"),
+        ),
+    }
+    if session.busy {
+        append(view, "The new approval mode applies to the next task.");
+    }
 }
 
 fn submit_chat(
@@ -768,7 +826,7 @@ fn submit_chat(
         }
         "/help" => append(
             view,
-            "/agents  /status  /config  /model [ID] (choose reasoning)  /clear  /exit or exit  Ctrl+D exit  Alt+Enter newline  Ctrl+R retry models",
+            "/agents  /status  /config  /model [ID]  /approval [manual|auto|bypass|plan]  /clear  /exit or exit  Ctrl+D exit  Alt+Enter newline  Ctrl+R retry models",
         ),
         _ if line.starts_with("/model") => {
             let id = line.strip_prefix("/model").unwrap_or("").trim();
@@ -802,6 +860,18 @@ fn submit_chat(
                 view.setup_field = 4;
                 view.setup_status = "Choose reasoning effort, then confirm model settings.".into();
                 *request += 1;
+            }
+        }
+        "/approval" => append(
+            view,
+            &format!("Approval mode: {}", approval_mode_name(cfg.approval_mode)),
+        ),
+        _ if line.starts_with("/approval ") => {
+            let value = line.trim_start_matches("/approval ").trim();
+            if let Some(mode) = parse_approval_mode(value) {
+                set_approval_mode(mode, cfg, view, session);
+            } else {
+                append(view, "Approval mode must be manual, auto, bypass or plan.");
             }
         }
         _ if line.starts_with("/route") => {
@@ -928,7 +998,7 @@ fn handle_setup_key(
         let fields: &[usize] = match view.setup_tab {
             0 => &[0, 1, 2],
             1 => &[3, 4, 7, 8],
-            _ => &[5, 6],
+            _ => &[5, 9, 6],
         };
         let index = fields
             .iter()
@@ -1123,6 +1193,18 @@ fn handle_setup_key(
             }
             _ => {}
         },
+        9 => match key.code {
+            KeyCode::Up => {
+                view.setup_approval_mode_selected = (view.setup_approval_mode_selected + 3) % 4;
+                view.setup_approval_mode_dirty = true;
+            }
+            KeyCode::Down => {
+                view.setup_approval_mode_selected = (view.setup_approval_mode_selected + 1) % 4;
+                view.setup_approval_mode_dirty = true;
+            }
+            KeyCode::Enter => view.setup_editing = false,
+            _ => {}
+        },
         _ => match key.code {
             KeyCode::Enter => {
                 if let Err(e) = save_setup(cfg, view, session, tx, request) {
@@ -1274,15 +1356,62 @@ fn handle_chat_key(
         }
         return;
     }
+    if key.code == KeyCode::BackTab
+        || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+    {
+        if session.pending.is_none() {
+            let next = match cfg.approval_mode {
+                ApprovalMode::Manual => ApprovalMode::Auto,
+                ApprovalMode::Auto => ApprovalMode::Bypass,
+                ApprovalMode::Bypass => ApprovalMode::Plan,
+                ApprovalMode::Plan => ApprovalMode::Manual,
+            };
+            set_approval_mode(next, cfg, view, session);
+        }
+        return;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
         session.close(&mut |message| append(view, message));
         *exit = true;
         return;
     }
+    if view.slash_suggestions_open {
+        let matches = tui::slash_matches(&view.input);
+        if !matches.is_empty() {
+            match key.code {
+                KeyCode::Up => {
+                    view.slash_suggestion_selected =
+                        view.slash_suggestion_selected.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    view.slash_suggestion_selected =
+                        (view.slash_suggestion_selected + 1).min(matches.len() - 1);
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Enter if key.modifiers.is_empty() => {
+                    let command = matches[view.slash_suggestion_selected.min(matches.len() - 1)];
+                    view.input = command.name.into();
+                    if command.takes_argument {
+                        view.input.push(' ');
+                    }
+                    view.cursor = view.input.chars().count();
+                    view.slash_suggestions_open = false;
+                    return;
+                }
+                KeyCode::Esc => {
+                    view.slash_suggestions_open = false;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
     match key.code {
         KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             view.input.insert(byte_at(&view.input, view.cursor), '\n');
             view.cursor += 1;
+            view.slash_suggestions_open = false;
         }
         KeyCode::Enter
             if key
@@ -1291,10 +1420,12 @@ fn handle_chat_key(
         {
             view.input.insert(byte_at(&view.input, view.cursor), '\n');
             view.cursor += 1;
+            view.slash_suggestions_open = false;
         }
         KeyCode::Enter => {
             let line = std::mem::take(&mut view.input);
             view.cursor = 0;
+            view.slash_suggestions_open = false;
             submit_chat(line, cfg, view, session, request, exit);
         }
         KeyCode::PageUp => view.scroll = view.scroll.saturating_add(8),
@@ -1318,9 +1449,17 @@ fn handle_chat_key(
         KeyCode::Esc => {
             view.input.clear();
             view.cursor = 0;
+            view.slash_suggestions_open = false;
         }
         _ => {
+            let previous = view.input.clone();
             edit_buffer(&mut view.input, &mut view.cursor, key);
+            if view.input != previous {
+                let matches = tui::slash_matches(&view.input);
+                view.slash_suggestions_open =
+                    !matches.is_empty() && !(matches.len() == 1 && matches[0].name == view.input);
+                view.slash_suggestion_selected = 0;
+            }
         }
     }
 }
@@ -1428,6 +1567,7 @@ pub(crate) fn run_tui(mut cfg: Cfg) -> Result<(), String> {
     let mut view = tui::View {
         cwd: launch.display().to_string(),
         model: cfg.model.clone().unwrap_or_else(|| "server default".into()),
+        approval_mode: approval_mode_name(cfg.approval_mode).into(),
         connection: if cfg.base.is_empty() {
             "setup required".into()
         } else {
@@ -2605,6 +2745,8 @@ mod tests {
             route: Route::Off,
             decision_model: "clef".into(),
             response_language: ResponseLanguage::English,
+            approval_mode: ApprovalMode::Manual,
+            max_steps: 100,
             api: Api::Chat,
             base,
             key: String::new(),
@@ -3559,6 +3701,8 @@ mod tests {
         assert_eq!(view.setup_helpers, [false, true, true]);
         key!(KeyCode::Enter);
         assert!(!view.setup_editing);
+        key!(KeyCode::Down);
+        assert_eq!(view.setup_field, 9);
         key!(KeyCode::Down);
         assert_eq!(view.setup_field, 6);
     }

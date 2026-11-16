@@ -52,7 +52,7 @@ agent assign a targeted task to Revex when that is useful.
 3. `revex` runs every call in order, truncates each output, and sends the results
    back inside `<out>` tags.
 4. This repeats until a reply contains no `>> ` line. That reply is the answer.
-   A step limit of 30 stops runaway loops.
+   The default limit is 100 model steps per task; `maxSteps` can set 1–500.
 
 The conversation is append-only and the system prompt never changes, so a server
 that caches the prompt prefix can reuse it between steps.
@@ -140,6 +140,7 @@ Enter a task in the fixed input area; `/config` opens connection settings.
 | `REVEX_FRONTIER` | no | Command that handles a task instead of the local model, for example `claude -p`. The task is appended as the last argument |
 | `REVEX_ROUTE` | no | `auto` uses the local model's existing one-letter frontier route; `smart` uses a Clef Decisions score gate for Codex. Off by default |
 | `REVEX_DECISION_MODEL` | no | Decisions model for `smart`: `clef` (default), `clef-flash`, or `self` (the configured chat model). Saved as `decisionModel` |
+| `REVEX_MAX_STEPS` | no | Maximum model steps per task, from 1 to 500; default 100. Saved as `maxSteps` in `settings.json` |
 | `REVEX_EXTRA`    | no       | JSON object merged into every request body                                                                             |
 | `REVEX_DEBUG`    | no       | Set to print raw SSE lines to stderr                                                                                   |
 
@@ -186,6 +187,7 @@ API key for a different URL; set `REVEX_API_KEY` for that endpoint.
 | `model`, `decisionModel`, `reasoningEffort`, `language`, `route`, `api` | `model`, `decision_model`, `reasoning_effort`, `response_language` (`en`/`ja`), `route`, `api` | `REVEX_MODEL`, `REVEX_DECISION_MODEL`, `REVEX_REASONING_EFFORT`, `REVEX_RESPONSE_LANGUAGE`, `REVEX_ROUTE`, `REVEX_API` |
 | `frontier` | not allowed | `REVEX_FRONTIER` |
 | `helperProviders` (array) | not allowed | none |
+| `maxSteps` (integer, default 100) | not allowed | `REVEX_MAX_STEPS` |
 | `baseUrl`, `apiKey` in `auth.json` | not allowed | `REVEX_BASE_URL`, `REVEX_API_KEY` |
 
 `frontier` runs a command, and `baseUrl` receives your API key. A cloned repository
@@ -308,7 +310,9 @@ and replies with the result in `<out>` tags:
 
 An unknown verb is treated as a shell command, which absorbs the most common
 mistake of small models. A reply with no `>>` line ends the loop, and that reply is
-the answer. The loop stops after 30 steps.
+the answer. The loop stops after 100 steps by default. Set `maxSteps` in
+`~/.revex/settings.json` to an integer from 1 to 500. On a limit stop, the
+conversation retains completed tool results; send a follow-up to continue.
 
 ### Helper agents
 

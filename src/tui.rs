@@ -37,6 +37,7 @@ pub(crate) struct View {
     pub(crate) model: String,
     pub(crate) reasoning: Option<String>,
     pub(crate) connection: String,
+    pub(crate) approval_mode: String,
     pub(crate) transcript: Vec<String>,
     pub(crate) model_in_flight: bool,
     pub(crate) activity_tick: u64,
@@ -46,6 +47,8 @@ pub(crate) struct View {
     pub(crate) last_turn_rate: Option<f64>,
     pub(crate) input: String,
     pub(crate) cursor: usize,
+    pub(crate) slash_suggestions_open: bool,
+    pub(crate) slash_suggestion_selected: usize,
     pub(crate) scroll: usize,
     pub(crate) status: String,
     pub(crate) workspace_selected: usize,
@@ -69,6 +72,8 @@ pub(crate) struct View {
     pub(crate) setup_decision_model_selected: usize,
     pub(crate) setup_response_language_selected: usize,
     pub(crate) setup_helpers: [bool; 3],
+    pub(crate) setup_approval_mode_selected: usize,
+    pub(crate) setup_approval_mode_dirty: bool,
     pub(crate) setup_helper_selected: usize,
     pub(crate) setup_helper_available: [bool; 3],
     pub(crate) setup_status: String,
@@ -87,6 +92,75 @@ const ACTIVE_BG: Color = Color::Rgb(22, 51, 63);
 const CODE_BG: Color = Color::Rgb(39, 45, 52);
 const MAX_TRANSCRIPT_LINE_CHARS: usize = 2_048;
 const MAX_CODE_TOKENS_PER_ROW: usize = 256;
+pub(crate) struct SlashCommand {
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) takes_argument: bool,
+}
+
+const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "/help",
+        description: "Show commands",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/agents",
+        description: "Show agents",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/status",
+        description: "Show status",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/config",
+        description: "Open settings",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/model",
+        description: "Choose model or enter ID",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/approval",
+        description: "Set approval mode",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/route",
+        description: "Set helper route",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/clear",
+        description: "Clear history",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/exit",
+        description: "Exit Revex",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/quit",
+        description: "Exit Revex",
+        takes_argument: false,
+    },
+];
+
+pub(crate) fn slash_matches(input: &str) -> Vec<&'static SlashCommand> {
+    if !input.starts_with('/') || input.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+    let prefix = input.to_ascii_lowercase();
+    SLASH_COMMANDS
+        .iter()
+        .filter(|command| command.name.starts_with(&prefix))
+        .collect()
+}
 const ASCII_BORDER: border::Set = border::Set {
     top_left: "+",
     top_right: "+",
@@ -235,6 +309,9 @@ fn draw_footer(frame: &mut Frame, view: &View, area: Rect) {
         Page::Setup if view.setup_tab_focus => {
             "Tab/Shift+Tab or Left/Right screens  |  Enter fields  |  Ctrl+S save"
         }
+        Page::Setup if view.setup_editing && view.setup_field == 9 => {
+            "Up/Down mode  |  Enter done  |  Ctrl+S save"
+        }
         Page::Setup if view.setup_editing && view.setup_tab == 2 && area.width < 60 => {
             "Up/Down Space Enter Ctrl+S"
         }
@@ -246,6 +323,18 @@ fn draw_footer(frame: &mut Frame, view: &View, area: Rect) {
         }
         Page::Setup => "Up/Down items  |  Enter edit/select  |  Ctrl+S save  |  Esc tabs",
         Page::Chat => "Enter send  |  /agents  /status  /config  /exit",
+    };
+    let hint = if view.page == Page::Chat {
+        format!(
+            "Mode: {} (Shift+Tab)  |  {hint}",
+            if view.approval_mode.is_empty() {
+                "manual"
+            } else {
+                &view.approval_mode
+            }
+        )
+    } else {
+        hint.to_owned()
     };
     let status = if view.status.is_empty() {
         "Ready"
@@ -549,6 +638,19 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
                         && view.setup_helper_selected == index,
                 ));
             }
+            let modes = ["Manual", "Auto", "Bypass", "Plan"];
+            let selected = view.setup_approval_mode_selected.min(modes.len() - 1);
+            if view.setup_field == 9 {
+                active_row = lines.len();
+            }
+            lines.push(focused(
+                format!("Approval mode: {}", modes[selected]),
+                !view.setup_tab_focus && view.setup_field == 9,
+            ));
+            lines.push(Line::from(Span::styled(
+                "    Manual asks; Auto checks; Bypass allows; Plan reads only",
+                Style::default().fg(MUTED),
+            )));
             if view.setup_field == 6 {
                 active_row = lines.len();
             }
@@ -1067,6 +1169,11 @@ fn chat_activity(view: &View) -> Option<String> {
 }
 
 fn chat_footer(view: &View, agents: &[AgentInfo], width: usize) -> String {
+    let mode = (!view.approval_mode.is_empty())
+        .then(|| format!("Mode: {} (Shift+Tab)", single(view, &view.approval_mode)));
+    let mode_width = mode
+        .as_ref()
+        .map_or(0, |value| Line::raw(value).width() + 3);
     let model = view.model.trim();
     let known_model = !model.is_empty() && model != "server default";
     let model = if known_model {
@@ -1087,12 +1194,13 @@ fn chat_footer(view: &View, agents: &[AgentInfo], width: usize) -> String {
         let effort_width = effort
             .as_ref()
             .map_or(0, |value| Line::raw(value).width() + 3);
-        let available = width.saturating_sub(3 + effort_width);
+        let available = width.saturating_sub(3 + effort_width + mode_width);
         let path_width = Line::raw(&cwd)
             .width()
             .min(available.saturating_sub(Line::raw(&model).width().min(16)));
         let model_width = available.saturating_sub(path_width);
         let parts = [
+            mode.unwrap_or_default(),
             clip_cells(&model, model_width),
             effort.unwrap_or_default(),
             middle_clip_cells(&cwd, path_width),
@@ -1117,7 +1225,8 @@ fn chat_footer(view: &View, agents: &[AgentInfo], width: usize) -> String {
     let effort_width = effort
         .as_ref()
         .map_or(0, |value| Line::raw(value).width() + 3);
-    let fixed_width = effort_width
+    let fixed_width = mode_width
+        + effort_width
         + 4 * 3
         + Line::raw(&rate).width()
         + Line::raw(&time).width()
@@ -1128,7 +1237,11 @@ fn chat_footer(view: &View, agents: &[AgentInfo], width: usize) -> String {
         .width()
         .min(available.saturating_sub(model_reserve));
     let model_width = available.saturating_sub(path_width);
-    let mut parts = vec![clip_cells(&model, model_width)];
+    let mut parts = Vec::new();
+    if let Some(mode) = mode {
+        parts.push(mode);
+    }
+    parts.push(clip_cells(&model, model_width));
     if let Some(effort) = effort {
         parts.push(effort);
     }
@@ -1171,6 +1284,30 @@ fn draw_chat(frame: &mut Frame, view: &View, agents: &[AgentInfo], area: Rect) {
                 transcript_area.height.saturating_sub(top_padding),
             ),
         );
+    }
+
+    if view.slash_suggestions_open && view.overlay == Overlay::None {
+        let matches = slash_matches(&view.input);
+        let count = matches.len().min(transcript_area.height.min(6) as usize);
+        if count > 0 {
+            let selected = view.slash_suggestion_selected.min(matches.len() - 1);
+            let start = selected.saturating_sub(count - 1);
+            let menu_y = divider_y.saturating_sub(count as u16);
+            frame.render_widget(Clear, rect(area, menu_y, count as u16));
+            for (row, command) in matches.iter().skip(start).take(count).enumerate() {
+                let active = start + row == selected;
+                let marker = if active { ">" } else { " " };
+                let text = format!("{marker} {:<11} {}", command.name, command.description);
+                frame.render_widget(
+                    Paragraph::new(text).style(if active {
+                        Style::default().fg(Color::White).bg(ACTIVE_BG)
+                    } else {
+                        Style::default().fg(SECONDARY).bg(CODE_BG)
+                    }),
+                    rect(area, menu_y + row as u16, 1),
+                );
+            }
+        }
     }
 
     frame.render_widget(
@@ -1572,6 +1709,27 @@ mod tests {
             .join("\n");
         let cursor = terminal.backend_mut().get_cursor_position().unwrap();
         (output, (cursor.x, cursor.y))
+    }
+
+    #[test]
+    fn slash_suggestions_filter_and_render_in_narrow_chat() {
+        assert_eq!(slash_matches("/").len(), 10);
+        assert_eq!(slash_matches("/mo")[0].name, "/model");
+        assert!(slash_matches("/model ").is_empty());
+        assert!(slash_matches("hello").is_empty());
+        let view = View {
+            input: "/".into(),
+            cursor: 1,
+            slash_suggestions_open: true,
+            slash_suggestion_selected: 1,
+            ..View::default()
+        };
+        let wide = screen(&view, &[], 52, 24);
+        assert!(wide.contains("> /agents"));
+        assert!(wide.contains("Show agents"));
+        let narrow = screen(&view, &[], 20, 12);
+        assert!(narrow.contains("/agents"));
+        assert!(narrow.contains("-- INPUT"));
     }
 
     fn print_snapshot_if_requested(name: &str, output: &str) {

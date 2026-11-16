@@ -647,6 +647,9 @@ impl Agents {
 
     /// Start a child on `task` in the parent's cwd, or queue it when both slots are busy.
     pub(crate) fn spawn(self: &Arc<Self>, cfg: &Cfg, task: &str) -> String {
+        if cfg.approval_mode == ApprovalMode::Plan {
+            return "error: helper agents are unavailable in plan mode".into();
+        }
         let mut g = self.lock();
         if g.stopped {
             return "error: the session is ending; no agent was started".into();
@@ -678,6 +681,9 @@ impl Agents {
         provider: Provider,
         task: &str,
     ) -> Result<String, String> {
+        if cfg.approval_mode == ApprovalMode::Plan {
+            return Err("helper agents are unavailable in plan mode".into());
+        }
         if provider == Provider::Local {
             return Err("direct invocation requires an external helper".into());
         }
@@ -1319,6 +1325,8 @@ mod tests {
             model: Some("m".into()),
             decision_model: "clef".into(),
             response_language: ResponseLanguage::English,
+            approval_mode: ApprovalMode::Manual,
+            max_steps: DEFAULT_MAX_STEPS,
             reasoning: None,
             yes: false,
             history: None,
@@ -1557,7 +1565,9 @@ mod tests {
     }
 
     fn is_child(msgs: &[Value]) -> bool {
-        msgs[0]["content"] == CHILD_SYSTEM
+        msgs[0]["content"]
+            .as_str()
+            .is_some_and(|prompt| prompt.starts_with(CHILD_SYSTEM))
     }
 
     fn last(msgs: &[Value]) -> String {

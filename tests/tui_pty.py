@@ -65,7 +65,7 @@ def seed_settings(home, data):
 
 
 class Terminal:
-    def __init__(self, cwd, home, extra=None, columns=100):
+    def __init__(self, cwd, home, extra=None, columns=100, args=()):
         self.columns = columns
         self.master, self.slave = pty.openpty()
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, columns, 0, 0))
@@ -80,11 +80,12 @@ class Terminal:
             "REVEX_BASE_URL", "REVEX_MODEL", "REVEX_API_KEY", "REVEX_API",
             "REVEX_ROUTE", "REVEX_FRONTIER", "REVEX_EXTRA",
             "REVEX_RESPONSE_LANGUAGE",
+            "REVEX_APPROVAL_MODE",
         ):
             env.pop(key, None)
         env.update(extra or {})
         self.child = subprocess.Popen(
-            [str(BIN)], cwd=cwd, stdin=self.slave, stdout=self.slave,
+            [str(BIN), *args], cwd=cwd, stdin=self.slave, stdout=self.slave,
             stderr=self.slave, env=env,
         )
         self.output = b""
@@ -197,7 +198,11 @@ class Terminal:
         )
 
     def exit(self):
-        self.child.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while self.child.poll() is None and time.monotonic() < deadline:
+            self.read_for(0.05)
+        if self.child.poll() is None:
+            raise subprocess.TimeoutExpired(self.child.args, 5)
         self.read_for(0.1)
         assert self.child.returncode == 0, self.output[-1200:]
         assert b"\x1b[?1049l" in self.output, "alternate screen not restored"
@@ -619,6 +624,109 @@ class TuiPtyTests(unittest.TestCase):
             finally:
                 terminal.close()
 
+    def test_config_approval_mode_and_runtime_command_save_to_home(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            seed_settings(home, {
+                "base_url": "http://127.0.0.1:9/v1",
+                "model": "fake-model",
+                "helper_providers": "local",
+            })
+            terminal = Terminal(cwd, home)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/config\r")
+                terminal.wait_for_screen("Provider:")
+                terminal.send(b"\t\t\r\x1b[B\r\x1b[B\r\x13")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                self.assertEqual(json.loads(settings_file(home).read_text())["approvalMode"], "auto")
+                project = pathlib.Path(cwd, ".revex")
+                project.write_text('{"model":"project-only"}')
+                terminal.send(b"/approval bypass\r")
+                terminal.wait_for_screen("Approval mode: bypass")
+                self.assertEqual(json.loads(settings_file(home).read_text())["approvalMode"], "bypass")
+                self.assertEqual(json.loads(project.read_text()), {"model": "project-only"})
+                terminal.send(b"/approval manual\r")
+                terminal.wait_for_screen("Approval mode: manual")
+                self.assertEqual(json.loads(settings_file(home).read_text())["approvalMode"], "manual")
+                for mode in ("auto", "bypass", "plan", "manual"):
+                    terminal.send(b"\x1b[Z")  # Shift+Tab cycles chat approval modes.
+                    terminal.wait_for_screen(f"Mode: {mode} (Shift+Tab)")
+                    self.assertEqual(json.loads(settings_file(home).read_text())["approvalMode"], mode)
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                terminal.close()
+
+    def test_config_unrelated_save_does_not_persist_yes_override(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            seed_settings(home, {
+                "base_url": "http://127.0.0.1:9/v1",
+                "model": "fake-model",
+                "helper_providers": "local",
+                "approvalMode": "manual",
+            })
+            terminal = Terminal(cwd, home, args=("--yes",))
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("Mode: bypass (Shift+Tab)")
+                terminal.send(b"/config\r")
+                terminal.wait_for_screen("Provider:")
+                terminal.send(b"\x13")
+                terminal.wait_for_screen("Mode: bypass (Shift+Tab)")
+                self.assertEqual(json.loads(settings_file(home).read_text())["approvalMode"], "manual")
+                terminal.send(b"/config\r")
+                terminal.wait_for_screen("Provider:")
+                terminal.send(b"\t\t\r\x1b[B\r\x1b[B\r\x13")
+                terminal.wait_for_screen("Mode: plan (Shift+Tab)")
+                self.assertEqual(json.loads(settings_file(home).read_text())["approvalMode"], "plan")
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                terminal.close()
+
+    def test_slash_suggestions_complete_without_submitting(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            seed_settings(home, {
+                "base_url": "http://127.0.0.1:9/v1",
+                "model": "fake-model",
+                "helper_providers": "local",
+            })
+            terminal = Terminal(cwd, home, columns=52)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/")
+                terminal.wait_for_screen("/agents")
+                self.assertIn("/help", terminal.screen_text())
+                terminal.send(b"\x1b[B\r")  # Down, then Enter completes /agents.
+                terminal.wait_for_screen("> /agents")
+                self.assertNotIn(" Agents ", terminal.screen_text())
+                terminal.send(b"\r")  # A second Enter runs it.
+                terminal.wait_for_screen(" Agents ")
+                terminal.send(b"\x1b")  # Close overlay before typing a new command.
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/")
+                terminal.wait_for_screen("/agents")
+                terminal.send(b"\x1b[Z")  # Chat Shift+Tab still cycles mode.
+                terminal.wait_for_screen("Mode: auto (Shift+Tab)")
+                self.assertIn("/agents", terminal.screen_text())
+                terminal.send(b"mo")
+                terminal.wait_for_screen("> /mo")
+                self.assertIn("/model", terminal.screen_text())
+                self.assertNotIn("/agents", terminal.screen_text())
+                terminal.send(b"\t")
+                terminal.wait_for_screen("> /model")
+                terminal.send(b"x")
+                terminal.wait_for_screen("> /model x")
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                terminal.close()
+
     def test_saved_japanese_reaches_next_request_after_english_history(self):
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
             server = FakeSingleReplyServer(reply_count=2)
@@ -957,7 +1065,8 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.wait_for_screen("> Ask Revex to do anything")
                 terminal.send("あなたのモデルは？\r".encode())
                 self.assertTrue(server.finished.wait(4), "identity question did not reach the model")
-                self.assertEqual(server.user_input, "あなたのモデルは？")
+                self.assertEqual(server.user_input.split("\n\n[Revex response language:")[0], "あなたのモデルは？")
+                self.assertIn("[Revex response language: English]", server.user_input)
                 terminal.wait_for_screen("multiline done")
                 messages = json.loads(next(pathlib.Path(home, ".local/state/revex").glob("history-*.json")).read_text())["messages"]
                 self.assertEqual(messages[-1]["content"], "multiline done")
@@ -1030,7 +1139,8 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.read_for(0.2)
                 terminal.send(b"\r")  # Plain Enter submits.
                 self.assertTrue(server.finished.wait(4), "multiline request was not sent")
-                self.assertEqual(server.user_input, "first\nsecond")
+                self.assertEqual(server.user_input.split("\n\n[Revex response language:")[0], "first\nsecond")
+                self.assertIn("[Revex response language: English]", server.user_input)
                 terminal.wait_for(b"multiline")
                 terminal.wait_for_screen("tok/s")
                 footer = terminal.screen_text().splitlines()[-1].strip()
@@ -1060,7 +1170,8 @@ class TuiPtyTests(unittest.TestCase):
                 self.assertFalse(server.finished.is_set(), "Shift+Enter submitted early")
                 terminal.send(b"\x1b[13u")  # Unmodified Enter still submits in enhanced mode.
                 self.assertTrue(server.finished.wait(4), "multiline request was not sent")
-                self.assertEqual(server.user_input, "first\nsecond")
+                self.assertEqual(server.user_input.split("\n\n[Revex response language:")[0], "first\nsecond")
+                self.assertIn("[Revex response language: English]", server.user_input)
                 terminal.wait_for(b"multiline")
                 terminal.send(b"exit\r")
                 terminal.exit()
@@ -1085,7 +1196,8 @@ class TuiPtyTests(unittest.TestCase):
                 self.assertFalse(server.finished.is_set(), "Ctrl+J submitted early")
                 terminal.send(b"\r")
                 self.assertTrue(server.finished.wait(4), "multiline request was not sent")
-                self.assertEqual(server.user_input, "first\nsecond")
+                self.assertEqual(server.user_input.split("\n\n[Revex response language:")[0], "first\nsecond")
+                self.assertIn("[Revex response language: English]", server.user_input)
                 terminal.wait_for(b"multiline")
                 terminal.send(b"exit\r")
                 terminal.exit()
