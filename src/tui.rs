@@ -40,6 +40,7 @@ pub(crate) struct View {
     pub(crate) approval_mode: String,
     pub(crate) transcript: Vec<String>,
     pub(crate) model_in_flight: bool,
+    pub(crate) thinking_text: String,
     pub(crate) activity_tick: u64,
     pub(crate) turn_started: Option<Instant>,
     pub(crate) turn_usage_before: UsageTotal,
@@ -1262,6 +1263,21 @@ fn draw_chat(frame: &mut Frame, view: &View, agents: &[AgentInfo], area: Rect) {
                 format!("* {activity}"),
                 Style::default().fg(SECONDARY),
             ));
+            if !view.thinking_text.is_empty() {
+                let mut text_rows = Vec::new();
+                for line in safe(view, &view.thinking_text).lines() {
+                    text_rows.extend(wrap_visual(
+                        line,
+                        transcript_area.width.saturating_sub(2) as usize,
+                    ));
+                }
+                for line in text_rows.iter().skip(text_rows.len().saturating_sub(4)) {
+                    lines.push(Line::styled(
+                        format!("  {line}"),
+                        Style::default().fg(SECONDARY),
+                    ));
+                }
+            }
         }
         let top_padding = (transcript_area.height as usize)
             .saturating_sub(lines.len())
@@ -2738,18 +2754,22 @@ mod tests {
     fn model_in_flight_indicator_animates_and_disappears() {
         let mut view = View {
             model_in_flight: true,
+            thinking_text: "Inspecting the request.\nChecking details.".into(),
             activity_tick: 0,
             status: "running  |  1 queued".into(),
             ..View::default()
         };
         let first = screen(&view, &[], 80, 20);
         assert!(first.contains("| Thinking 1 queued"));
+        assert!(first.contains("Inspecting the request."));
+        assert!(first.contains("Checking details."));
         view.activity_tick = 1;
         let second = screen(&view, &[], 80, 20);
         assert!(second.contains("/ Thinking"));
         view.model_in_flight = false;
         let done = screen(&view, &[], 80, 20);
         assert!(!done.contains("Thinking"));
+        assert!(!done.contains("Inspecting the request."));
     }
 
     #[test]

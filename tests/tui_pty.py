@@ -373,7 +373,7 @@ class FakeHelperDispatchServer:
 
 
 class FakeSingleReplyServer:
-    def __init__(self, reply_count=1):
+    def __init__(self, reply_count=1, reasoning=None):
         self.listener = socket.socket()
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen(4)
@@ -381,6 +381,9 @@ class FakeSingleReplyServer:
         self.base = f"http://127.0.0.1:{self.listener.getsockname()[1]}"
         self.user_input = None
         self.reply_count = reply_count
+        self.reasoning = reasoning
+        self.reasoning_sent = threading.Event()
+        self.release_final = threading.Event()
         self.requests = []
         self.finished = threading.Event()
         self.error = None
@@ -415,12 +418,24 @@ class FakeSingleReplyServer:
                     request = json.loads(body[:length])
                     self.requests.append(request)
                     self.user_input = request["messages"][-1]["content"]
-                    sse(conn, "multiline done")
+                    if self.reasoning is None:
+                        sse(conn, "multiline done")
+                    else:
+                        delta = json.dumps({"choices": [{"delta": {"reasoning_content": self.reasoning}}]})
+                        conn.sendall((
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                            f"data: {delta}\n\n"
+                        ).encode())
+                        self.reasoning_sent.set()
+                        assert self.release_final.wait(5), "final reply was never released"
+                        final = json.dumps({"choices": [{"delta": {"content": "final-only reply"}}]})
+                        conn.sendall((f"data: {final}\n\ndata: [DONE]\n\n").encode())
             self.finished.set()
         except Exception as exc:
             self.error = exc
 
     def close(self):
+        self.release_final.set()
         self.thread.join(timeout=7)
         self.listener.close()
         if self.error:
@@ -768,6 +783,36 @@ class TuiPtyTests(unittest.TestCase):
                         break
                 else:
                     self.fail("second reply did not return to chat")
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_provider_reasoning_is_transient_and_separate_from_answer(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            server = FakeSingleReplyServer(reasoning="Inspecting the request.\nChecking details.")
+            seed_settings(home, {
+                "base_url": server.base,
+                "model": "fake-model",
+                "helper_providers": "local",
+            })
+            terminal = Terminal(cwd, home)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"show reasoning\r")
+                self.assertTrue(server.reasoning_sent.wait(4), "reasoning SSE was not emitted")
+                terminal.wait_for_screen("Thinking")
+                terminal.wait_for_screen("Inspecting the request")
+                self.assertNotIn("final-only reply", terminal.screen_text())
+                server.release_final.set()
+                terminal.wait_for_screen("final-only reply")
+                self.assertNotIn("Inspecting the request", terminal.screen_text())
+                state = pathlib.Path(home, ".local/state/revex")
+                for path in state.rglob("*.json"):
+                    self.assertNotIn("Inspecting the request", path.read_text())
                 terminal.send(b"\x04")
                 terminal.exit()
             finally:
@@ -1145,7 +1190,7 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.wait_for(b"multiline")
                 terminal.wait_for_screen("tok/s")
                 footer = terminal.screen_text().splitlines()[-1].strip()
-                self.assertRegex(footer, r"[0-9]+\.[0-9] tok/s \. [0-9]+\.[0-9]s \. -")
+                self.assertRegex(footer, r"[0-9]+\.[0-9] tok/s \| [0-9]+\.[0-9]s \| -")
                 terminal.send(b"exit\r")
                 terminal.exit()
             finally:

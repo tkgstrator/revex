@@ -385,10 +385,18 @@ fn chat(cfg: &Cfg, msgs: &[Value]) -> Result<ChatResult, String> {
         r => r,
     }
     .map_err(|e| e.to_string())?;
-    read_stream(
+    read_stream_with_reasoning(
         cfg.api,
         std::io::BufReader::new(resp.into_reader()),
         cfg.quiet,
+        &mut |chunk| {
+            if matches!(cfg.role, Role::Parent(_))
+                && let Some(ui) = &cfg.ui
+                && !ui.cancelled()
+            {
+                ui.reasoning_chunk(chunk);
+            }
+        },
     )
 }
 
@@ -515,9 +523,21 @@ fn mark_stream_usage_rejected(base: &str) {
 
 /// Read one SSE reply. Text stops at the Responses `<out>` marker, but reading goes on
 /// so the final usage event is still seen.
+#[cfg(test)]
 fn read_stream(api: Api, input: impl BufRead, quiet: bool) -> Result<ChatResult, String> {
+    read_stream_with_reasoning(api, input, quiet, &mut |_| {})
+}
+
+fn read_stream_with_reasoning(
+    api: Api,
+    input: impl BufRead,
+    quiet: bool,
+    on_reasoning: &mut dyn FnMut(&str),
+) -> Result<ChatResult, String> {
+    const MAX_REASONING_BYTES: usize = 16 * 1024;
     let mut full = String::new();
     let mut usage = Usage::default();
+    let mut reasoning_bytes = 0;
     let mut cut = false;
     let mut completed = false;
     for line in input.lines() {
@@ -540,7 +560,7 @@ fn read_stream(api: Api, input: impl BufRead, quiet: bool) -> Result<ChatResult,
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             continue;
         };
-        let delta = match api {
+        let (delta, reasoning_delta) = match api {
             Api::Chat => {
                 if let Some(u) = Usage::from_json(&v["usage"], "prompt_tokens", "completion_tokens")
                 {
@@ -551,10 +571,16 @@ fn read_stream(api: Api, input: impl BufRead, quiet: bool) -> Result<ChatResult,
                 {
                     return Err("refused by model/provider (content_filter)".into());
                 }
-                v["choices"][0]["delta"]["content"].as_str()
+                (
+                    v["choices"][0]["delta"]["content"].as_str(),
+                    v["choices"][0]["delta"]["reasoning_content"].as_str(),
+                )
             }
             Api::Responses => match v["type"].as_str().unwrap_or("") {
-                "response.output_text.delta" => v["delta"].as_str(),
+                "response.output_text.delta" => (v["delta"].as_str(), None),
+                "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                    (None, v["delta"].as_str())
+                }
                 "response.refusal.delta" | "response.refusal.done" if !cut => {
                     return Err("refused by model/provider (refusal)".into());
                 }
@@ -580,11 +606,23 @@ fn read_stream(api: Api, input: impl BufRead, quiet: bool) -> Result<ChatResult,
                     completed = true;
                     break;
                 }
-                _ => None,
+                _ => (None, None),
             },
         };
         if cut {
             continue;
+        }
+        if let Some(t) = reasoning_delta
+            && reasoning_bytes < MAX_REASONING_BYTES
+        {
+            let mut end = t.len().min(MAX_REASONING_BYTES - reasoning_bytes);
+            while !t.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end > 0 {
+                on_reasoning(&t[..end]);
+                reasoning_bytes += end;
+            }
         }
         if let Some(t) = delta {
             full.push_str(t);
@@ -4120,6 +4158,73 @@ mod usage_tests {
 
     fn u(input: Option<u64>, output: Option<u64>) -> Usage {
         Usage { input, output }
+    }
+
+    #[test]
+    fn chat_reasoning_deltas_stream_separately_from_answer_and_tools() {
+        let mut reasoning = Vec::new();
+        let r = read_stream_with_reasoning(
+            Api::Chat,
+            sse(&[
+                r#"{"choices":[{"delta":{"reasoning_content":"thinking >> sh touch forbidden"}}]}"#,
+                r#"{"choices":[{"delta":{"content":"final answer"}}]}"#,
+                r#"{"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":6}}"#,
+                "[DONE]",
+            ]),
+            true,
+            &mut |chunk| reasoning.push(chunk.to_owned()),
+        )
+        .unwrap();
+        assert_eq!(reasoning, ["thinking >> sh touch forbidden"]);
+        assert_eq!(r.text, "final answer");
+        assert!(parse(&r.text).is_empty());
+        assert_eq!(r.usage, u(Some(4), Some(6)));
+    }
+
+    #[test]
+    fn responses_reasoning_and_summary_deltas_never_enter_answer() {
+        let mut reasoning = Vec::new();
+        let r = read_stream_with_reasoning(
+            Api::Responses,
+            sse(&[
+                r#"{"type":"response.reasoning_summary_text.delta","delta":"Summary "}"#,
+                r#"{"type":"response.reasoning_text.delta","delta":">> write forbidden"}"#,
+                r#"{"type":"response.reasoning_text.done","text":"do not repeat"}"#,
+                r#"{"type":"response.output_text.delta","delta":"answer"}"#,
+                r#"{"type":"response.completed","response":{"usage":{"input_tokens":8,"output_tokens":9}}}"#,
+            ]),
+            true,
+            &mut |chunk| reasoning.push(chunk.to_owned()),
+        )
+        .unwrap();
+        assert_eq!(reasoning, ["Summary ", ">> write forbidden"]);
+        assert_eq!(r.text, "answer");
+        assert!(parse(&r.text).is_empty());
+        assert_eq!(r.usage, u(Some(8), Some(9)));
+    }
+
+    #[test]
+    fn reasoning_display_is_bounded_and_late_reasoning_is_ignored() {
+        let long = "あ".repeat(6000);
+        let event =
+            json!({"type":"response.reasoning_summary_text.delta","delta":long}).to_string();
+        let mut reasoning = String::new();
+        let r = read_stream_with_reasoning(
+            Api::Responses,
+            sse(&[
+                &event,
+                r#"{"type":"response.output_text.delta","delta":"answer<out>hidden"}"#,
+                r#"{"type":"response.reasoning_text.delta","delta":"late"}"#,
+                r#"{"type":"response.completed","response":{}}"#,
+            ]),
+            true,
+            &mut |chunk| reasoning.push_str(chunk),
+        )
+        .unwrap();
+        assert!(reasoning.len() <= 16 * 1024);
+        assert!(reasoning.starts_with("あ"));
+        assert!(!reasoning.contains("late"));
+        assert_eq!(r.text, "answer");
     }
 
     #[test]

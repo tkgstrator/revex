@@ -108,6 +108,12 @@ impl UiHandle {
         let _ = self.events.send(Event::Progress(display));
     }
 
+    pub(crate) fn reasoning_chunk(&self, chunk: &str) {
+        if !self.cancelled() && !chunk.is_empty() {
+            let _ = self.events.send(Event::ReasoningChunk(chunk.into()));
+        }
+    }
+
     pub(crate) fn approve(&self, what: &str, preview: &str) -> bool {
         if self.cancelled() {
             return false;
@@ -136,6 +142,7 @@ enum Event {
     Eof,
     Progress(String),
     ModelPhase(bool),
+    ReasoningChunk(String),
     Approval {
         what: String,
         preview: String,
@@ -448,6 +455,19 @@ fn append(view: &mut tui::View, message: &str) {
         view.transcript.drain(..view.transcript.len() - 2000);
     }
     view.scroll = 0;
+}
+
+const MAX_THINKING_BYTES: usize = 16 * 1024;
+
+fn append_reasoning(view: &mut tui::View, chunk: &str) {
+    view.thinking_text.push_str(&terminal_safe(chunk));
+    if view.thinking_text.len() > MAX_THINKING_BYTES {
+        let mut start = view.thinking_text.len() - MAX_THINKING_BYTES;
+        while !view.thinking_text.is_char_boundary(start) {
+            start += 1;
+        }
+        view.thinking_text.drain(..start);
+    }
 }
 
 fn byte_at(value: &str, scalar: usize) -> usize {
@@ -909,6 +929,7 @@ fn submit_chat(
 }
 
 fn begin_turn(view: &mut tui::View, session: &Session) {
+    view.thinking_text.clear();
     view.turn_usage_before = session.agents.snapshot()[0].usage;
     view.turn_started = Some(std::time::Instant::now());
     view.last_turn_elapsed = None;
@@ -1472,7 +1493,22 @@ fn handle_worker_event(
 ) {
     match event {
         Event::Progress(message) => append(view, &message),
-        Event::ModelPhase(active) => view.model_in_flight = active,
+        Event::ModelPhase(active) => {
+            view.model_in_flight = active
+                && session
+                    .as_ref()
+                    .is_some_and(|session| session.busy && !session.interrupted && !session.closed);
+            view.thinking_text.clear();
+        }
+        Event::ReasoningChunk(chunk) => {
+            if view.model_in_flight
+                && session
+                    .as_ref()
+                    .is_some_and(|session| session.busy && !session.interrupted && !session.closed)
+            {
+                append_reasoning(view, &chunk);
+            }
+        }
         Event::Approval {
             what,
             preview,
@@ -1500,6 +1536,7 @@ fn handle_worker_event(
         }
         Event::Finished(result, msgs) => {
             view.model_in_flight = false;
+            view.thinking_text.clear();
             if let Some(session) = session.as_mut() {
                 complete_turn(view, session);
                 session.finished(result, msgs, &mut |message| append(view, message));
@@ -1611,6 +1648,7 @@ pub(crate) fn run_tui(mut cfg: Cfg) -> Result<(), String> {
         }
         if SIGINT_REQUESTED.swap(false, Ordering::AcqRel) {
             view.model_in_flight = false;
+            view.thinking_text.clear();
             if let Some(session) = session.as_mut() {
                 session.interrupt_turn(&mut |message| append(&mut view, message));
                 view.overlay = tui::Overlay::None;
@@ -1689,6 +1727,7 @@ pub(crate) fn run_tui(mut cfg: Cfg) -> Result<(), String> {
         dirty = true;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             view.model_in_flight = false;
+            view.thinking_text.clear();
             if let Some(session) = session.as_mut() {
                 session.interrupt_turn(&mut |message| append(&mut view, message));
                 view.overlay = tui::Overlay::None;
@@ -2580,7 +2619,7 @@ fn run_loop(
             Ok(Event::Input(line)) => session.line(&line, out),
             Ok(Event::Eof) => session.close(out),
             Ok(Event::Progress(message)) => out(&message),
-            Ok(Event::ModelPhase(_)) => {}
+            Ok(Event::ModelPhase(_)) | Ok(Event::ReasoningChunk(_)) => {}
             Ok(Event::Approval {
                 what,
                 preview,
@@ -3391,6 +3430,48 @@ mod tests {
             &mut exit,
         );
         assert!(exit);
+    }
+
+    #[test]
+    fn provider_reasoning_stays_bounded_and_sanitized() {
+        let mut view = tui::View::default();
+        append_reasoning(&mut view, "\x1b[31mfirst\n");
+        append_reasoning(&mut view, &"あ".repeat(MAX_THINKING_BYTES));
+        assert!(view.thinking_text.len() <= MAX_THINKING_BYTES);
+        assert!(!view.thinking_text.contains('\x1b'));
+        assert!(view.thinking_text.ends_with('あ'));
+        assert!(view.transcript.is_empty());
+    }
+
+    #[test]
+    fn interrupted_turn_ignores_late_reasoning_and_model_phase() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut active = Session::new(config, fresh_history(), agents, tx);
+        active.busy = true;
+        let mut session = Some(active);
+        let mut view = tui::View::default();
+        handle_worker_event(Event::ModelPhase(true), &mut view, &mut session, 0);
+        handle_worker_event(
+            Event::ReasoningChunk("visible".into()),
+            &mut view,
+            &mut session,
+            0,
+        );
+        assert_eq!(view.thinking_text, "visible");
+        session.as_mut().unwrap().interrupted = true;
+        view.model_in_flight = false;
+        view.thinking_text.clear();
+        handle_worker_event(Event::ModelPhase(true), &mut view, &mut session, 0);
+        handle_worker_event(
+            Event::ReasoningChunk("stale".into()),
+            &mut view,
+            &mut session,
+            0,
+        );
+        assert!(!view.model_in_flight);
+        assert!(view.thinking_text.is_empty());
     }
 
     #[test]
