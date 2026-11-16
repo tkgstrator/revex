@@ -226,7 +226,7 @@ In the interactive mode these slash commands are available:
 | `/model [ID]` | Select a model (or provide its ID), then set an optional reasoning effort |
 | `/route [off\|auto\|smart\|local\|remote]` | Show or switch the forwarding mode |
 | `/status` | Show the active API, model, route, parent state, queued tasks and directory |
-| `/exit` or `exit` | Quit |
+| `/exit` or `exit` | Exit |
 
 `/model` and `/route` save the choice: to `./.revex` if it exists, otherwise to
 `~/.revex/settings.json`. When writing a project file, keys that a project file may not set are

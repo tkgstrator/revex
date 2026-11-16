@@ -775,7 +775,7 @@ fn submit_chat(
         append(view, &format!("Input history not saved: {e}"));
     }
     match line {
-        "/exit" | "/quit" | "exit" => {
+        "/exit" | "exit" => {
             session.close(&mut |message| append(view, message));
             *exit = true;
         }
@@ -2042,7 +2042,7 @@ fn first_run_with(
         let Some(raw) = ask("  1/3  API base URL (or /exit): ", false)? else {
             return Ok(None);
         };
-        if raw == "/exit" || raw == "/quit" {
+        if raw == "/exit" {
             return Ok(None);
         }
         let value = raw.trim().trim_end_matches('/');
@@ -2059,7 +2059,7 @@ fn first_run_with(
     let Some(key) = ask("  2/3  API key (optional, hidden; Enter to skip): ", true)? else {
         return Ok(None);
     };
-    if key == "/exit" || key == "/quit" {
+    if key == "/exit" {
         return Ok(None);
     }
     let Some(model) = ask(
@@ -2069,7 +2069,7 @@ fn first_run_with(
     else {
         return Ok(None);
     };
-    if model == "/exit" || model == "/quit" {
+    if model == "/exit" {
         return Ok(None);
     }
     let mut settings = read_settings(path)?;
@@ -2443,7 +2443,7 @@ impl Session {
 
     fn line(&mut self, line: &str, out: &mut dyn FnMut(&str)) {
         let line = line.trim();
-        if matches!(line, "/exit" | "/quit") {
+        if line == "/exit" {
             self.close(out);
             return;
         }
@@ -3362,6 +3362,7 @@ mod tests {
             &mut exit,
         );
         assert!(view.transcript.last().unwrap().contains("/exit or exit"));
+        assert!(!view.transcript.last().unwrap().contains("/quit"));
         assert!(
             view.transcript
                 .last()
@@ -3371,6 +3372,16 @@ mod tests {
         assert!(!view.transcript.last().unwrap().contains("Ctrl+J newline"));
         assert!(!view.transcript.last().unwrap().contains("Shift+Enter"));
         assert!(!exit);
+        submit_chat(
+            "/quit".into(),
+            &mut config,
+            &mut view,
+            &mut session,
+            &mut request,
+            &mut exit,
+        );
+        assert!(!exit);
+        assert!(view.transcript.last().unwrap().contains("Unknown command"));
         submit_chat(
             "exit".into(),
             &mut config,

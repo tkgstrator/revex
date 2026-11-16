@@ -652,7 +652,7 @@ class TuiPtyTests(unittest.TestCase):
                 self.assertEqual(json.loads(settings_file(home).read_text())["approvalMode"], "manual")
                 for mode in ("auto", "bypass", "plan", "manual"):
                     terminal.send(b"\x1b[Z")  # Shift+Tab cycles chat approval modes.
-                    terminal.wait_for_screen(f"Mode: {mode} (Shift+Tab)")
+                    terminal.wait_for_screen(f"Mode: {mode}")
                     self.assertEqual(json.loads(settings_file(home).read_text())["approvalMode"], mode)
                 terminal.send(b"\x04")
                 terminal.exit()
@@ -671,16 +671,16 @@ class TuiPtyTests(unittest.TestCase):
             try:
                 terminal.wait_for(b"workspace?")
                 terminal.send(b"\r")
-                terminal.wait_for_screen("Mode: bypass (Shift+Tab)")
+                terminal.wait_for_screen("Mode: bypass")
                 terminal.send(b"/config\r")
                 terminal.wait_for_screen("Provider:")
                 terminal.send(b"\x13")
-                terminal.wait_for_screen("Mode: bypass (Shift+Tab)")
+                terminal.wait_for_screen("Mode: bypass")
                 self.assertEqual(json.loads(settings_file(home).read_text())["approvalMode"], "manual")
                 terminal.send(b"/config\r")
                 terminal.wait_for_screen("Provider:")
                 terminal.send(b"\t\t\r\x1b[B\r\x1b[B\r\x13")
-                terminal.wait_for_screen("Mode: plan (Shift+Tab)")
+                terminal.wait_for_screen("Mode: plan")
                 self.assertEqual(json.loads(settings_file(home).read_text())["approvalMode"], "plan")
                 terminal.send(b"\x04")
                 terminal.exit()
@@ -702,6 +702,7 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.send(b"/")
                 terminal.wait_for_screen("/agents")
                 self.assertIn("/help", terminal.screen_text())
+                self.assertNotIn("/quit", terminal.screen_text())
                 terminal.send(b"\x1b[B\r")  # Down, then Enter completes /agents.
                 terminal.wait_for_screen("> /agents")
                 self.assertNotIn(" Agents ", terminal.screen_text())
@@ -712,7 +713,7 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.send(b"/")
                 terminal.wait_for_screen("/agents")
                 terminal.send(b"\x1b[Z")  # Chat Shift+Tab still cycles mode.
-                terminal.wait_for_screen("Mode: auto (Shift+Tab)")
+                terminal.wait_for_screen("Mode: auto")
                 self.assertIn("/agents", terminal.screen_text())
                 terminal.send(b"mo")
                 terminal.wait_for_screen("> /mo")

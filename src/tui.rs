@@ -144,11 +144,6 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Exit Revex",
         takes_argument: false,
     },
-    SlashCommand {
-        name: "/quit",
-        description: "Exit Revex",
-        takes_argument: false,
-    },
 ];
 
 pub(crate) fn slash_matches(input: &str) -> Vec<&'static SlashCommand> {
@@ -326,7 +321,7 @@ fn draw_footer(frame: &mut Frame, view: &View, area: Rect) {
     };
     let hint = if view.page == Page::Chat {
         format!(
-            "Mode: {} (Shift+Tab)  |  {hint}",
+            "Mode: {}  |  {hint}",
             if view.approval_mode.is_empty() {
                 "manual"
             } else {
@@ -1170,7 +1165,7 @@ fn chat_activity(view: &View) -> Option<String> {
 
 fn chat_footer(view: &View, agents: &[AgentInfo], width: usize) -> String {
     let mode = (!view.approval_mode.is_empty())
-        .then(|| format!("Mode: {} (Shift+Tab)", single(view, &view.approval_mode)));
+        .then(|| format!("Mode: {}", single(view, &view.approval_mode)));
     let mode_width = mode
         .as_ref()
         .map_or(0, |value| Line::raw(value).width() + 3);
@@ -1209,7 +1204,7 @@ fn chat_footer(view: &View, agents: &[AgentInfo], width: usize) -> String {
             .into_iter()
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
-            .join(" . ");
+            .join(" | ");
     }
     let rate = view
         .last_turn_rate
@@ -1246,7 +1241,7 @@ fn chat_footer(view: &View, agents: &[AgentInfo], width: usize) -> String {
         parts.push(effort);
     }
     parts.extend([middle_clip_cells(&cwd, path_width), rate, time, cost]);
-    parts.join(" . ")
+    parts.join(" | ")
 }
 
 fn draw_chat(frame: &mut Frame, view: &View, agents: &[AgentInfo], area: Rect) {
@@ -1713,7 +1708,8 @@ mod tests {
 
     #[test]
     fn slash_suggestions_filter_and_render_in_narrow_chat() {
-        assert_eq!(slash_matches("/").len(), 10);
+        assert_eq!(slash_matches("/").len(), 9);
+        assert!(slash_matches("/q").is_empty());
         assert_eq!(slash_matches("/mo")[0].name, "/model");
         assert!(slash_matches("/model ").is_empty());
         assert!(slash_matches("hello").is_empty());
@@ -1931,8 +1927,8 @@ mod tests {
             assert!(output.contains(expected), "missing {expected}:\n{output}");
         }
         let footer = output.lines().last().unwrap().trim_end();
-        assert!(footer.starts_with("  my-model . /tmp/project"));
-        assert!(footer.ends_with(". - . - . -"));
+        assert!(footer.starts_with("  my-model | /tmp/project"));
+        assert!(footer.ends_with("| - | - | -"));
         assert!(!footer.contains("connected"));
         assert!(!footer.contains("Revex"));
         assert!(!output.contains("+---"));
@@ -2043,7 +2039,7 @@ mod tests {
         let output = screen(&view, &[], 80, 24);
         let footer = output.lines().last().unwrap().trim_end();
         assert!(footer.starts_with("  deepseek"), "{footer}");
-        assert!(footer.ends_with(" . 12.7 tok/s . 22.9s . -"), "{footer}");
+        assert!(footer.ends_with(" | 12.7 tok/s | 22.9s | -"), "{footer}");
         assert_eq!(Line::raw(footer).width(), 80);
     }
 
@@ -2232,7 +2228,7 @@ mod tests {
         let output = screen(&view, &[], 80, 20);
         let lines: Vec<_> = output.lines().collect();
         assert!(lines[0].trim().is_empty());
-        assert!(lines[19].starts_with("  local-model . high . /tmp/project"));
+        assert!(lines[19].starts_with("  local-model | high | /tmp/project"));
         assert!(!lines[19].contains("connected"));
     }
 
@@ -2265,10 +2261,10 @@ mod tests {
         let footer = chat_footer(&view, &[], 80);
         assert!(footer.starts_with("deepseek-v4.1"), "{footer}");
         assert!(
-            footer.contains(" . high . ~/Developer/revex/target/release"),
+            footer.contains(" | high | ~/Developer/revex/target/release"),
             "{footer}"
         );
-        assert!(footer.ends_with(" . - . - . -"), "{footer}");
+        assert!(footer.ends_with(" | - | - | -"), "{footer}");
         assert!(!footer.contains("Revex"));
         assert!(!footer.contains("connected"));
         assert!(!footer.contains("0 agents"));
@@ -2313,13 +2309,13 @@ mod tests {
             ..claude.clone()
         };
         let footer = chat_footer(&view, &[main.clone(), claude.clone()], 80);
-        assert!(footer.ends_with(" . ~$0.125"), "{footer}");
+        assert!(footer.ends_with(" | ~$0.125"), "{footer}");
         let known = claude.clone();
         claude.provider = crate::agents::Provider::Codex;
         claude.id = "a2".into();
         claude.cost_usd = None;
         let mixed = chat_footer(&view, &[main.clone(), claude, known.clone()], 80);
-        assert!(mixed.ends_with(" . -"), "{mixed}");
+        assert!(mixed.ends_with(" | -"), "{mixed}");
         let local = AgentInfo {
             id: "a3".into(),
             provider: crate::agents::Provider::Local,
@@ -2327,7 +2323,7 @@ mod tests {
             ..known.clone()
         };
         let mixed_local = chat_footer(&view, &[main, known, local], 80);
-        assert!(mixed_local.ends_with(" . -"), "{mixed_local}");
+        assert!(mixed_local.ends_with(" | -"), "{mixed_local}");
     }
 
     #[test]

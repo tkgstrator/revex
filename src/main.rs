@@ -2805,6 +2805,15 @@ enum Cmd {
     Exit,
 }
 
+#[cfg(test)]
+#[test]
+fn quit_is_not_a_console_command() {
+    let mut cfg = approval_mode_tests::config(std::env::temp_dir(), ApprovalMode::Manual);
+    let mut msgs = vec![json!({"role":"system","content":"test"})];
+    assert!(matches!(command(&mut cfg, &mut msgs, "/quit"), Cmd::Done));
+    assert!(matches!(command(&mut cfg, &mut msgs, "/exit"), Cmd::Exit));
+}
+
 const HELP: &str =
     "/help  /agents  /clear  /model [ID]  /route [off|auto|smart|local|remote]  /status  /exit";
 
@@ -2840,7 +2849,7 @@ fn command(cfg: &mut Cfg, msgs: &mut Vec<Value>, line: &str) -> Cmd {
     let arg = arg.trim();
     match name {
         "help" => eprintln!("{HELP}"),
-        "exit" | "quit" => return Cmd::Exit,
+        "exit" => return Cmd::Exit,
         "clear" => match clear_history(cfg, msgs) {
             Ok(()) => eprintln!("history cleared"),
             Err(e) => eprintln!("history not cleared: {e}"),
