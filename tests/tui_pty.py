@@ -554,7 +554,9 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.wait_for_screen("> Ask Revex to do anything")
                 terminal.send(b"/model new-model\r")
                 terminal.wait_for(b"Reasoning")
-                terminal.send(b"\x1b[B\x1b[B\x1b[B\r\x1b[B\r\x1b[B\r\r\r")  # High, clef-flash, Japanese, confirm.
+                terminal.send(b"\r\x1b[B\x1b[B\x1b[B\r")  # Edit Reasoning, choose High.
+                terminal.send(b"\x1b[B\r\x1b[B\r")  # Edit Decision model, choose clef-flash.
+                terminal.send(b"\x1b[B\r\x1b[B\r\x13")  # Edit Language, choose Japanese, save.
                 until = time.monotonic() + 3
                 while time.monotonic() < until:
                     saved = json.loads(project.read_text())
@@ -580,6 +582,39 @@ class TuiPtyTests(unittest.TestCase):
             finally:
                 terminal.close()
 
+    def test_config_model_tab_edits_one_item_and_saves_directly(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            seed_settings(home, {
+                "base_url": "http://127.0.0.1:9/v1",
+                "model": "saved-model",
+                "reasoning_effort": "low",
+                "decision_model": "clef",
+                "response_language": "en",
+                "helper_providers": "local",
+            })
+            terminal = Terminal(cwd, home)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/config\r")
+                terminal.wait_for_screen("Provider:")
+                terminal.send(b"\t\r")  # Model tab, browse Model item.
+                terminal.wait_for_screen("Model: saved-model")
+                terminal.send(b"\x1b[B\r\x1b[B\r")  # Reasoning item, edit, choose medium, done.
+                terminal.wait_for_screen("Reasoning: medium")
+                terminal.send(b"\x13")  # Ctrl+S saves from Model tab.
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                saved = json.loads(settings_file(home).read_text())
+                self.assertEqual(saved["model"], "saved-model")
+                self.assertEqual(saved["reasoningEffort"], "medium")
+                self.assertEqual(saved["decisionModel"], "clef")
+                self.assertEqual(saved["language"], "English")
+                terminal.send(b"exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+
     def test_setup_tabs_keep_provider_uncommitted_until_enter(self):
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
             terminal = Terminal(cwd, home)
@@ -598,16 +633,16 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.wait_for_screen("Decision model: clef")
                 terminal.send(b"\x1b[Z")  # Model -> Server.
                 terminal.wait_for_screen("Provider: Ollama (suggested)")
-                terminal.send(b"\r\x1b[B")  # Focus Provider, candidate LM Studio.
+                terminal.send(b"\r\r\x1b[B")  # Browse, then edit Provider; candidate LM Studio.
                 terminal.wait_for_screen("Provider: LM Studio (suggested)")
                 self.assertIn("URL: http://127.0.0.1:11434/v1", terminal.screen_text())
                 self.assertFalse(settings.exists())
                 terminal.send(b"\r")  # Commit LM Studio to draft only.
                 terminal.wait_for_screen("URL: http://127.0.0.1:1234/v1")
                 self.assertFalse(settings.exists())
-                terminal.send(b"x\t")  # Edit URL, then leave Server.
+                terminal.send(b"\x1b[B\rx\t")  # Edit URL, then leave Server.
                 terminal.wait_for_screen("Decision model: clef")
-                terminal.send(b"\x1b[Z\r")  # Return to Server URL field.
+                terminal.send(b"\x1b[Z\r")  # Return to Server URL item.
                 terminal.wait_for_screen("URL: http://127.0.0.1:1234/v1x")
                 terminal.send(b"\x1b")
                 terminal.read_for(0.15)
@@ -624,7 +659,7 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.wait_for(b"workspace?")
                 terminal.send(b"\r")
                 terminal.wait_for(b"Provider:")
-                terminal.send(b"\r\r")  # Open Server, commit Provider -> editable URL.
+                terminal.send(b"\r\r\r\x1b[B\r")  # Browse Provider, commit it, edit URL.
                 url_frame = terminal.read_for(0.15)
                 self.assertTrue(terminal.cursor_visible())
                 url_row, url_x = Terminal.last_cursor(url_frame)
@@ -634,7 +669,7 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.send(b"\x1b[D")
                 left_frame = terminal.read_for(0.15)
                 self.assertEqual(Terminal.last_cursor(left_frame), (url_row, url_x))
-                terminal.send(b"\r")
+                terminal.send(b"\r\x1b[B\r")  # Finish URL, browse API key, edit it.
                 key_frame = terminal.read_for(0.15)
                 self.assertTrue(terminal.cursor_visible())
                 key_row, key_x = Terminal.last_cursor(key_frame)
@@ -643,6 +678,8 @@ class TuiPtyTests(unittest.TestCase):
                 secret_frame = terminal.read_for(0.15)
                 self.assertEqual(Terminal.last_cursor(secret_frame), (key_row, key_x + 6))
                 self.assertNotIn(b"secret", secret_frame)
+                terminal.send(b"\x1b")
+                terminal.read_for(0.15)
                 terminal.send(b"\x1b")
                 terminal.read_for(0.15)
                 terminal.send(b"\x1b")
@@ -672,9 +709,9 @@ class TuiPtyTests(unittest.TestCase):
                 first.wait_for(str(ROOT).encode())
                 first.send(b"\r")
                 first.wait_for(b"Provider:")
-                first.send(b"\r\r\r\r")  # Open Server, commit provider, URL, key -> Model.
+                first.send(b"\r\r\r\t\r\r")  # Browse and commit Provider, open Model ID editor.
                 first.read_for(0.1)
-                first.send(b"fake-model\r\r\r\r\r\r")
+                first.send(b"fake-model\r\x13")  # Finish Model ID and save from Model tab.
                 first.wait_for_screen("> Ask Revex to do anything")
                 self.assertTrue(settings_file(home).is_file())
                 self.assertEqual(json.loads(settings_file(home).read_text())["decisionModel"], "clef")
@@ -765,8 +802,8 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.wait_for_screen("> Ask Revex to do anything")
                 terminal.send(b"/config\r")
                 terminal.wait_for(b"Provider:")
-                terminal.send(b"\r\r")  # Open Server and confirm saved Custom API.
-                terminal.send(b"x\r\r\r\r\r\r\r\r")  # Change URL, then final Confirm.
+                terminal.send(b"\r\x1b[B\r")  # Browse URL and edit it.
+                terminal.send(b"x\r\x13")  # Change URL, then try direct save.
                 terminal.wait_for(b"REVEX_API_KEY")
                 self.assertEqual(json.loads(settings.read_text()), original)
                 self.assertNotIn(b"test-secret", terminal.output)
@@ -793,16 +830,16 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.wait_for_screen("> Ask Revex to do anything")
                 terminal.send(b"/config\r")
                 terminal.wait_for_screen("Provider: Custom API")
-                terminal.send(b"\t\t\r\r\r")  # Helpers tab, Confirm with blank key.
+                terminal.send(b"\x13")  # Save unchanged settings with blank key.
                 terminal.wait_for_screen("> Ask Revex to do anything")
                 self.assertEqual(json.loads(auth_file(home).read_text())["apiKey"], "saved-test-secret")
                 terminal.send(b"/config\r")
                 terminal.wait_for_screen("Provider: Custom API")
-                terminal.send(b"\r\r\r")  # Open Server, Provider, URL -> API key.
+                terminal.send(b"\r\x1b[B\x1b[B\r")  # Browse API key and edit it.
                 terminal.wait_for_screen("Blank keeps saved key; Ctrl+K clears it")
                 terminal.send(b"\x0b")  # Ctrl+K explicitly clears saved API key.
-                terminal.wait_for_screen("API key: (clear on Confirm)")
-                terminal.send(b"\t\t\r\r\r")
+                terminal.wait_for_screen("API key: (clear on Save)")
+                terminal.send(b"\x13")
                 terminal.wait_for_screen("> Ask Revex to do anything")
                 self.assertNotIn("apiKey", json.loads(auth_file(home).read_text()))
                 backups = list(settings.parent.glob("auth.json.bak-*"))
@@ -823,11 +860,11 @@ class TuiPtyTests(unittest.TestCase):
                 first.wait_for(b"workspace?")
                 first.send(b"\r")
                 first.wait_for(b"Provider:")
-                first.send(b"\r\r\r\r\r\r\r\r")  # Server bar, provider, URL, key, model, reasoning, decision, language -> helpers.
-                first.wait_for(b"Up/Down helper")
+                first.send(b"\r\r\r\t\t\r\r")  # Commit Provider, switch to Helpers, edit choices.
+                first.wait_for_screen("Space toggle")
                 first.wait_for(b"Codex")
                 first.wait_for(b"Claude")
-                first.send(b" \x1b[B \x1b[B \r\r")  # Local off, Codex + Claude on, save.
+                first.send(b" \x1b[B \x1b[B \r\x13")  # Local off, Codex + Claude on, save.
                 first.wait_for_screen("> Ask Revex to do anything")
                 settings = json.loads(settings_file(home).read_text())
                 self.assertEqual(settings["helperProviders"], ["codex", "claude"])
@@ -845,7 +882,7 @@ class TuiPtyTests(unittest.TestCase):
                 returning.send(b"/config\r")
                 returning.wait_for(b"Provider:")
                 returning.output = b""
-                returning.send(b"\t\t\r\r\r")  # Helpers tab, then Confirm unchanged selection.
+                returning.send(b"\t\t\x13")  # Helpers tab, then save unchanged selection.
                 returning.wait_for_screen("> Ask Revex to do anything")
                 settings = json.loads(settings_file(home).read_text())
                 self.assertEqual(settings["helperProviders"], ["codex", "claude"])

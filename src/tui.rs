@@ -53,6 +53,7 @@ pub(crate) struct View {
     pub(crate) setup_provider_committed: Option<usize>,
     pub(crate) setup_tab: usize,
     pub(crate) setup_tab_focus: bool,
+    pub(crate) setup_editing: bool,
     pub(crate) setup_tab_fields: [usize; 3],
     pub(crate) setup_field: usize,
     pub(crate) setup_url: String,
@@ -232,13 +233,18 @@ fn draw_footer(frame: &mut Frame, view: &View, area: Rect) {
     let hint = match view.page {
         Page::Workspace => "Up/Down choose  |  Enter confirm",
         Page::Setup if view.setup_tab_focus => {
-            "Tab/Shift+Tab or Left/Right screens  |  Enter open  |  Esc back"
+            "Tab/Shift+Tab or Left/Right screens  |  Enter fields  |  Ctrl+S save"
         }
-        Page::Setup if view.setup_tab == 2 && area.width < 60 => "Up/Down Space Enter",
-        Page::Setup if view.setup_tab == 2 => {
-            "Tab/Shift+Tab screens  |  Up/Down helper  |  Space toggle  |  Esc tabs"
+        Page::Setup if view.setup_editing && view.setup_tab == 2 && area.width < 60 => {
+            "Up/Down Space Enter Ctrl+S"
         }
-        Page::Setup => "Tab/Shift+Tab screens  |  Enter choose  |  Esc tabs",
+        Page::Setup if view.setup_editing && view.setup_tab == 2 => {
+            "Up/Down choice  |  Space toggle  |  Enter done  |  Ctrl+S save"
+        }
+        Page::Setup if view.setup_editing => {
+            "Up/Down choice  |  Enter done  |  Esc fields  |  Ctrl+S save"
+        }
+        Page::Setup => "Up/Down items  |  Enter edit/select  |  Ctrl+S save  |  Esc tabs",
         Page::Chat => "Enter send  |  /agents  /status  /config  /exit",
     };
     let status = if view.status.is_empty() {
@@ -353,14 +359,14 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
             );
             if view.setup_field == 1 {
                 active_row = lines.len();
-                editable = Some((7, url_cursor));
+                editable = view.setup_editing.then_some((7, url_cursor));
             }
             lines.push(focused(
                 format!("URL: {url}"),
                 !view.setup_tab_focus && view.setup_field == 1,
             ));
             let key = if view.setup_clear_key {
-                "(clear on Confirm)".to_owned()
+                "(clear on Save)".to_owned()
             } else if view.setup_key.is_empty() {
                 "(blank keeps saved key)".to_owned()
             } else {
@@ -377,7 +383,7 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
             );
             if view.setup_field == 2 {
                 active_row = lines.len();
-                editable = Some((11, key_cursor));
+                editable = view.setup_editing.then_some((11, key_cursor));
             }
             lines.push(focused(
                 format!("API key: {key}"),
@@ -409,7 +415,7 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
             };
             let (model, model_cursor) = field_window(
                 &model,
-                if !view.setup_tab_focus && view.setup_field == 3 && view.setup_manual {
+                if view.setup_editing && view.setup_field == 3 && view.setup_manual {
                     view.cursor
                 } else {
                     0
@@ -417,7 +423,7 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
                 inner.width.saturating_sub(9) as usize,
             );
             active_row = lines.len();
-            if view.setup_manual {
+            if view.setup_manual && view.setup_editing {
                 editable = Some((9, model_cursor));
             }
             lines.push(focused(
@@ -465,7 +471,7 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
             };
             let (reasoning, cursor) = field_window(
                 &reasoning,
-                if !view.setup_tab_focus && view.setup_field == 4 && view.setup_reasoning_manual {
+                if view.setup_editing && view.setup_field == 4 && view.setup_reasoning_manual {
                     view.cursor
                 } else {
                     0
@@ -474,7 +480,8 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
             );
             if view.setup_field == 4 {
                 active_row = lines.len();
-                editable = view.setup_reasoning_manual.then_some((13, cursor));
+                editable =
+                    (view.setup_editing && view.setup_reasoning_manual).then_some((13, cursor));
             }
             lines.push(focused(
                 format!("Reasoning: {reasoning}"),
@@ -1667,6 +1674,7 @@ mod tests {
     fn manual_reasoning_field_shows_insertion_cursor() {
         let view = View {
             page: Page::Setup,
+            setup_editing: true,
             setup_tab: 1,
             setup_field: 4,
             setup_reasoning_manual: true,
@@ -1695,6 +1703,7 @@ mod tests {
     fn setup_helper_list_shows_selection_and_cli_availability() {
         let view = View {
             page: Page::Setup,
+            setup_editing: true,
             setup_tab: 2,
             setup_field: 5,
             setup_helpers: [true, true, false],
@@ -1730,6 +1739,7 @@ mod tests {
     fn narrow_helper_list_keeps_selected_choice_and_hint_visible() {
         let view = View {
             page: Page::Setup,
+            setup_editing: true,
             setup_tab: 2,
             setup_field: 5,
             setup_helper_selected: 2,
@@ -2789,13 +2799,14 @@ mod tests {
             ..view
         };
         let output = screen(&view, &[], 80, 24);
-        assert!(output.contains("API key: (clear on Confirm)"));
+        assert!(output.contains("API key: (clear on Save)"));
     }
 
     #[test]
     fn setup_url_cursor_tracks_unicode_cell_width() {
         let view = View {
             page: Page::Setup,
+            setup_editing: true,
             setup_field: 1,
             setup_url: "ab界d".into(),
             cursor: 3,
@@ -2810,6 +2821,7 @@ mod tests {
     fn setup_key_cursor_tracks_masked_characters_without_revealing_them() {
         let view = View {
             page: Page::Setup,
+            setup_editing: true,
             setup_field: 2,
             setup_key: "a界b".into(),
             cursor: 2,
@@ -2825,6 +2837,7 @@ mod tests {
     fn manual_model_cursor_tracks_unicode_cell_width() {
         let view = View {
             page: Page::Setup,
+            setup_editing: true,
             setup_tab: 1,
             setup_field: 3,
             setup_manual: true,
@@ -2841,6 +2854,7 @@ mod tests {
     fn narrow_setup_field_scrolls_horizontally_and_keeps_cursor_visible() {
         let view = View {
             page: Page::Setup,
+            setup_editing: true,
             setup_field: 1,
             setup_url: "https://example.test/v1".into(),
             cursor: 23,

@@ -322,6 +322,7 @@ fn setup_view(view: &mut tui::View, cfg: &Cfg) {
     view.setup_provider_committed = (!cfg.base.is_empty()).then_some(view.setup_provider);
     view.setup_tab = 0;
     view.setup_tab_focus = true;
+    view.setup_editing = false;
     view.setup_tab_fields = [0, 3, 5];
     view.setup_url = if cfg.base.is_empty() {
         preset_url(0).into()
@@ -362,8 +363,8 @@ fn setup_view(view: &mut tui::View, cfg: &Cfg) {
     view.setup_model_selected = 0;
     view.setup_manual = !view.setup_model.is_empty();
     view.setup_field = 0;
-    view.setup_status = helper_status
-        .unwrap_or_else(|| "Choose a provider. Nothing is saved until Confirm.".into());
+    view.setup_status =
+        helper_status.unwrap_or_else(|| "Choose a provider. Ctrl+S saves from any tab.".into());
     view.cursor = 0;
 }
 
@@ -787,6 +788,7 @@ fn submit_chat(
                 setup_view(view, cfg);
                 view.setup_tab = 1;
                 view.setup_tab_focus = false;
+                view.setup_editing = false;
                 view.setup_field = 3;
                 view.setup_manual = false;
                 start_model_check(view, cfg, &session.events, request);
@@ -794,6 +796,7 @@ fn submit_chat(
                 setup_view(view, cfg);
                 view.setup_tab = 1;
                 view.setup_tab_focus = false;
+                view.setup_editing = false;
                 view.setup_model = id.into();
                 view.setup_manual = true;
                 view.setup_field = 4;
@@ -865,8 +868,16 @@ fn handle_setup_key(
     request: &mut u64,
     exit: &mut bool,
 ) -> Result<(), String> {
+    if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if let Err(e) = save_setup(cfg, view, session, tx, request) {
+            view.setup_status = format!("Cannot save: {e}");
+        }
+        return Ok(());
+    }
     if key.code == KeyCode::Esc {
-        if !view.setup_tab_focus {
+        if view.setup_editing {
+            view.setup_editing = false;
+        } else if !view.setup_tab_focus {
             view.setup_tab_fields[view.setup_tab] = view.setup_field;
             view.setup_tab_focus = true;
         } else if session.is_some() {
@@ -881,6 +892,7 @@ fn handle_setup_key(
         if !view.setup_tab_focus {
             view.setup_tab_fields[view.setup_tab] = view.setup_field;
         }
+        view.setup_editing = false;
         view.setup_tab = if key.code == KeyCode::Tab {
             (view.setup_tab + 1) % 3
         } else {
@@ -895,6 +907,7 @@ fn handle_setup_key(
             KeyCode::Right | KeyCode::Down => view.setup_tab = (view.setup_tab + 1) % 3,
             KeyCode::Enter => {
                 view.setup_tab_focus = false;
+                view.setup_editing = false;
                 view.setup_field = view.setup_tab_fields[view.setup_tab];
                 view.cursor = match view.setup_field {
                     1 => view.setup_url.chars().count(),
@@ -908,6 +921,41 @@ fn handle_setup_key(
                 }
             }
             _ => {}
+        }
+        return Ok(());
+    }
+    if !view.setup_editing {
+        let fields: &[usize] = match view.setup_tab {
+            0 => &[0, 1, 2],
+            1 => &[3, 4, 7, 8],
+            _ => &[5, 6],
+        };
+        let index = fields
+            .iter()
+            .position(|field| *field == view.setup_field)
+            .unwrap_or(0);
+        match key.code {
+            KeyCode::Up => view.setup_field = fields[index.saturating_sub(1)],
+            KeyCode::Down => view.setup_field = fields[(index + 1).min(fields.len() - 1)],
+            KeyCode::Enter if view.setup_field == 6 => {
+                if let Err(e) = save_setup(cfg, view, session, tx, request) {
+                    view.setup_status = format!("Cannot save: {e}");
+                }
+            }
+            KeyCode::Enter => {
+                view.setup_editing = true;
+                view.cursor = match view.setup_field {
+                    1 => view.setup_url.chars().count(),
+                    2 => view.setup_key.chars().count(),
+                    3 => view.setup_model.chars().count(),
+                    4 => view.setup_reasoning.chars().count(),
+                    _ => 0,
+                };
+            }
+            _ => {}
+        }
+        if view.page == tui::Page::Setup {
+            view.setup_tab_fields[view.setup_tab] = view.setup_field;
         }
         return Ok(());
     }
@@ -934,23 +982,13 @@ fn handle_setup_key(
                         invalidate_setup_models(view, request);
                     }
                 }
-                view.setup_field = 1;
-                view.cursor = view.setup_url.chars().count();
+                view.setup_editing = false;
             }
             _ => {}
         },
         1 | 2 => {
             if key.code == KeyCode::Enter {
-                if view.setup_field == 1 {
-                    view.setup_field = 2;
-                    view.cursor = view.setup_key.chars().count();
-                } else {
-                    view.setup_tab_fields[0] = 2;
-                    view.setup_tab = 1;
-                    view.setup_field = 3;
-                    view.cursor = view.setup_model.chars().count();
-                    start_model_check(view, cfg, tx, request);
-                }
+                view.setup_editing = false;
             } else if view.setup_field == 1 {
                 let previous = view.setup_url.clone();
                 edit_buffer(&mut view.setup_url, &mut view.cursor, key);
@@ -967,7 +1005,7 @@ fn handle_setup_key(
                     view.setup_key.clear();
                     view.setup_clear_key = true;
                     view.cursor = 0;
-                    view.setup_status = "Saved API key will be cleared on Confirm.".into();
+                    view.setup_status = "Saved API key will be cleared on Save.".into();
                     invalidate_setup_models(view, request);
                     return Ok(());
                 }
@@ -981,8 +1019,7 @@ fn handle_setup_key(
         }
         3 => match key.code {
             KeyCode::Enter => {
-                view.setup_field = 4;
-                view.cursor = view.setup_reasoning.chars().count();
+                view.setup_editing = false;
             }
             KeyCode::Up | KeyCode::Down if !view.setup_models.is_empty() => {
                 if view.setup_manual {
@@ -1015,7 +1052,7 @@ fn handle_setup_key(
         },
         4 => match key.code {
             KeyCode::Enter => {
-                view.setup_field = 7;
+                view.setup_editing = false;
             }
             KeyCode::Up | KeyCode::Down => {
                 if view.setup_reasoning_manual {
@@ -1054,7 +1091,7 @@ fn handle_setup_key(
                 view.setup_decision_model_selected = (view.setup_decision_model_selected + 1) % 3;
             }
             KeyCode::Enter => {
-                view.setup_field = 8;
+                view.setup_editing = false;
             }
             _ => {}
         },
@@ -1063,9 +1100,7 @@ fn handle_setup_key(
                 view.setup_response_language_selected = 1 - view.setup_response_language_selected;
             }
             KeyCode::Enter => {
-                view.setup_tab_fields[1] = 8;
-                view.setup_tab = 2;
-                view.setup_field = 5;
+                view.setup_editing = false;
             }
             _ => {}
         },
@@ -1084,11 +1119,7 @@ fn handle_setup_key(
                 }
             }
             KeyCode::Enter => {
-                if view.setup_helpers.iter().any(|selected| *selected) {
-                    view.setup_field = 6;
-                } else {
-                    view.setup_status = "Select at least one helper provider with Space.".into();
-                }
+                view.setup_editing = false;
             }
             _ => {}
         },
@@ -2694,6 +2725,7 @@ mod tests {
         let mut exit = false;
         assert_eq!(view.setup_provider, 0);
         view.setup_tab_focus = false;
+        view.setup_editing = true;
         handle_setup_key(
             KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
             &mut config,
@@ -2718,6 +2750,7 @@ mod tests {
         .unwrap();
         assert_eq!(view.setup_url, "http://127.0.0.1:8000/v1");
         view.setup_field = 0;
+        view.setup_editing = true;
         handle_setup_key(
             KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE),
             &mut config,
@@ -2741,6 +2774,7 @@ mod tests {
         setup_view(&mut view, &config);
         view.setup_tab = 1;
         view.setup_tab_focus = false;
+        view.setup_editing = true;
         view.setup_field = 3;
         view.setup_status = "Connection failed".into();
         let (tx, _rx) = mpsc::channel();
@@ -3069,6 +3103,7 @@ mod tests {
         let mut view = tui::View::default();
         setup_view(&mut view, &config);
         view.setup_tab_focus = false;
+        view.setup_editing = true;
         view.setup_field = 2;
         view.setup_key = "draft-secret".into();
         let (tx, _rx) = mpsc::channel();
@@ -3206,7 +3241,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_picker_advances_from_model_then_confirms() {
+    fn reasoning_picker_can_be_reached_without_editing_model() {
         let agents = Agents::memory(model_fn(|_, _| unreachable!()));
         let mut config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
         let mut view = tui::View::default();
@@ -3219,7 +3254,7 @@ mod tests {
         let mut request = 0;
         let mut exit = false;
         handle_setup_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
             &mut config,
             &mut view,
             &mut session,
@@ -3229,6 +3264,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(view.setup_field, 4);
+        handle_setup_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut config,
+            &mut view,
+            &mut session,
+            &tx,
+            &mut request,
+            &mut exit,
+        )
+        .unwrap();
+        assert!(view.setup_editing);
         for _ in 0..3 {
             handle_setup_key(
                 KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
@@ -3252,7 +3298,8 @@ mod tests {
             &mut exit,
         )
         .unwrap();
-        assert_eq!(view.setup_field, 7);
+        assert_eq!(view.setup_field, 4);
+        assert!(!view.setup_editing);
     }
 
     #[test]
@@ -3287,7 +3334,8 @@ mod tests {
         assert_eq!(view.setup_tab, 1);
         press!(KeyCode::BackTab);
         assert_eq!(view.setup_tab, 0);
-        press!(KeyCode::Enter); // Focus Provider.
+        press!(KeyCode::Enter); // Browse Provider.
+        press!(KeyCode::Enter); // Edit Provider.
         press!(KeyCode::Down); // Candidate LM Studio; no URL change yet.
         assert_eq!(view.setup_url, preset_url(0));
         assert_eq!(view.setup_provider_committed, None);
@@ -3303,6 +3351,7 @@ mod tests {
         let mut view = tui::View::default();
         setup_view(&mut view, &config);
         view.setup_tab_focus = false;
+        view.setup_editing = true;
         let (tx, _rx) = mpsc::channel();
         let mut session = None;
         let mut request = 0;
@@ -3332,6 +3381,7 @@ mod tests {
         let mut view = tui::View::default();
         setup_view(&mut view, &config);
         view.setup_tab_focus = false;
+        view.setup_editing = true;
         let (tx, _rx) = mpsc::channel();
         let mut session = None;
         let mut request = 0;
@@ -3360,6 +3410,7 @@ mod tests {
         let mut view = tui::View::default();
         setup_view(&mut view, &config);
         view.setup_tab_focus = false;
+        view.setup_editing = true;
         view.setup_field = 1;
         view.cursor = view.setup_url.chars().count();
         let (tx, _rx) = mpsc::channel();
@@ -3390,7 +3441,7 @@ mod tests {
     }
 
     #[test]
-    fn model_tab_selects_decision_model_before_helpers() {
+    fn model_tab_edits_decision_model_without_changing_other_items() {
         let agents = Agents::memory(model_fn(|_, _| unreachable!()));
         let mut config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
         let mut view = tui::View::default();
@@ -3402,7 +3453,7 @@ mod tests {
         let mut session = None;
         let mut request = 0;
         let mut exit = false;
-        for code in [KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
+        for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
             handle_setup_key(
                 KeyEvent::new(code, KeyModifiers::NONE),
                 &mut config,
@@ -3413,17 +3464,15 @@ mod tests {
                 &mut exit,
             )
             .unwrap();
-            if code == KeyCode::Enter && view.setup_field == 7 {
-                assert_eq!(view.setup_decision_model_selected, 1);
-            }
         }
         assert_eq!(view.setup_decision_model_selected, 2);
-        assert_eq!(view.setup_field, 8);
+        assert_eq!(view.setup_field, 7);
+        assert!(!view.setup_editing);
         assert_eq!(view.setup_tab, 1);
     }
 
     #[test]
-    fn model_tab_selects_response_language_before_helpers() {
+    fn model_tab_edits_response_language_without_changing_other_items() {
         let agents = Agents::memory(model_fn(|_, _| unreachable!()));
         let mut config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
         let mut view = tui::View::default();
@@ -3435,7 +3484,7 @@ mod tests {
         let mut session = None;
         let mut request = 0;
         let mut exit = false;
-        for code in [KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
+        for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
             handle_setup_key(
                 KeyEvent::new(code, KeyModifiers::NONE),
                 &mut config,
@@ -3448,8 +3497,9 @@ mod tests {
             .unwrap();
         }
         assert_eq!(view.setup_response_language_selected, 1);
-        assert_eq!(view.setup_field, 5);
-        assert_eq!(view.setup_tab, 2);
+        assert_eq!(view.setup_field, 8);
+        assert_eq!(view.setup_tab, 1);
+        assert!(!view.setup_editing);
     }
 
     #[test]
@@ -3479,6 +3529,7 @@ mod tests {
         view.setup_tab = 2;
         view.setup_tab_focus = false;
         view.setup_field = 5;
+        view.setup_editing = true;
         view.setup_helpers = [true, false, false];
         view.setup_helper_selected = 0;
         let (tx, _rx) = mpsc::channel();
@@ -3500,15 +3551,15 @@ mod tests {
             };
         }
         key!(KeyCode::Char(' ')); // Deselect Local.
-        key!(KeyCode::Enter);
-        assert_eq!(view.setup_field, 5);
-        assert!(view.setup_status.contains("at least one"));
+        assert!(!view.setup_helpers.iter().any(|selected| *selected));
         key!(KeyCode::Down);
         key!(KeyCode::Char(' ')); // Select Codex.
         key!(KeyCode::Down);
         key!(KeyCode::Char(' ')); // Select Claude too.
         assert_eq!(view.setup_helpers, [false, true, true]);
         key!(KeyCode::Enter);
+        assert!(!view.setup_editing);
+        key!(KeyCode::Down);
         assert_eq!(view.setup_field, 6);
     }
 
