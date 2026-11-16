@@ -3862,7 +3862,7 @@ mod tests {
                 let messages = request["messages"].as_array().unwrap();
                 let is_child = messages[0]["content"]
                     .as_str()
-                    .is_some_and(|prompt| prompt.starts_with(CHILD_SYSTEM));
+                    .is_some_and(|prompt| prompt.contains(CHILD_SYSTEM));
                 let sequence = messages.len();
                 let gate = child_gate.clone();
                 if is_child {
