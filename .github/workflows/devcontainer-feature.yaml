@@ -32,6 +32,15 @@ jobs:
           sh -n src/revex/install.sh test/revex/test.sh test/revex/smoke.sh
       - name: Test wrapper without installing on host
         run: sh test/revex/smoke.sh
+      - name: Stage only the Revex Feature
+        run: |
+          mkdir -p .feature-publish
+          cp -R src/revex .feature-publish/
+      - name: Validate the exact publish payload
+        uses: devcontainers/action@v1
+        with:
+          validate-only: 'true'
+          base-path-to-features: ./.feature-publish
 
   container:
     name: Feature install (${{ matrix.runner }})
@@ -58,11 +67,15 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v7
+      - name: Stage only the Revex Feature
+        run: |
+          mkdir -p .feature-publish
+          cp -R src/revex .feature-publish/
       - name: Publish ghcr.io/tkgstrator/revex
         uses: devcontainers/action@v1
         with:
           publish-features: 'true'
-          base-path-to-features: ./src
+          base-path-to-features: ./.feature-publish
           features-namespace: tkgstrator
           generate-docs: 'false'
           disable-repo-tagging: 'true'
