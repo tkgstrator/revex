@@ -43,6 +43,28 @@ def goal_file(home, cwd):
     return pathlib.Path(home, ".local/state/revex", f"history-{value:016x}.goal.json")
 
 
+def history_file(home, cwd):
+    path = goal_file(home, cwd)
+    return path.with_name(path.name.replace(".goal.json", ".json"))
+
+
+def seed_long_history(home, cwd):
+    path = history_file(home, cwd)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    messages = [{"role": "system", "content": "old system prompt"}]
+    for index in range(48):
+        messages.append({"role": "user", "content": f"archive-{index} " + "x" * 150})
+        messages.append({"role": "assistant", "content": f"finding-{index} " + "y" * 150})
+    body = json.dumps({
+        "version": 1,
+        "cwd": str(pathlib.Path(cwd).resolve()),
+        "messages": messages,
+    }).encode()
+    path.write_bytes(body)
+    path.chmod(0o600)
+    return path, body
+
+
 def seed_settings(home, data):
     path = settings_file(home)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -89,6 +111,9 @@ class Terminal:
             "REVEX_ROUTE", "REVEX_FRONTIER", "REVEX_EXTRA",
             "REVEX_RESPONSE_LANGUAGE",
             "REVEX_APPROVAL_MODE",
+            "REVEX_CONTEXT_BUDGET_TOKENS",
+            "REVEX_MAX_OUTPUT_TOKENS",
+            "REVEX_REQUEST_DEADLINE_SECONDS",
         ):
             env.pop(key, None)
         env.update(extra or {})
@@ -570,6 +595,76 @@ class FakeGoalServer:
         assert self.finished.is_set(), "goal server did not finish"
 
 
+class FakeContextServer:
+    """Serve bounded context summaries and one ordinary chat reply."""
+
+    def __init__(self, hold_summary=False):
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(8)
+        self.listener.settimeout(8)
+        self.base = f"http://127.0.0.1:{self.listener.getsockname()[1]}"
+        self.summaries = []
+        self.chats = []
+        self.summary_started = threading.Event()
+        self.release_summary = threading.Event()
+        if not hold_summary:
+            self.release_summary.set()
+        self.finished = threading.Event()
+        self.error = None
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        try:
+            while not self.finished.is_set():
+                conn, _ = self.listener.accept()
+                conn.settimeout(6)
+                with conn:
+                    head = b""
+                    while b"\r\n\r\n" not in head:
+                        head += conn.recv(4096)
+                    headers, body_read = head.split(b"\r\n\r\n", 1)
+                    length = next(
+                        (int(line.split(b":", 1)[1].strip()) for line in headers.split(b"\r\n")
+                         if line.lower().startswith(b"content-length:")), 0
+                    )
+                    while len(body_read) < length:
+                        body_read += conn.recv(4096)
+                    if b"GET /models" in headers:
+                        body = b'{"data":[{"id":"fake-context"}]}'
+                        conn.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                            + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                            + body
+                        )
+                        continue
+                    assert b"POST /chat/completions" in headers
+                    request = json.loads(body_read[:length])
+                    if "Summarize prior Revex conversation facts" in request["messages"][0]["content"]:
+                        self.summaries.append(request)
+                        self.summary_started.set()
+                        assert self.release_summary.wait(7), "summary was never released"
+                        try:
+                            sse(conn, "Archived parser evidence and open verification work.")
+                        except BrokenPipeError:
+                            pass  # Ctrl+C may close an in-flight summary request.
+                    else:
+                        self.chats.append(request)
+                        sse(conn, "bounded reply")
+                        self.finished.set()
+        except Exception as exc:
+            self.error = exc
+
+    def close(self):
+        self.release_summary.set()
+        self.thread.join(timeout=8)
+        self.listener.close()
+        if self.error:
+            raise self.error
+        assert self.finished.is_set(), "context server did not finish"
+
+
 class FakeSingleReplyServer:
     def __init__(self, reply_count=1, reasoning=None):
         self.listener = socket.socket()
@@ -833,6 +928,37 @@ class TuiPtyTests(unittest.TestCase):
                 self.assertEqual(saved["decisionModel"], "clef")
                 self.assertEqual(saved["language"], "English")
                 terminal.send(b"exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+
+    def test_config_request_limit_only_persists_when_edited(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            seed_settings(home, {
+                "base_url": "http://127.0.0.1:9/v1",
+                "model": "saved-model",
+                "helper_providers": "local",
+            })
+            terminal = Terminal(cwd, home, {"REVEX_CONTEXT_BUDGET_TOKENS": "4096"})
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/config\r")
+                terminal.wait_for_screen("Provider:")
+                terminal.send(b"\x13")  # Save without editing a request limit.
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                self.assertNotIn("contextBudgetTokens", json.loads(settings_file(home).read_text()))
+                terminal.send(b"/config\r\t\r")  # Model tab, browse Model.
+                terminal.wait_for_screen("Context budget: 4096 tokens")
+                terminal.send(b"\x1b[B\x1b[B\x1b[B\x1b[B\r")  # Edit Context budget.
+                terminal.send(b"\x7f" * 4 + b"8192\r\x13")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                saved = json.loads(settings_file(home).read_text())
+                self.assertEqual(saved["contextBudgetTokens"], 8192)
+                self.assertNotIn("maxOutputTokens", saved)
+                self.assertNotIn("requestDeadlineSeconds", saved)
+                terminal.send(b"/exit\r")
                 terminal.exit()
             finally:
                 terminal.close()
@@ -1157,7 +1283,7 @@ class TuiPtyTests(unittest.TestCase):
                 first.send(b"/help\r")
                 first.wait_for(b"/model")
                 first.send(b"/route\r")
-                first.wait_for(b"Route:")
+                first.wait_for_screen("Route: off")
                 first.send(b"draft")
                 first.read_for(0.1)
                 first.send(b"\x1b[A")
@@ -1612,6 +1738,122 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.wait_for_screen("multiline done")
                 self.assertEqual(sidecar.read_bytes(), b"{malformed-goal")
                 self.assertEqual(len(server.requests), 1)
+                terminal.send(b"/exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_compact_preserves_full_history_and_bounds_next_request(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            history, original = seed_long_history(home, cwd)
+            server = FakeContextServer()
+            seed_settings(home, {
+                "base_url": server.base,
+                "model": "fake-context",
+                "contextBudgetTokens": 8192,
+            })
+            terminal = Terminal(cwd, home)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/compact\r")
+                terminal.wait_for_screen("Context compacted:", seconds=15)
+                self.assertTrue(server.summaries)
+                self.assertEqual(history.read_bytes(), original)
+                self.assertTrue(history.with_suffix(".context.json").exists())
+                terminal.send(b"follow up\r")
+                terminal.wait_for_screen("bounded reply", seconds=10)
+                self.assertEqual(len(server.chats), 1)
+                messages = server.chats[0]["messages"]
+                encoded = json.dumps(messages, separators=(",", ":")).encode()
+                self.assertLessEqual(len(encoded), 8192 * 2)
+                joined = "\n".join(message["content"] for message in messages)
+                self.assertIn("Archived parser evidence", joined)
+                self.assertNotIn("archive-0", joined)
+                self.assertIn("follow up", joined)
+                terminal.send(b"/exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_chat_input_queues_during_compaction(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            seed_long_history(home, cwd)
+            server = FakeContextServer(hold_summary=True)
+            seed_settings(home, {
+                "base_url": server.base,
+                "model": "fake-context",
+                "contextBudgetTokens": 8192,
+            })
+            terminal = Terminal(cwd, home)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/compact\r")
+                until = time.monotonic() + 5
+                while not server.summary_started.is_set() and time.monotonic() < until:
+                    terminal.read_for(0.05)
+                self.assertTrue(server.summary_started.is_set(), "summary request never started")
+                terminal.wait_for_screen("Compacting context")
+                terminal.send(b"run after compaction\r")
+                terminal.wait_for_screen("Task queued")
+                self.assertEqual(len(server.chats), 0)
+                server.release_summary.set()
+                terminal.wait_for_screen("bounded reply", seconds=15)
+                self.assertEqual(len(server.chats), 1)
+                self.assertIn(
+                    "run after compaction",
+                    server.chats[0]["messages"][-1]["content"],
+                )
+                terminal.send(b"/exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_compact_ctrl_c_discards_queued_input_and_preserves_history(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            history, original = seed_long_history(home, cwd)
+            server = FakeContextServer(hold_summary=True)
+            seed_settings(home, {
+                "base_url": server.base,
+                "model": "fake-context",
+                "contextBudgetTokens": 8192,
+            })
+            terminal = Terminal(cwd, home)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/compact\r")
+                until = time.monotonic() + 5
+                while not server.summary_started.is_set() and time.monotonic() < until:
+                    terminal.read_for(0.05)
+                self.assertTrue(server.summary_started.is_set(), "summary request never started")
+                terminal.send(b"queued task must not run\r")
+                terminal.wait_for_screen("Task queued")
+                terminal.send(b"\x03")
+                terminal.wait_for_screen("Stopping compaction")
+                server.release_summary.set()
+                terminal.wait_for_screen("Context not compacted:", seconds=12)
+                self.assertIn("interrupted", terminal.screen_text())
+                self.assertEqual(history.read_bytes(), original)
+                self.assertFalse(history.with_suffix(".context.json").exists())
+                terminal.send(b"/status\r")
+                terminal.wait_for_screen("Session:")
+                self.assertEqual(server.chats, [], "queued task ran after cancellation")
+                terminal.send(b"\x1b")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"manual request after cancellation\r")
+                terminal.wait_for_screen("bounded reply", seconds=10)
+                self.assertEqual(len(server.chats), 1)
+                joined = "\n".join(message["content"] for message in server.chats[0]["messages"])
+                self.assertIn("manual request after cancellation", joined)
+                self.assertNotIn("queued task must not run", joined)
                 terminal.send(b"/exit\r")
                 terminal.exit()
             finally:

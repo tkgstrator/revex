@@ -1477,6 +1477,7 @@ mod tests {
             response_language: ResponseLanguage::English,
             approval_mode: ApprovalMode::Manual,
             max_steps: DEFAULT_MAX_STEPS,
+            limits: RequestLimits::default(),
             reasoning: None,
             yes: false,
             history: None,

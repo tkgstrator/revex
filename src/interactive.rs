@@ -195,6 +195,7 @@ enum Event {
         answer: Sender<bool>,
     },
     Finished(Result<AgentAnswer, String>, Vec<Value>),
+    Compacted(Result<context::CompactionReport, String>),
     GoalEvaluated {
         revision: u64,
         turn: u32,
@@ -405,6 +406,12 @@ fn setup_view(view: &mut tui::View, cfg: &Cfg) {
         ResponseLanguage::English => 0,
         ResponseLanguage::Japanese => 1,
     };
+    view.setup_limit_values = [
+        cfg.limits.context_budget_tokens.to_string(),
+        cfg.limits.max_output_tokens.to_string(),
+        cfg.limits.request_deadline_secs.to_string(),
+    ];
+    view.setup_limit_dirty = [false; 3];
     let helper_status = match stored_helper_selection() {
         Ok(selected) => {
             view.setup_helpers = selected;
@@ -505,6 +512,9 @@ fn activate_chat(
     if let Some(ui) = active.cfg.ui.as_mut() {
         ui.suppress_routine = true;
     }
+    if let Some(msgs) = active.msgs.as_ref() {
+        refresh_context_usage(view, &active.cfg, msgs);
+    }
     if let Some(state) = active.goal.as_ref().and_then(GoalStore::status) {
         append(
             view,
@@ -531,6 +541,26 @@ fn append(view: &mut tui::View, message: &str) {
         view.transcript.drain(..view.transcript.len() - 2000);
     }
     view.scroll = 0;
+}
+
+fn refresh_context_usage(view: &mut tui::View, cfg: &Cfg, msgs: &[Value]) {
+    view.context_usage = Some(match context_usage(cfg, msgs) {
+        Ok(usage) => {
+            let mut label = format!(
+                "~{}/{} tokens (estimated",
+                usage.estimated_tokens, usage.budget_tokens
+            );
+            if usage.compacted {
+                label.push_str(", compacted");
+            }
+            if usage.omitted_messages > 0 {
+                label.push_str(&format!(", {} older omitted", usage.omitted_messages));
+            }
+            label.push(')');
+            label
+        }
+        Err(error) => format!("unavailable ({error})"),
+    });
 }
 
 const MAX_THINKING_BYTES: usize = 16 * 1024;
@@ -724,6 +754,26 @@ fn save_setup(
         3 => ApprovalMode::Plan,
         _ => return Err("Choose a valid approval mode".into()),
     };
+    let limits = RequestLimits {
+        context_budget_tokens: parse_bounded_number(
+            &Value::String(view.setup_limit_values[0].clone()),
+            "contextBudgetTokens",
+            4_096,
+            800_000,
+        )? as usize,
+        max_output_tokens: parse_bounded_number(
+            &Value::String(view.setup_limit_values[1].clone()),
+            "maxOutputTokens",
+            256,
+            32_768,
+        )? as u32,
+        request_deadline_secs: parse_bounded_number(
+            &Value::String(view.setup_limit_values[2].clone()),
+            "requestDeadlineSeconds",
+            10,
+            3_600,
+        )?,
+    };
     if view.setup_provider_committed.is_none() {
         return Err("Choose a model server provider with Enter".into());
     }
@@ -755,6 +805,23 @@ fn save_setup(
             Value::String(approval_mode_name(approval_mode).into()),
         );
     }
+    for (index, key) in [
+        "contextBudgetTokens",
+        "maxOutputTokens",
+        "requestDeadlineSeconds",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if view.setup_limit_dirty[index] {
+            let value = match index {
+                0 => limits.context_budget_tokens as u64,
+                1 => limits.max_output_tokens as u64,
+                _ => limits.request_deadline_secs,
+            };
+            settings.insert(key.into(), json!(value));
+        }
+    }
     cfg.model = (!view.setup_model.trim().is_empty()).then(|| view.setup_model.trim().into());
     let effort = view.setup_reasoning.trim();
     cfg.reasoning = Some(effort.into());
@@ -777,6 +844,7 @@ fn save_setup(
         );
     }
     save_home_config(&settings)?;
+    cfg.limits = limits;
     if view.setup_approval_mode_dirty {
         cfg.approval_mode = approval_mode;
         cfg.yes = false; // an explicit UI selection replaces the startup --yes override
@@ -806,6 +874,7 @@ fn save_setup(
         session.cfg.reasoning = cfg.reasoning.clone();
         session.cfg.decision_model = cfg.decision_model.clone();
         session.cfg.response_language = cfg.response_language;
+        session.cfg.limits = cfg.limits;
         if view.setup_approval_mode_dirty {
             session.cfg.approval_mode = cfg.approval_mode;
             session.cfg.yes = false;
@@ -816,6 +885,9 @@ fn save_setup(
             view,
             "Settings saved. New requests will use the updated provider.",
         );
+        if let Some(msgs) = session.msgs.as_ref() {
+            refresh_context_usage(view, &session.cfg, msgs);
+        }
         maybe_start_goal(view, session);
     } else {
         activate_chat(cfg, view, session, tx)?;
@@ -929,12 +1001,17 @@ fn submit_task(task: &str, mode: SubmissionMode, view: &mut tui::View, session: 
     }
     append(view, &format!("You  {task}"));
     if session.busy {
-        if session.interrupted || matches!(mode, SubmissionMode::Queue) {
+        if session.interrupted || session.compacting || matches!(mode, SubmissionMode::Queue) {
             session.queued.push_back(task.into());
             append(
                 view,
                 &format!(
-                    "Task queued for after this task ({}).",
+                    "Task queued for after {} ({}).",
+                    if session.compacting {
+                        "compaction"
+                    } else {
+                        "this task"
+                    },
                     session.queued.len()
                 ),
             );
@@ -1101,6 +1178,10 @@ fn submit_chat_mode(
                 *request += 1; // invalidate any pending connection check
             }
         }
+        "/compact" => {
+            session.start_compaction(&mut |message| append(view, message));
+            view.compacting = session.compacting;
+        }
         "/clear" => {
             if session.busy {
                 append(view, "Finish the current task before /clear.");
@@ -1126,6 +1207,7 @@ fn submit_chat_mode(
                         view.last_turn_elapsed = None;
                         view.last_turn_rate = None;
                         append(view, "Session history and agent records cleared.");
+                        refresh_context_usage(view, &session.cfg, msgs);
                         if let Some(error) = goal_error {
                             append(view, &format!("Goal state remains: {error}"));
                         }
@@ -1136,7 +1218,7 @@ fn submit_chat_mode(
         }
         "/help" => append(
             view,
-            "/agents  /status  /config  /model [ID]  /approval [manual|auto|bypass|plan]  /goal [--max-turns N] OBJECTIVE  /goal status|pause|resume|clear  /steer TEXT  /queue TEXT  /clear  /exit or exit  Ctrl+D exit  Alt+Enter newline  Ctrl+R retry models",
+            "/agents  /status  /config  /compact  /model [ID]  /approval [manual|auto|bypass|plan]  /goal [--max-turns N] OBJECTIVE  /goal status|pause|resume|clear  /steer TEXT  /queue TEXT  /clear  /exit or exit  Ctrl+D exit  Alt+Enter newline  Ctrl+R retry models",
         ),
         _ if line == "/goal" || line.starts_with("/goal ") => {
             handle_goal_command(line.strip_prefix("/goal").unwrap_or(""), view, session)
@@ -1483,6 +1565,9 @@ fn handle_setup_key(
                     2 => view.setup_key.chars().count(),
                     3 => view.setup_model.chars().count(),
                     4 => view.setup_reasoning.chars().count(),
+                    10..=12 => view.setup_limit_values[view.setup_field - 10]
+                        .chars()
+                        .count(),
                     _ => 0,
                 };
                 if view.setup_field == 3 && view.setup_models.is_empty() {
@@ -1496,7 +1581,7 @@ fn handle_setup_key(
     if !view.setup_editing {
         let fields: &[usize] = match view.setup_tab {
             0 => &[0, 1, 2],
-            1 => &[3, 4, 7, 8],
+            1 => &[3, 4, 7, 8, 10, 11, 12],
             _ => &[5, 9, 6],
         };
         let index = fields
@@ -1518,6 +1603,9 @@ fn handle_setup_key(
                     2 => view.setup_key.chars().count(),
                     3 => view.setup_model.chars().count(),
                     4 => view.setup_reasoning.chars().count(),
+                    10..=12 => view.setup_limit_values[view.setup_field - 10]
+                        .chars()
+                        .count(),
                     _ => 0,
                 };
             }
@@ -1673,6 +1761,18 @@ fn handle_setup_key(
             }
             _ => {}
         },
+        10..=12 => {
+            if key.code == KeyCode::Enter {
+                view.setup_editing = false;
+            } else {
+                let index = view.setup_field - 10;
+                let previous = view.setup_limit_values[index].clone();
+                edit_buffer(&mut view.setup_limit_values[index], &mut view.cursor, key);
+                if view.setup_limit_values[index] != previous {
+                    view.setup_limit_dirty[index] = true;
+                }
+            }
+        }
         5 => match key.code {
             KeyCode::Up => view.setup_helper_selected = (view.setup_helper_selected + 2) % 3,
             KeyCode::Down => view.setup_helper_selected = (view.setup_helper_selected + 1) % 3,
@@ -2052,6 +2152,7 @@ fn handle_worker_event(
             view.thinking_text.clear();
             if let Some(session) = session.as_mut() {
                 complete_turn(view, session);
+                refresh_context_usage(view, &session.cfg, &msgs);
                 let judgement = prepare_goal_judgement(session, &result, &msgs, view);
                 session.finished(result, msgs, &mut |message| append(view, message));
                 if session.busy {
@@ -2076,6 +2177,23 @@ fn handle_worker_event(
                             &mut |message| append(view, message),
                         );
                     }
+                } else {
+                    maybe_start_goal(view, session);
+                }
+            }
+        }
+        Event::Compacted(result) => {
+            view.compacting = false;
+            view.model_in_flight = false;
+            view.thinking_started = None;
+            view.thinking_text.clear();
+            if let Some(session) = session.as_mut() {
+                session.compact_finished(result, &mut |message| append(view, message));
+                if let Some(msgs) = session.msgs.as_ref() {
+                    refresh_context_usage(view, &session.cfg, msgs);
+                }
+                if session.busy {
+                    begin_turn(view, session);
                 } else {
                     maybe_start_goal(view, session);
                 }
@@ -2220,7 +2338,15 @@ pub(crate) fn run_tui(mut cfg: Cfg) -> Result<(), String> {
         }
         if let Some(session) = session.as_ref() {
             let main = &session.agents.snapshot()[0];
-            let mut status = format!("{}  |  {} queued", main.status.name(), session.queued.len());
+            let mut status = format!(
+                "{}  |  {} queued",
+                if session.compacting {
+                    "compacting"
+                } else {
+                    main.status.name()
+                },
+                session.queued.len()
+            );
             if let Some(goal) = session.goal.as_ref().and_then(GoalStore::status) {
                 status.push_str(&format!(
                     "  |  goal {} {}/{}",
@@ -2903,6 +3029,8 @@ struct Session {
     events: Sender<Event>,
     cancelled: Arc<AtomicBool>,
     busy: bool,
+    compacting: bool,
+    compact_cancel: Option<Arc<AtomicBool>>,
     pending: Option<Sender<bool>>,
     queued: VecDeque<String>,
     closed: bool,
@@ -2948,6 +3076,8 @@ impl Session {
             events,
             cancelled,
             busy: false,
+            compacting: false,
+            compact_cancel: None,
             pending: None,
             queued: VecDeque::new(),
             closed: false,
@@ -2983,6 +3113,15 @@ impl Session {
     }
 
     fn interrupt_turn(&mut self, out: &mut dyn FnMut(&str)) {
+        if self.compacting {
+            self.queued.clear();
+            if let Some(cancel) = &self.compact_cancel
+                && !cancel.swap(true, Ordering::AcqRel)
+            {
+                out("Stopping compaction; waiting for the summarizer to finish.");
+            }
+            return;
+        }
         if !self.busy {
             if self
                 .goal
@@ -3057,6 +3196,9 @@ impl Session {
     }
 
     fn close(&mut self, out: &mut dyn FnMut(&str)) {
+        if let Some(cancel) = &self.compact_cancel {
+            cancel.store(true, Ordering::Release);
+        }
         self.pause_goal("Session ended; use /goal resume to continue.", out);
         self.cancelled.store(true, Ordering::Release);
         #[cfg(unix)]
@@ -3097,6 +3239,78 @@ impl Session {
             // A thread spawn failure is fatal for this interactive session.
             out(&format!("error: cannot start parent worker: {e}"));
             self.close(out);
+        }
+    }
+
+    fn start_compaction(&mut self, out: &mut dyn FnMut(&str)) {
+        if self.busy || self.pending.is_some() {
+            out("Finish the active task before /compact.");
+            return;
+        }
+        let Some(msgs) = self.msgs.as_ref() else {
+            out("Conversation history is unavailable for /compact.");
+            return;
+        };
+        let msgs = msgs.clone();
+        let mut cfg = self.cfg.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(ui) = cfg.ui.as_mut() {
+            ui.cancelled = cancel.clone();
+        }
+        self.busy = true;
+        self.compacting = true;
+        self.compact_cancel = Some(cancel);
+        let events = self.events.clone();
+        let spawned = std::thread::Builder::new()
+            .name("revex-compact".into())
+            .spawn(move || {
+                let result = compact_context(&cfg, &msgs, true);
+                let _ = events.send(Event::Compacted(result));
+            });
+        if let Err(error) = spawned {
+            self.busy = false;
+            self.compacting = false;
+            self.compact_cancel = None;
+            out(&format!("Could not start compaction: {error}"));
+        } else {
+            out("Compacting older context...");
+        }
+    }
+
+    fn compact_finished(
+        &mut self,
+        result: Result<context::CompactionReport, String>,
+        out: &mut dyn FnMut(&str),
+    ) {
+        if !self.compacting {
+            return;
+        }
+        self.busy = false;
+        self.compacting = false;
+        self.compact_cancel = None;
+        match result {
+            Ok(report) => {
+                out(&format!(
+                    "Context compacted: {} older messages summarized, {} recent kept; estimated ~{}/{} tokens.",
+                    report.summarized_messages,
+                    report.kept_messages,
+                    report.estimated_tokens,
+                    report.budget_tokens
+                ));
+                if report.omitted_messages > 0 {
+                    out(&format!(
+                        "{} older messages remain outside the request view; run /compact again if needed.",
+                        report.omitted_messages
+                    ));
+                }
+            }
+            Err(error) => out(&format!("Context not compacted: {error}")),
+        }
+        while !self.busy && !self.closed {
+            let Some(task) = self.queued.pop_front() else {
+                break;
+            };
+            self.line(&task, out);
         }
     }
 
@@ -3270,6 +3484,7 @@ fn run_loop(
                 }
             }
             Ok(Event::Finished(result, msgs)) => session.finished(result, msgs, out),
+            Ok(Event::Compacted(result)) => session.compact_finished(result, out),
             Ok(Event::GoalEvaluated { .. }) => {}
             Ok(Event::ModelsFetched { .. }) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => session.close(out),
@@ -3421,6 +3636,7 @@ mod tests {
             response_language: ResponseLanguage::English,
             approval_mode: ApprovalMode::Manual,
             max_steps: 100,
+            limits: RequestLimits::default(),
             api: Api::Chat,
             base,
             key: String::new(),
@@ -3460,6 +3676,35 @@ mod tests {
         ));
         assert!(parse_goal_command("--max-turns nope inspect parser").is_err());
         assert!(parse_goal_command("--max-turns 4").is_err());
+    }
+
+    #[test]
+    fn compact_rejects_busy_without_touching_history_or_queue() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let mut config = cfg(PathBuf::from("/tmp"), "http://unused".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut session = Session::new(config.clone(), fresh_history(), agents, tx);
+        session.busy = true;
+        session.queued.push_back("later".into());
+        let mut view = tui::View::default();
+        let mut request = 0;
+        let mut exit = false;
+        submit_chat(
+            "/compact".into(),
+            &mut config,
+            &mut view,
+            &mut session,
+            &mut request,
+            &mut exit,
+        );
+        assert!(!session.compacting);
+        assert_eq!(session.msgs.as_ref().unwrap().len(), 1);
+        assert_eq!(session.queued.front().map(String::as_str), Some("later"));
+        assert!(
+            view.transcript
+                .iter()
+                .any(|line| line.contains("Finish the active task before /compact"))
+        );
     }
 
     #[test]

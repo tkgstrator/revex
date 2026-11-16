@@ -37,6 +37,8 @@ pub(crate) struct View {
     pub(crate) model: String,
     pub(crate) reasoning: Option<String>,
     pub(crate) connection: String,
+    pub(crate) context_usage: Option<String>,
+    pub(crate) compacting: bool,
     pub(crate) approval_mode: String,
     pub(crate) transcript: Vec<String>,
     pub(crate) model_in_flight: bool,
@@ -73,6 +75,8 @@ pub(crate) struct View {
     pub(crate) setup_reasoning_manual: bool,
     pub(crate) setup_decision_model_selected: usize,
     pub(crate) setup_response_language_selected: usize,
+    pub(crate) setup_limit_values: [String; 3],
+    pub(crate) setup_limit_dirty: [bool; 3],
     pub(crate) setup_helpers: [bool; 3],
     pub(crate) setup_approval_mode_selected: usize,
     pub(crate) setup_approval_mode_dirty: bool,
@@ -135,6 +139,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/goal",
         description: "Set or inspect a goal",
         takes_argument: true,
+    },
+    SlashCommand {
+        name: "/compact",
+        description: "Summarize older context",
+        takes_argument: false,
     },
     SlashCommand {
         name: "/steer",
@@ -624,6 +633,34 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
                 "    Up/Down choose response language",
                 Style::default().fg(MUTED),
             )));
+            for (index, (label, unit)) in [
+                ("Context budget", "tokens"),
+                ("Max output", "tokens"),
+                ("Request deadline", "seconds"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let field = 10 + index;
+                let prefix = label.len() + 4;
+                let (value, cursor) = field_window(
+                    &single(view, &view.setup_limit_values[index]),
+                    if view.setup_editing && view.setup_field == field {
+                        view.cursor
+                    } else {
+                        0
+                    },
+                    inner.width.saturating_sub(prefix as u16) as usize,
+                );
+                if view.setup_field == field {
+                    active_row = lines.len();
+                    editable = view.setup_editing.then_some((prefix, cursor));
+                }
+                lines.push(focused(
+                    format!("{label}: {value} {unit}"),
+                    !view.setup_tab_focus && view.setup_field == field,
+                ));
+            }
         }
         _ => {
             lines.push(Line::from(Span::styled(
@@ -1177,6 +1214,9 @@ fn format_clock(duration: Duration) -> String {
 }
 
 fn chat_activity(view: &View) -> Option<String> {
+    if view.compacting {
+        return Some("Compacting context...".into());
+    }
     if !view.model_in_flight {
         return None;
     }
@@ -1671,11 +1711,15 @@ fn draw_overlay(frame: &mut Frame, view: &View, agents: &[AgentInfo], area: Rect
                 Line::raw(format!("Workspace: {}", single(view, &view.cwd))),
                 Line::raw(format!("Model: {}", single(view, &view.model))),
                 Line::raw(format!("Connection: {}", single(view, &view.connection))),
+                Line::raw(format!(
+                    "Context: {}",
+                    single(view, view.context_usage.as_deref().unwrap_or("unavailable"))
+                )),
                 Line::raw(format!("Session: {}", single(view, &view.status))),
                 Line::raw(""),
                 Line::from(Span::styled("Esc close", Style::default().fg(MUTED))),
             ];
-            (" Status ", 70, 9, lines)
+            (" Status ", 70, 10, lines)
         }
         Overlay::Approval => unreachable!(),
     };
@@ -1765,8 +1809,9 @@ mod tests {
 
     #[test]
     fn slash_suggestions_filter_and_render_in_narrow_chat() {
-        assert_eq!(slash_matches("/").len(), 12);
+        assert_eq!(slash_matches("/").len(), 13);
         assert_eq!(slash_matches("/go")[0].name, "/goal");
+        assert_eq!(slash_matches("/com")[0].name, "/compact");
         assert_eq!(slash_matches("/q")[0].name, "/queue");
         assert_eq!(slash_matches("/mo")[0].name, "/model");
         assert!(slash_matches("/model ").is_empty());
@@ -1882,6 +1927,32 @@ mod tests {
         let output = screen(&view, &[], 80, 24);
         assert!(output.contains("> Response language: Japanese"));
         assert!(!output.contains("HELPER PROVIDERS"));
+    }
+
+    #[test]
+    fn model_tab_shows_individually_editable_request_limits() {
+        let view = View {
+            page: Page::Setup,
+            setup_tab: 1,
+            setup_field: 10,
+            setup_limit_values: ["32000".into(), "8192".into(), "180".into()],
+            ..View::default()
+        };
+        let output = screen(&view, &[], 80, 24);
+        assert!(output.contains("> Context budget: 32000 tokens"));
+        assert!(output.contains("Max output: 8192 tokens"));
+        assert!(output.contains("Request deadline: 180 seconds"));
+    }
+
+    #[test]
+    fn status_overlay_shows_estimated_context_usage() {
+        let view = View {
+            overlay: Overlay::Status,
+            context_usage: Some("~12000/32000 tokens (estimated, compacted)".into()),
+            ..View::default()
+        };
+        let output = screen(&view, &[], 80, 24);
+        assert!(output.contains("Context: ~12000/32000 tokens (estimated, compacted)"));
     }
 
     #[test]
