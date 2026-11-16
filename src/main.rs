@@ -130,10 +130,10 @@ fn response_language_name(language: ResponseLanguage) -> &'static str {
 fn response_language_instruction(language: ResponseLanguage) -> &'static str {
     match language {
         ResponseLanguage::English => {
-            "Reply in English by default. Follow an explicit user request for another language. Keep code, commands, paths and identifiers unchanged."
+            "Response language for this request: English. Write the final answer and any explanatory prose in English, even if earlier assistant messages used another language. If the user's active task explicitly requests another language, follow that language throughout the task, including after tool outputs. Keep code, commands, paths, identifiers, and quoted text unchanged."
         }
         ResponseLanguage::Japanese => {
-            "Reply in Japanese by default. Follow an explicit user request for another language. Keep code, commands, paths and identifiers unchanged."
+            "Response language for this request: Japanese. Write the final answer and any explanatory prose in Japanese, even if earlier assistant messages were in English. If the user's active task explicitly requests another language, follow that language throughout the task, including after tool outputs. Keep code, commands, paths, identifiers, and quoted text unchanged."
         }
     }
 }
@@ -359,8 +359,7 @@ fn add_runtime_model_context(body: &mut Value, api: Api, language: ResponseLangu
         format!("configured effort {}", json!(id))
     });
     let context = format!(
-        "\nRuntime request metadata: {model_label}; reasoning effort {effort_label}. You can use the `>>` tools listed above. {}",
-        response_language_instruction(language)
+        "\nRuntime request metadata: {model_label}; reasoning effort {effort_label}. You can use the `>>` tools listed above."
     );
     match api {
         Api::Chat => {
@@ -368,12 +367,18 @@ fn add_runtime_model_context(body: &mut Value, api: Api, language: ResponseLangu
                 && let Some(system) = messages.first_mut().filter(|m| m["role"] == "system")
                 && let Some(prompt) = system["content"].as_str()
             {
-                system["content"] = Value::String(format!("{prompt}{context}"));
+                system["content"] = Value::String(format!(
+                    "{}\n{prompt}{context}",
+                    response_language_instruction(language)
+                ));
             }
         }
         Api::Responses => {
             if let Some(prompt) = body.get("instructions").and_then(Value::as_str) {
-                body["instructions"] = Value::String(format!("{prompt}{context}"));
+                body["instructions"] = Value::String(format!(
+                    "{}\n{prompt}{context}",
+                    response_language_instruction(language)
+                ));
             }
         }
     }
@@ -2930,6 +2935,86 @@ mod reasoning_tests {
     }
 
     #[test]
+    fn japanese_setting_overrides_english_conversation_history_in_request() {
+        for api in [Api::Chat, Api::Responses] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let mut bodies = Vec::new();
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    bodies.push(request(&mut stream));
+                    let sse = match api {
+                        Api::Chat => {
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n"
+                        }
+                        Api::Responses => {
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+                        }
+                    };
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}").unwrap();
+                    stream.flush().unwrap();
+                }
+                bodies
+            });
+            let mut cfg = Cfg {
+                temperature: None,
+                max_tokens: None,
+                quiet: true,
+                frontier: None,
+                route: Route::Off,
+                api,
+                base,
+                key: String::new(),
+                model: Some("fake".into()),
+                decision_model: "clef".into(),
+                response_language: ResponseLanguage::English,
+                reasoning: None,
+                yes: false,
+                history: None,
+                strict_save: false,
+                cwd: PathBuf::from("."),
+                role: Role::Parent(None),
+                ui: None,
+            };
+            let mut history = fresh_history();
+            history.push(json!({"role":"user","content":"Explain this program."}));
+            history
+                .push(json!({"role":"assistant","content":"Here is the explanation in English."}));
+            history.push(json!({"role":"user","content":"続きを説明して"}));
+            chat(&cfg, &history).unwrap();
+            cfg.response_language = ResponseLanguage::Japanese;
+            chat(&cfg, &history).unwrap();
+            let bodies = server.join().unwrap();
+            let prompt = |body: &Value| match api {
+                Api::Chat => body["messages"][0]["content"].as_str().unwrap().to_owned(),
+                Api::Responses => body["instructions"].as_str().unwrap().to_owned(),
+            };
+            assert!(prompt(&bodies[0]).starts_with("Response language for this request: English."));
+            assert!(
+                prompt(&bodies[1]).starts_with("Response language for this request: Japanese.")
+            );
+            assert!(
+                prompt(&bodies[1]).contains("even if earlier assistant messages were in English")
+            );
+            assert!(!prompt(&bodies[1]).contains("Response language for this request: English."));
+            let messages = match api {
+                Api::Chat => &bodies[1]["messages"],
+                Api::Responses => &bodies[1]["input"],
+            };
+            assert!(
+                messages
+                    .to_string()
+                    .contains("Here is the explanation in English.")
+            );
+            assert_eq!(history[0]["content"], SYSTEM);
+        }
+    }
+
+    #[test]
     fn model_context_tracks_switch_and_unknown_without_changing_saved_history() {
         let history = fresh_history();
         for api in [Api::Chat, Api::Responses] {
@@ -2991,8 +3076,14 @@ mod reasoning_tests {
         let history = fresh_history();
         for api in [Api::Chat, Api::Responses] {
             for (language, expected) in [
-                (ResponseLanguage::English, "Reply in English by default"),
-                (ResponseLanguage::Japanese, "Reply in Japanese by default"),
+                (
+                    ResponseLanguage::English,
+                    "Response language for this request: English.",
+                ),
+                (
+                    ResponseLanguage::Japanese,
+                    "Response language for this request: Japanese.",
+                ),
             ] {
                 let mut body = match api {
                     Api::Chat => json!({"messages": history}),
@@ -3004,8 +3095,13 @@ mod reasoning_tests {
                     Api::Responses => body["instructions"].as_str().unwrap(),
                 };
                 assert!(prompt.contains(expected));
-                assert!(prompt.contains("Follow an explicit user request for another language"));
-                assert!(prompt.contains("Keep code, commands, paths and identifiers unchanged"));
+                assert!(
+                    prompt
+                        .contains("If the user's active task explicitly requests another language")
+                );
+                assert!(prompt.contains(
+                    "Keep code, commands, paths, identifiers, and quoted text unchanged"
+                ));
             }
         }
         assert_eq!(history[0]["content"], SYSTEM);
