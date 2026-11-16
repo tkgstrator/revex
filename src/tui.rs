@@ -65,7 +65,10 @@ pub(crate) struct View {
 
 const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGray;
+const SECONDARY: Color = Color::Gray;
 const USER_BG: Color = Color::Rgb(25, 31, 40);
+const EDITOR_BG: Color = Color::Rgb(28, 34, 44);
+const ACTIVE_BG: Color = Color::Rgb(22, 51, 63);
 const CODE_BG: Color = Color::Rgb(18, 23, 30);
 const MAX_TRANSCRIPT_LINE_CHARS: usize = 2_048;
 const MAX_CODE_TOKENS_PER_ROW: usize = 256;
@@ -135,7 +138,10 @@ fn focused(label: String, active: bool) -> Line<'static> {
     if active {
         Line::from(Span::styled(
             format!("> {label}"),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .bg(ACTIVE_BG)
+                .add_modifier(Modifier::BOLD),
         ))
     } else {
         Line::raw(format!("  {label}"))
@@ -276,7 +282,10 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
         model
     };
     let mut lines = vec![
-        Line::raw("Connect an OpenAI-compatible model server"),
+        Line::from(Span::styled(
+            "MODEL SERVER  ·  Connect an OpenAI-compatible model server",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
         Line::raw(""),
     ];
     lines.push(focused(
@@ -297,7 +306,7 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
         .join("  ");
     lines.push(Line::from(Span::styled(
         format!("    {choices}"),
-        Style::default().fg(MUTED),
+        Style::default().fg(SECONDARY),
     )));
     let url_active = view.setup_field == 1;
     let (url, url_cursor) = field_window(
@@ -388,7 +397,10 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
         Style::default().fg(MUTED),
     )));
     let helpers_row = lines.len();
-    lines.push(Line::raw("Helper providers (select any)"));
+    lines.push(Line::from(Span::styled(
+        "HELPER PROVIDERS  ·  Select any",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )));
     for (index, name) in ["Local", "Codex", "Claude"].iter().enumerate() {
         let mark = if view.setup_helpers[index] { 'x' } else { ' ' };
         let availability = if index == 0 {
@@ -674,14 +686,46 @@ fn transcript_rows(view: &View, width: usize) -> Vec<Line<'static>> {
             for visual in wrap_visual(&bounded, width) {
                 if user {
                     let padding = width.saturating_sub(Line::raw(&visual).width());
-                    rows.push(Line::styled(
-                        format!("{visual}{}", " ".repeat(padding)),
-                        Style::default().bg(USER_BG),
-                    ));
+                    let (label, rest) = visual
+                        .strip_prefix("You  ")
+                        .map(|rest| ("You", format!("  {rest}")))
+                        .unwrap_or(("", visual.clone()));
+                    rows.push(Line::from(vec![
+                        Span::styled(
+                            label,
+                            Style::default()
+                                .fg(ACCENT)
+                                .bg(USER_BG)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("{rest}{}", " ".repeat(padding)),
+                            Style::default().fg(Color::White).bg(USER_BG),
+                        ),
+                    ]));
                 } else if assistant && (in_code.is_some() || fence) {
                     rows.push(code_row(&visual, width, fence, language));
+                } else if assistant {
+                    if let Some(rest) = visual.strip_prefix("Revex  ") {
+                        rows.push(Line::from(vec![
+                            Span::styled(
+                                "Revex",
+                                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(format!("  {rest}")),
+                        ]));
+                    } else {
+                        rows.push(Line::raw(visual));
+                    }
                 } else {
-                    rows.push(Line::raw(visual));
+                    let color = if visual.starts_with("error:") {
+                        Color::Red
+                    } else if visual.starts_with("tool ") || visual.contains("] tool ") {
+                        Color::Yellow
+                    } else {
+                        SECONDARY
+                    };
+                    rows.push(Line::styled(visual, Style::default().fg(color)));
                 }
             }
             if truncated {
@@ -788,10 +832,14 @@ fn draw_chat(frame: &mut Frame, view: &View, area: Rect) {
     frame.render_widget(
         Paragraph::new(vec![
             title,
-            Line::from(Span::styled(model_line, Style::default().fg(MUTED))),
-            Line::from(Span::styled(location, Style::default().fg(MUTED))),
+            Line::from(Span::styled(model_line, Style::default().fg(SECONDARY))),
+            Line::from(Span::styled(location, Style::default().fg(SECONDARY))),
         ]),
         rect(area, 0, 3),
+    );
+    frame.render_widget(
+        Paragraph::new("─".repeat(area.width as usize)).style(Style::default().fg(MUTED)),
+        rect(area, 3, 1),
     );
 
     let input = safe(view, &view.input);
@@ -800,9 +848,12 @@ fn draw_chat(frame: &mut Frame, view: &View, area: Rect) {
     let editor_cap = area.height.saturating_sub(7).clamp(1, 6) as usize;
     let editor_height = editor_lines.len().min(editor_cap) as u16;
     let editor_y = area.height.saturating_sub(1 + editor_height);
-    let transcript_area = rect(area, 4, editor_y.saturating_sub(4));
+    let transcript_area = rect(area, 4, editor_y.saturating_sub(5));
     if transcript_area.height > 0 {
         let lines = transcript_rows(view, transcript_area.width as usize);
+        let top_padding = (transcript_area.height as usize)
+            .saturating_sub(lines.len())
+            .min(u16::MAX as usize) as u16;
         let top = lines
             .len()
             .saturating_sub(transcript_area.height as usize)
@@ -810,9 +861,19 @@ fn draw_chat(frame: &mut Frame, view: &View, area: Rect) {
             .min(u16::MAX as usize) as u16;
         frame.render_widget(
             Paragraph::new(Text::from(lines)).scroll((top, 0)),
-            transcript_area,
+            rect(
+                transcript_area,
+                top_padding,
+                transcript_area.height.saturating_sub(top_padding),
+            ),
         );
     }
+
+    frame.render_widget(
+        Paragraph::new(format!("── INPUT {}", "─".repeat(area.width as usize)))
+            .style(Style::default().fg(ACCENT)),
+        rect(area, editor_y.saturating_sub(1), 1),
+    );
 
     let editor_scroll = insertion
         .0
@@ -824,7 +885,7 @@ fn draw_chat(frame: &mut Frame, view: &View, area: Rect) {
         .enumerate()
     {
         let original_row = editor_scroll + visible_row;
-        let prefix = if original_row == 0 { "› " } else { "  " };
+        let prefix = if original_row == 0 { "> " } else { "  " };
         let placeholder = input.is_empty() && original_row == 0;
         let editor = Line::from(vec![
             Span::styled(
@@ -841,7 +902,7 @@ fn draw_chat(frame: &mut Frame, view: &View, area: Rect) {
             ),
         ]);
         frame.render_widget(
-            Paragraph::new(editor).style(Style::default().bg(Color::Rgb(28, 34, 44))),
+            Paragraph::new(editor).style(Style::default().bg(EDITOR_BG)),
             rect(area, editor_y + visible_row as u16, 1),
         );
     }
@@ -1387,7 +1448,7 @@ mod tests {
             "connected",
             "hello",
             "answer",
-            "› next question",
+            "> next question",
             "/agents",
             "/help",
         ] {
@@ -1411,8 +1472,78 @@ mod tests {
             ..View::default()
         };
         let output = screen(&view, &[], 80, 20);
-        assert!(output.contains("› Ask Revex to do anything"));
+        assert!(output.contains("> Ask Revex to do anything"));
         assert!(!output.contains("Start a conversation."));
+    }
+
+    #[test]
+    fn chat_separates_context_and_composer_with_ascii_prompt() {
+        let view = View {
+            input: "next task".into(),
+            ..View::default()
+        };
+        let output = screen(&view, &[], 80, 20);
+        let rows: Vec<_> = output.lines().collect();
+        assert!(rows[3].starts_with('─'));
+        assert!(rows[17].starts_with('─'));
+        assert!(rows[18].starts_with("> next task"));
+    }
+
+    #[test]
+    fn short_transcript_sits_near_input_while_overflow_still_scrolls() {
+        let mut view = View {
+            transcript: vec!["recent result".into()],
+            ..View::default()
+        };
+        let short = screen(&view, &[], 50, 20);
+        let rows: Vec<_> = short.lines().map(str::trim_end).collect();
+        assert_eq!(rows[16], "recent result");
+        assert_eq!(rows[17].chars().next(), Some('─'));
+
+        view.transcript = (0..20).map(|i| format!("message {i:02}")).collect();
+        let latest = screen(&view, &[], 50, 20);
+        let rows: Vec<_> = latest.lines().map(str::trim_end).collect();
+        assert_eq!(rows[16], "message 19");
+        assert_eq!(rows[4], "message 07");
+        view.scroll = 7;
+        let earlier = screen(&view, &[], 50, 20);
+        let rows: Vec<_> = earlier.lines().map(str::trim_end).collect();
+        assert_eq!(rows[4], "message 00");
+        assert_eq!(rows[16], "message 12");
+    }
+
+    #[test]
+    fn transcript_roles_and_events_have_distinct_styles() {
+        let view = View {
+            transcript: vec![
+                "You  question".into(),
+                "Revex  answer".into(),
+                "tool read_file".into(),
+                "Task queued".into(),
+                "error: unavailable".into(),
+            ],
+            ..View::default()
+        };
+        let rows = transcript_rows(&view, 40);
+        assert_eq!(rows[1].spans[0].style.fg, Some(Color::Cyan));
+        assert_eq!(rows[3].spans[0].style.fg, Some(Color::Cyan));
+        assert_eq!(rows[5].style.fg, Some(Color::Yellow));
+        assert_eq!(rows[6].style.fg, Some(Color::Gray));
+        assert_eq!(rows[7].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn setup_focused_choice_is_shaded_beneath_section_heading() {
+        let view = View {
+            page: Page::Setup,
+            setup_field: 0,
+            ..View::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &view, &[])).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(buffer[(3, 4)].modifier.contains(Modifier::BOLD));
+        assert_ne!(buffer[(3, 6)].bg, Color::Reset);
     }
 
     #[test]
@@ -1501,10 +1632,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
         terminal.draw(|frame| render(frame, &view, &[])).unwrap();
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(0, 4)].bg, Color::Reset);
-        assert_eq!(buffer[(0, 5)].bg, Color::Rgb(25, 31, 40));
-        assert_eq!(buffer[(39, 5)].bg, Color::Rgb(25, 31, 40));
-        assert_eq!(buffer[(0, 6)].bg, Color::Reset);
+        assert_eq!(buffer[(0, 9)].bg, Color::Reset);
+        assert_eq!(buffer[(0, 10)].bg, Color::Rgb(25, 31, 40));
+        assert_eq!(buffer[(39, 10)].bg, Color::Rgb(25, 31, 40));
+        assert_eq!(buffer[(0, 11)].bg, Color::Reset);
     }
 
     #[test]
@@ -1516,12 +1647,12 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(20, 12)).unwrap();
         terminal.draw(|frame| render(frame, &view, &[])).unwrap();
         let buffer = terminal.backend().buffer();
-        for y in [5, 6] {
+        for y in [6, 7] {
             assert_eq!(buffer[(0, y)].bg, Color::Rgb(25, 31, 40));
             assert_eq!(buffer[(19, y)].bg, Color::Rgb(25, 31, 40));
         }
-        assert_eq!(buffer[(0, 4)].bg, Color::Reset);
-        assert_eq!(buffer[(0, 7)].bg, Color::Reset);
+        assert_eq!(buffer[(0, 5)].bg, Color::Reset);
+        assert_eq!(buffer[(0, 8)].bg, Color::Reset);
     }
 
     #[test]
@@ -1538,7 +1669,7 @@ mod tests {
         let output = screen(&view, &[], 40, 20);
         let rows: Vec<_> = output.lines().map(str::trim_end).collect();
         assert_eq!(
-            rows[4..14],
+            rows[7..17],
             [
                 "",
                 "You  question",
@@ -1567,7 +1698,7 @@ mod tests {
         let output = screen(&view, &[], 40, 20);
         let rows: Vec<_> = output.lines().map(str::trim_end).collect();
         assert_eq!(
-            rows[4..11],
+            rows[10..17],
             [
                 "",
                 "You  live question",
@@ -1588,7 +1719,7 @@ mod tests {
         };
         let output = screen(&view, &[], 40, 18);
         let rows: Vec<_> = output.lines().map(str::trim_end).collect();
-        assert_eq!(rows[4..8], ["tool finished", "", "You  next task", ""]);
+        assert_eq!(rows[11..15], ["tool finished", "", "You  next task", ""]);
     }
 
     #[test]
@@ -1600,8 +1731,8 @@ mod tests {
         let output = screen(&view, &[], 40, 18);
         let rows: Vec<_> = output.lines().map(str::trim_end).collect();
         assert_eq!(
-            rows[4..10],
-            ["", "Revex  answer one", "", "Revex  answer two", "", ""]
+            rows[10..15],
+            ["", "Revex  answer one", "", "Revex  answer two", ""]
         );
     }
 
@@ -1616,10 +1747,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         terminal.draw(|frame| render(frame, &view, &[])).unwrap();
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(0, 7)].fg, Color::Cyan);
-        assert_eq!(buffer[(11, 7)].fg, Color::Green);
-        assert_eq!(buffer[(17, 7)].fg, Color::DarkGray);
-        assert_eq!(buffer[(59, 7)].bg, Color::Rgb(18, 23, 30));
+        assert_eq!(buffer[(0, 13)].fg, Color::Cyan);
+        assert_eq!(buffer[(11, 13)].fg, Color::Green);
+        assert_eq!(buffer[(17, 13)].fg, Color::DarkGray);
+        assert_eq!(buffer[(59, 13)].bg, Color::Rgb(18, 23, 30));
     }
 
     #[test]
@@ -1638,7 +1769,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
             terminal.draw(|frame| render(frame, &view, &[])).unwrap();
             assert_eq!(
-                terminal.backend().buffer()[(0, 6)].fg,
+                terminal.backend().buffer()[(0, 10)].fg,
                 expected,
                 "{language} {word}"
             );
@@ -2018,7 +2149,7 @@ mod tests {
         };
         let (output, cursor) = screen_with_cursor(&view, &[], 80, 20);
         let rows: Vec<_> = output.lines().collect();
-        assert!(rows[17].starts_with("› first line"));
+        assert!(rows[17].starts_with("> first line"));
         assert!(rows[18].starts_with("  second line"));
         assert_eq!(cursor, (8, 18));
     }
@@ -2038,7 +2169,7 @@ mod tests {
             ..View::default()
         };
         let (output, cursor) = screen_with_cursor(&view, &[], 80, 20);
-        assert!(output.lines().nth(17).unwrap().starts_with("› one"));
+        assert!(output.lines().nth(17).unwrap().starts_with("> one"));
         assert_eq!(cursor, (2, 18));
     }
 
@@ -2052,7 +2183,7 @@ mod tests {
         };
         let (output, cursor) = screen_with_cursor(&view, &[], 20, 12);
         assert!(output.contains("  g"));
-        assert!(!output.contains("› a"));
+        assert!(!output.contains("> a"));
         assert_eq!(cursor, (3, 10));
     }
 

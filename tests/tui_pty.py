@@ -421,11 +421,27 @@ class TuiPtyTests(unittest.TestCase):
             try:
                 terminal.wait_for(b"workspace?")
                 terminal.send(b"\r")
-                terminal.wait_for("›".encode())
+                terminal.wait_for_screen("> Ask Revex to do anything")
                 self.assertIn(b"/agents", terminal.output)
                 self.assertIn(b"/help", terminal.output)
                 self.assertNotIn(b"server default", terminal.output)
                 self.assertNotIn(b"0 queued", terminal.output)
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                terminal.close()
+
+    def test_empty_chat_uses_composer_hint_without_stale_transcript_line(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            terminal = Terminal(cwd, home, {"REVEX_BASE_URL": "http://127.0.0.1:9/v1"})
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                self.assertNotIn("Ready. Enter a task below.", terminal.screen_text())
+                terminal.send(b"hello\r")
+                terminal.wait_for_screen("You  hello")
+                self.assertNotIn("Ready. Enter a task below.", terminal.screen_text())
                 terminal.send(b"\x04")
                 terminal.exit()
             finally:
@@ -439,7 +455,7 @@ class TuiPtyTests(unittest.TestCase):
             try:
                 terminal.wait_for(b"workspace?")
                 terminal.send(b"\r")
-                terminal.wait_for("›".encode())
+                terminal.wait_for_screen("> Ask Revex to do anything")
                 terminal.send(b"/model new-model\r")
                 terminal.wait_for(b"Reasoning")
                 terminal.send(b"\x1b[B\x1b[B\x1b[B\r\r\r")  # Select high, helpers, confirm.
@@ -489,7 +505,7 @@ class TuiPtyTests(unittest.TestCase):
 
             configured = Terminal(ROOT, home, {"REVEX_BASE_URL": "http://127.0.0.1:9/v1", "REVEX_MODEL": "fake"})
             try:
-                configured.wait_for("›".encode())
+                configured.wait_for_screen("> Ask Revex to do anything")
                 self.assertNotIn(b"workspace?", configured.output)
                 configured.read_for(0.15)
                 self.assertTrue(configured.cursor_visible())
@@ -512,7 +528,7 @@ class TuiPtyTests(unittest.TestCase):
                 first.send(b"\r\t\t")
                 first.read_for(0.1)
                 first.send(b"fake-model\r\r\r\r")
-                first.wait_for("›".encode())
+                first.wait_for_screen("> Ask Revex to do anything")
                 self.assertTrue(pathlib.Path(home, ".revex").is_file())
                 first.send(b"/exit\r")
                 first.exit()
@@ -521,7 +537,7 @@ class TuiPtyTests(unittest.TestCase):
 
             returning = Terminal(ROOT, home)
             try:
-                returning.wait_for("›".encode())
+                returning.wait_for_screen("> Ask Revex to do anything")
                 self.assertNotIn(b"workspace?", returning.output)
                 self.assertNotIn(b"Provider:", returning.output)
                 returning.send(b"/status\r")
@@ -549,7 +565,7 @@ class TuiPtyTests(unittest.TestCase):
             try:
                 first.wait_for(b"workspace?")
                 first.send(b"\r")
-                first.wait_for("›".encode())
+                first.wait_for_screen("> Ask Revex to do anything")
                 first.send(b"/help\r")
                 first.wait_for(b"/model")
                 first.send(b"/route\r")
@@ -571,14 +587,14 @@ class TuiPtyTests(unittest.TestCase):
 
             returning = Terminal(cwd, home, options)
             try:
-                returning.wait_for("›".encode())
+                returning.wait_for_screen("> Ask Revex to do anything")
                 self.assertNotIn(b"workspace?", returning.output)
                 returning.send(b"\x1b[A")
                 self.assertEqual(Terminal.last_cursor(returning.read_for(0.15))[1], 9)
                 returning.send(b"\x1b")  # Clear the editor, then clear the session.
                 returning.read_for(0.15)
                 returning.send(b"/clear\r")
-                returning.wait_for(b"cleared.")
+                returning.wait_for_screen("Session history and agent records cleared.")
                 saved = list(pathlib.Path(home, ".local/state/revex").glob("input-*.json"))
                 self.assertEqual(len(saved), 1)
                 self.assertEqual(json.loads(saved[0].read_text())["entries"], ["/help", "/route", "/clear"])
@@ -596,7 +612,7 @@ class TuiPtyTests(unittest.TestCase):
             try:
                 terminal.wait_for(b"workspace?")
                 terminal.send(b"\r")
-                terminal.wait_for("›".encode())
+                terminal.wait_for_screen("> Ask Revex to do anything")
                 terminal.send(b"/config\r")
                 terminal.wait_for(b"Provider:")
                 terminal.send(b"\r")  # URL field.
@@ -623,7 +639,7 @@ class TuiPtyTests(unittest.TestCase):
                 first.wait_for(b"Codex")
                 first.wait_for(b"Claude")
                 first.send(b" \x1b[B \x1b[B \r\r")  # Local off, Codex + Claude on, save.
-                first.wait_for("›".encode())
+                first.wait_for_screen("> Ask Revex to do anything")
                 settings = json.loads(pathlib.Path(home, ".revex").read_text())
                 self.assertEqual(settings["helper_providers"], "codex,claude")
                 self.assertFalse(pathlib.Path(cwd, ".revex").exists())
@@ -636,12 +652,12 @@ class TuiPtyTests(unittest.TestCase):
             project_settings.write_text('{"helper_providers":"local"}')
             returning = Terminal(cwd, home)
             try:
-                returning.wait_for("›".encode())
+                returning.wait_for_screen("> Ask Revex to do anything")
                 returning.send(b"/config\r")
                 returning.wait_for(b"Provider:")
                 returning.output = b""
                 returning.send(b"\r\r\r\r\r\r\r")  # Confirm unchanged selection.
-                returning.wait_for("›".encode())
+                returning.wait_for_screen("> Ask Revex to do anything")
                 settings = json.loads(pathlib.Path(home, ".revex").read_text())
                 self.assertEqual(settings["helper_providers"], "codex,claude")
                 self.assertNotIn("helper_providers", json.loads(project_settings.read_text()))
@@ -661,7 +677,7 @@ class TuiPtyTests(unittest.TestCase):
             try:
                 terminal.wait_for(b"workspace?")
                 terminal.send(b"\r")
-                terminal.wait_for("›".encode())
+                terminal.wait_for_screen("> Ask Revex to do anything")
                 terminal.send("あなたのモデルは？\r".encode())
                 state = pathlib.Path(home, ".local/state/revex")
                 until = time.monotonic() + 3
@@ -680,7 +696,8 @@ class TuiPtyTests(unittest.TestCase):
                 self.assertNotIn("127.0.0.1", answer)
                 self.assertNotIn(b"Thinking", terminal.output)
                 self.assertNotIn(b"[main] started", terminal.output)
-                terminal.send(b"exit\r")
+                terminal.wait_for_screen("Revex  Revex")
+                terminal.send(b"\x04")
                 terminal.exit()
             finally:
                 terminal.close()
@@ -695,7 +712,7 @@ class TuiPtyTests(unittest.TestCase):
             try:
                 terminal.wait_for(b"workspace?")
                 terminal.send(b"\r")
-                terminal.wait_for("›".encode())
+                terminal.wait_for_screen("> Ask Revex to do anything")
                 terminal.send(b"first\x1b\rsecond")  # Alt+Enter inserts one newline.
                 terminal.read_for(0.2)
                 terminal.send(b"\r")  # Plain Enter submits.
@@ -742,7 +759,7 @@ class TuiPtyTests(unittest.TestCase):
             try:
                 terminal.wait_for(b"workspace?")
                 terminal.send(b"\r")
-                terminal.wait_for("›".encode())
+                terminal.wait_for_screen("> Ask Revex to do anything")
                 terminal.send(b"use both helpers\r")
                 terminal.wait_for(b"finished", seconds=12)
                 codex_args = pathlib.Path(home, "codex-args").read_text()
@@ -782,7 +799,7 @@ class TuiPtyTests(unittest.TestCase):
             try:
                 terminal.wait_for(b"workspace?")
                 terminal.send(b"\r")
-                terminal.wait_for("›".encode())
+                terminal.wait_for_screen("> Ask Revex to do anything")
                 terminal.send(b"first task\r")
                 self.assertTrue(server.blocked.wait(4), "first model request did not block")
                 terminal.send(b"\x03")  # Ctrl+C interrupts the turn.
@@ -809,7 +826,7 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.wait_for(b"workspace?")
                 terminal.wait_for(str(pathlib.Path(cwd).resolve()).encode())
                 terminal.send(b"\r")
-                terminal.wait_for("›".encode())
+                terminal.wait_for_screen("> Ask Revex to do anything")
                 terminal.send(b"edit file\r")
                 self.assertTrue(server.blocked.wait(4), "model request did not start")
                 terminal.wait_for_screen("Thinking")
@@ -841,7 +858,7 @@ class TuiPtyTests(unittest.TestCase):
             try:
                 terminal.wait_for(b"workspace?")
                 terminal.send(b"\r")
-                terminal.wait_for("›".encode())
+                terminal.wait_for_screen("> Ask Revex to do anything")
                 terminal.send(b"edit file\r")
                 self.assertTrue(server.blocked.wait(4))
                 server.release.set()

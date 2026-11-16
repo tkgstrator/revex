@@ -385,9 +385,6 @@ fn activate_chat(
     view.overlay = tui::Overlay::None;
     view.transcript.clear();
     seed_transcript(&msgs, view);
-    if view.transcript.is_empty() {
-        view.transcript.push("Ready. Enter a task below.".into());
-    }
     let mut active = Session::new(cfg.clone(), msgs, agents, tx.clone());
     active.prompt_history = Some(prompt_history);
     active.helper_selection = helper_selection;
@@ -3060,6 +3057,22 @@ mod tests {
         assert!(lines.contains("Model    not selected"));
         assert!(lines.contains("/agents  /status  /model"));
         assert!(lines.contains("Setup  Connect a running OpenAI-compatible API"));
+    }
+
+    #[test]
+    fn restored_messages_still_seed_chat_transcript() {
+        let mut view = tui::View::default();
+        let msgs = vec![
+            json!({"role": "system", "content": "instructions"}),
+            json!({"role": "user", "content": "saved question"}),
+            json!({"role": "assistant", "content": "saved answer"}),
+            json!({"role": "user", "content": "<out>tool output</out>"}),
+        ];
+        seed_transcript(&msgs, &mut view);
+        assert_eq!(
+            view.transcript,
+            ["You  saved question", "Revex  saved answer"]
+        );
     }
 
     #[test]
