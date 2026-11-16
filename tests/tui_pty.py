@@ -27,6 +27,43 @@ if not BIN.is_absolute():
     BIN = ROOT / BIN
 
 
+def settings_file(home):
+    return pathlib.Path(home, ".revex", "settings.json")
+
+
+def auth_file(home):
+    return pathlib.Path(home, ".revex", "auth.json")
+
+
+def seed_settings(home, data):
+    path = settings_file(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    settings = {}
+    auth = {}
+    for key, value in data.items():
+        if key == "base_url":
+            auth["baseUrl"] = value
+        elif key == "api_key":
+            auth["apiKey"] = value
+        elif key == "helper_providers":
+            settings["helperProviders"] = value.split(",")
+        elif key == "reasoning_effort":
+            settings["reasoningEffort"] = value
+        elif key == "decision_model":
+            settings["decisionModel"] = value
+        elif key == "response_language":
+            settings["language"] = {"en": "English", "ja": "Japanese"}[value]
+        else:
+            settings[key] = value
+    path.write_text(json.dumps(settings))
+    path.chmod(0o600)
+    if auth:
+        auth_path = auth_file(home)
+        auth_path.write_text(json.dumps(auth))
+        auth_path.chmod(0o600)
+    return path
+
+
 class Terminal:
     def __init__(self, cwd, home, extra=None, columns=100):
         self.columns = columns
@@ -546,7 +583,7 @@ class TuiPtyTests(unittest.TestCase):
     def test_setup_tabs_keep_provider_uncommitted_until_enter(self):
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
             terminal = Terminal(cwd, home)
-            settings = pathlib.Path(home, ".revex")
+            settings = settings_file(home)
             try:
                 terminal.wait_for(b"workspace?")
                 terminal.send(b"\r")
@@ -639,9 +676,9 @@ class TuiPtyTests(unittest.TestCase):
                 first.read_for(0.1)
                 first.send(b"fake-model\r\r\r\r\r\r")
                 first.wait_for_screen("> Ask Revex to do anything")
-                self.assertTrue(pathlib.Path(home, ".revex").is_file())
-                self.assertEqual(json.loads(pathlib.Path(home, ".revex").read_text())["decision_model"], "clef")
-                self.assertEqual(json.loads(pathlib.Path(home, ".revex").read_text())["response_language"], "en")
+                self.assertTrue(settings_file(home).is_file())
+                self.assertEqual(json.loads(settings_file(home).read_text())["decisionModel"], "clef")
+                self.assertEqual(json.loads(settings_file(home).read_text())["language"], "English")
                 first.send(b"/exit\r")
                 first.exit()
             finally:
@@ -717,9 +754,10 @@ class TuiPtyTests(unittest.TestCase):
 
     def test_env_key_refuses_endpoint_change_before_restart(self):
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
-            settings = pathlib.Path(home, ".revex")
-            original = {"base_url": "http://127.0.0.1:9/v1", "model": "fake"}
-            settings.write_text(json.dumps(original))
+            settings = settings_file(home)
+            original = {"model": "fake"}
+            seed_settings(home, original)
+            auth_file(home).write_text(json.dumps({"baseUrl": "http://127.0.0.1:9/v1"}))
             terminal = Terminal(cwd, home, {"REVEX_API_KEY": "test-secret"})
             try:
                 terminal.wait_for(b"workspace?")
@@ -741,6 +779,43 @@ class TuiPtyTests(unittest.TestCase):
             finally:
                 terminal.close()
 
+    def test_blank_key_keeps_saved_key_and_ctrl_k_explicitly_clears_it(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            settings = seed_settings(home, {
+                "base_url": "http://127.0.0.1:9/v1",
+                "model": "fake",
+                "api_key": "saved-test-secret",
+            })
+            terminal = Terminal(cwd, home)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/config\r")
+                terminal.wait_for_screen("Provider: Custom API")
+                terminal.send(b"\t\t\r\r\r")  # Helpers tab, Confirm with blank key.
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                self.assertEqual(json.loads(auth_file(home).read_text())["apiKey"], "saved-test-secret")
+                terminal.send(b"/config\r")
+                terminal.wait_for_screen("Provider: Custom API")
+                terminal.send(b"\r\r\r")  # Open Server, Provider, URL -> API key.
+                terminal.wait_for_screen("Blank keeps saved key; Ctrl+K clears it")
+                terminal.send(b"\x0b")  # Ctrl+K explicitly clears saved API key.
+                terminal.wait_for_screen("API key: (clear on Confirm)")
+                terminal.send(b"\t\t\r\r\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                self.assertNotIn("apiKey", json.loads(auth_file(home).read_text()))
+                backups = list(settings.parent.glob("auth.json.bak-*"))
+                self.assertGreaterEqual(len(backups), 1)
+                self.assertTrue(any(json.loads(path.read_text()).get("apiKey") == "saved-test-secret" for path in backups))
+                self.assertEqual(auth_file(home).stat().st_mode & 0o777, 0o600)
+                self.assertEqual(settings.parent.stat().st_mode & 0o777, 0o700)
+                self.assertNotIn(b"saved-test-secret", terminal.output)
+                terminal.send(b"exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+
     def test_helper_multiselect_saves_home_only_and_survives_config(self):
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
             first = Terminal(cwd, home)
@@ -754,8 +829,8 @@ class TuiPtyTests(unittest.TestCase):
                 first.wait_for(b"Claude")
                 first.send(b" \x1b[B \x1b[B \r\r")  # Local off, Codex + Claude on, save.
                 first.wait_for_screen("> Ask Revex to do anything")
-                settings = json.loads(pathlib.Path(home, ".revex").read_text())
-                self.assertEqual(settings["helper_providers"], "codex,claude")
+                settings = json.loads(settings_file(home).read_text())
+                self.assertEqual(settings["helperProviders"], ["codex", "claude"])
                 self.assertFalse(pathlib.Path(cwd, ".revex").exists())
                 first.send(b"exit\r")
                 first.exit()
@@ -772,8 +847,8 @@ class TuiPtyTests(unittest.TestCase):
                 returning.output = b""
                 returning.send(b"\t\t\r\r\r")  # Helpers tab, then Confirm unchanged selection.
                 returning.wait_for_screen("> Ask Revex to do anything")
-                settings = json.loads(pathlib.Path(home, ".revex").read_text())
-                self.assertEqual(settings["helper_providers"], "codex,claude")
+                settings = json.loads(settings_file(home).read_text())
+                self.assertEqual(settings["helperProviders"], ["codex", "claude"])
                 self.assertNotIn("helper_providers", json.loads(project_settings.read_text()))
                 returning.send(b"exit\r")
                 returning.exit()
@@ -820,13 +895,13 @@ class TuiPtyTests(unittest.TestCase):
                 "'{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}'\n"
             )
             codex.chmod(0o755)
-            pathlib.Path(home, ".revex").write_text(json.dumps({
+            seed_settings(home, {
                 "base_url": server.base,
                 "model": "fake-local",
                 "helper_providers": "codex",
                 "route": "auto",
                 "frontier": "missing-frontier-command",
-            }))
+            })
             terminal = Terminal(cwd, home, {"PATH": str(scripts) + os.pathsep + os.environ.get("PATH", "")})
             try:
                 terminal.wait_for(b"workspace?")
@@ -957,11 +1032,11 @@ class TuiPtyTests(unittest.TestCase):
                     + response
                 )
                 script.chmod(0o755)
-            pathlib.Path(home, ".revex").write_text(json.dumps({
+            seed_settings(home, {
                 "base_url": server.base,
                 "model": "fake-parent",
                 "helper_providers": "codex,claude",
-            }))
+            })
             terminal = Terminal(cwd, home, {"PATH": str(scripts) + os.pathsep + os.environ.get("PATH", "")})
             try:
                 terminal.wait_for(b"workspace?")
@@ -1006,11 +1081,11 @@ class TuiPtyTests(unittest.TestCase):
                 "'{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}'\n"
             )
             codex.chmod(0o755)
-            pathlib.Path(home, ".revex").write_text(json.dumps({
+            seed_settings(home, {
                 "base_url": server.base,
                 "model": "fake-parent",
                 "helper_providers": "codex",
-            }))
+            })
             terminal = Terminal(cwd, home, {"PATH": str(scripts) + os.pathsep + os.environ.get("PATH", "")})
             try:
                 terminal.wait_for(b"workspace?")

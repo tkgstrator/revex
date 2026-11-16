@@ -57,6 +57,7 @@ pub(crate) struct View {
     pub(crate) setup_field: usize,
     pub(crate) setup_url: String,
     pub(crate) setup_key: String,
+    pub(crate) setup_clear_key: bool,
     pub(crate) setup_model: String,
     pub(crate) setup_models: Vec<String>,
     pub(crate) setup_model_selected: usize,
@@ -358,8 +359,10 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
                 format!("URL: {url}"),
                 !view.setup_tab_focus && view.setup_field == 1,
             ));
-            let key = if view.setup_key.is_empty() {
-                "(optional)".to_owned()
+            let key = if view.setup_clear_key {
+                "(clear on Confirm)".to_owned()
+            } else if view.setup_key.is_empty() {
+                "(blank keeps saved key)".to_owned()
             } else {
                 "*".repeat(view.setup_key.chars().count())
             };
@@ -380,6 +383,10 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
                 format!("API key: {key}"),
                 !view.setup_tab_focus && view.setup_field == 2,
             ));
+            lines.push(Line::from(Span::styled(
+                "    Blank keeps saved key; Ctrl+K clears it",
+                Style::default().fg(MUTED),
+            )));
         }
         1 => {
             lines.push(Line::from(Span::styled(
@@ -2766,6 +2773,23 @@ mod tests {
         assert!(output.contains("API key: *"));
         assert!(output.contains("a valid API response"));
         assert!(!output.contains("API key: a"));
+    }
+
+    #[test]
+    fn setup_key_field_explains_keep_and_explicit_clear() {
+        let view = View {
+            page: Page::Setup,
+            setup_field: 2,
+            ..View::default()
+        };
+        let output = screen(&view, &[], 80, 24);
+        assert!(output.contains("Blank keeps saved key; Ctrl+K clears it"));
+        let view = View {
+            setup_clear_key: true,
+            ..view
+        };
+        let output = screen(&view, &[], 80, 24);
+        assert!(output.contains("API key: (clear on Confirm)"));
     }
 
     #[test]

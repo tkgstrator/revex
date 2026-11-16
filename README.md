@@ -122,7 +122,8 @@ OpenAI-compatible API. The oMLX preset starts at `http://127.0.0.1:8000/v1`.
 The URL is editable. The API key is optional and masked; a model can be chosen from
 the server list when available or entered manually. You can also select one or more
 helper-agent providers: Local, Codex CLI and Claude Code CLI. Confirmed settings are saved in
-`~/.revex` with mode `0600` on Unix. Setup does not start a model server. One-shot,
+`~/.revex/settings.json`, with the endpoint and API key in `~/.revex/auth.json`. The directory
+uses mode `0700` and both files use mode `0600` on Unix. Setup does not start a model server. One-shot,
 piped and MCP modes require prior configuration and do not prompt. Environment
 variables can override saved settings.
 
@@ -132,14 +133,14 @@ Enter a task in the fixed input area; `/config` opens connection settings.
 
 | Variable         | Required | Description                                                                                                            |
 | ---------------- | -------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `REVEX_BASE_URL` | yes      | Base URL of the OpenAI-compatible API, including `/v1`. Interactive setup can save it as `base_url` in `~/.revex` |
+| `REVEX_BASE_URL` | yes      | Base URL of the OpenAI-compatible API, including `/v1`. Interactive setup saves it as `baseUrl` in `~/.revex/auth.json` |
 | `REVEX_API`      | no       | `chat` (default, `/chat/completions`) or `responses` (`/responses`)                                                    |
 | `REVEX_MODEL`    | no       | Model ID. If unset, interactive mode leaves model choice to the server until you select one; one-shot/piped mode tries the first `/models` entry, then omits the field if discovery fails |
 | `REVEX_REASONING_EFFORT` | no | Optional reasoning effort sent with model requests; the server must support the chosen value |
-| `REVEX_API_KEY`  | no       | Sent as `Authorization: Bearer <key>`; setup can save it in private `~/.revex` |
+| `REVEX_API_KEY`  | no       | Sent as `Authorization: Bearer <key>`; setup can save it as `apiKey` in private `~/.revex/auth.json` |
 | `REVEX_FRONTIER` | no | Command that handles a task instead of the local model, for example `claude -p`. The task is appended as the last argument |
 | `REVEX_ROUTE` | no | `auto` uses the local model's existing one-letter frontier route; `smart` uses a Clef Decisions score gate for Codex. Off by default |
-| `REVEX_DECISION_MODEL` | no | Decisions model for `smart`: `clef` (default), `clef-flash`, or `self` (the configured chat model). Saved as `decision_model` |
+| `REVEX_DECISION_MODEL` | no | Decisions model for `smart`: `clef` (default), `clef-flash`, or `self` (the configured chat model). Saved as `decisionModel` |
 | `REVEX_EXTRA`    | no       | JSON object merged into every request body                                                                             |
 | `REVEX_DEBUG`    | no       | Set to print raw SSE lines to stderr                                                                                   |
 
@@ -165,25 +166,37 @@ export REVEX_API_KEY=your-key
 
 ### Settings files
 
-Settings can also live in a JSON file. `~/.revex` and the `.revex` in the current
-directory are both read and merged key by key, and the project file wins.
-Environment variables beat both.
+Home settings live in `~/.revex/settings.json` with camelCase keys. Credentials live
+in `~/.revex/auth.json`, bound to their saved endpoint. The project file `./.revex`
+still uses snake_case keys and can override only the allowed settings below.
+Environment variables override both. A `REVEX_BASE_URL` override cannot reuse a saved
+API key for a different URL; set `REVEX_API_KEY` for that endpoint.
 
 ```json
-{ "model": "your-model-id", "route": "auto", "api": "chat", "helper_providers": "local,codex,claude" }
+{ "model": "your-model-id", "reasoningEffort": "high", "decisionModel": "clef", "language": "English", "route": "smart", "api": "chat", "helperProviders": ["local", "codex"] }
 ```
 
-| Key | Allowed in `./.revex` | Environment variable |
-| --- | --- | --- |
-| `model`, `decision_model`, `reasoning_effort`, `route`, `api` | yes | `REVEX_MODEL`, `REVEX_DECISION_MODEL`, `REVEX_REASONING_EFFORT`, `REVEX_ROUTE`, `REVEX_API` |
-| `frontier`, `base_url`, `api_key` | no, `~/.revex` only | `REVEX_FRONTIER`, `REVEX_BASE_URL`, `REVEX_API_KEY` |
-| `helper_providers` | no, `~/.revex` only | none |
+`auth.json` contains the endpoint and optional key:
 
-`frontier` runs a command, and `base_url` receives your API key. A cloned repository
-cannot set these or `api_key`; project-file values are ignored with a warning. The
-optional key entered in first-run setup is stored in the private user settings file.
-Put `helper_providers` in `~/.revex` as a comma-separated list; project files
-cannot select external helper CLIs.
+```json
+{ "baseUrl": "http://127.0.0.1:8000/v1", "apiKey": "your-key" }
+```
+
+| Home key | Project `./.revex` key | Environment variable |
+| --- | --- | --- |
+| `model`, `decisionModel`, `reasoningEffort`, `language`, `route`, `api` | `model`, `decision_model`, `reasoning_effort`, `response_language` (`en`/`ja`), `route`, `api` | `REVEX_MODEL`, `REVEX_DECISION_MODEL`, `REVEX_REASONING_EFFORT`, `REVEX_RESPONSE_LANGUAGE`, `REVEX_ROUTE`, `REVEX_API` |
+| `frontier` | not allowed | `REVEX_FRONTIER` |
+| `helperProviders` (array) | not allowed | none |
+| `baseUrl`, `apiKey` in `auth.json` | not allowed | `REVEX_BASE_URL`, `REVEX_API_KEY` |
+
+`frontier` runs a command, and `baseUrl` receives your API key. A cloned repository
+cannot set these or `apiKey`; project-file values are ignored with a warning.
+`language` is `English` or `Japanese` (English by default). First-run setup and `/config`
+save the selected helper providers only in the home settings file.
+
+Existing home `~/.revex` files and `~/.revex/config.json` are migrated on first use.
+The original JSON is retained as a backup; later saves retain previous versions of
+each home file. Migration errors stop startup without replacing the original file.
 
 ## Usage
 
@@ -215,7 +228,7 @@ In the interactive mode these slash commands are available:
 | `/exit` or `exit` | Quit |
 
 `/model` and `/route` save the choice: to `./.revex` if it exists, otherwise to
-`~/.revex`. When writing a project file, keys that a project file may not set are
+`~/.revex/settings.json`. When writing a project file, keys that a project file may not set are
 dropped. If the matching environment variable is set, it still wins on the next start.
 
 The interactive input stays available while a model request or helper runs.
@@ -239,8 +252,8 @@ wait for the helper to finish, then run `/clear` again.
 
 The interactive mode (no arguments, terminal on stdin) keeps its conversation across
 restarts, one history per canonical working directory. It is stored as versioned JSON in
-`$XDG_STATE_HOME/revex/`, or `~/.local/state/revex/` if that is unset. (`~/.revex` is the
-settings file and is not used.) The file is rewritten atomically (temp file and rename)
+`$XDG_STATE_HOME/revex/`, or `~/.local/state/revex/` if that is unset. (`~/.revex/settings.json` is
+not used for history.) The file is rewritten atomically (temp file and rename)
 after every message, including partial progress when a request fails. A save failure
 stops the current request and exits interactive mode. On start the
 messages are reloaded, tool outputs included, and the stored system prompt is replaced by
@@ -318,7 +331,7 @@ works in the same directory as the main agent. It can only use `read` and
 
 First-run setup and `/config` let you select one or more helper providers: Local,
 Codex CLI and Claude Code CLI. Local is the default. The choices are saved only in
-private `~/.revex` settings. When several are enabled, plain `>> spawn TASK`
+private `~/.revex/settings.json` settings. When several are enabled, plain `>> spawn TASK`
 cycles through them; `@codex`, `@claude` or `@local` explicitly chooses one of the
 enabled providers. Codex helpers run with YOLO mode and Claude Code helpers with
 Bypass Permissions, as selected in setup; those external agents can run commands
@@ -393,6 +406,40 @@ Notes:
   `claude -p` used about 15k input tokens in a test.
 - Automatic routing was checked on six clear-cut tasks only. A borderline task can
   go either way, so use `--remote` and `--local` when it matters.
+
+## Use MCP tools in Revex
+
+Revex can also connect to MCP servers during its own model turns. Add servers to
+`~/.revex/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "local": {"type": "stdio", "command": "/path/to/server", "args": []},
+    "remote": {"type": "http", "url": "https://example.com/mcp"}
+  }
+}
+```
+
+Store credentials separately in `~/.revex/auth.json`, under the matching server
+name. Revex overlays these `env` or `headers` values onto the server definition:
+
+```json
+{
+  "mcpServers": {
+    "local": {"env": {"TOKEN": "your-token"}},
+    "remote": {"headers": {"Authorization": "Bearer your-token"}}
+  }
+}
+```
+
+Revex writes both files with mode `0600` in a `0700` directory on Unix; use
+those modes if you create them manually. Revex discovers tools at the start of
+each turn and shows their names and input schemas to the model. A model calls one
+with `>> mcp SERVER TOOL {JSON_OBJECT}`. Interactive mode asks before each call;
+`--yes` permits calls without a prompt. A failed or unavailable server does not
+disable other configured servers. This is separate from `revex --mcp`, which
+exposes Revex's own `delegate` tool to another client.
 
 ## Use from Claude Code or Codex
 

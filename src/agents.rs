@@ -195,8 +195,13 @@ fn select_provider<'a>(s: &mut State, task: &'a str) -> Result<(Provider, &'a st
     Err("no helper provider is enabled".into())
 }
 
+#[cfg(test)]
 fn selection_from_file(path: &Path) -> Result<[bool; 3], String> {
     let settings = read_settings(path)?;
+    selection_from_settings(&settings)
+}
+
+fn selection_from_settings(settings: &Map<String, Value>) -> Result<[bool; 3], String> {
     let Some(value) = settings.get("helper_providers") else {
         return Ok([true, false, false]);
     };
@@ -449,6 +454,7 @@ impl Agents {
 
     /// Noninteractive sessions keep running when home helper selection is invalid.
     /// Invalid settings can never opt into an external, editable helper.
+    #[cfg(test)]
     pub(crate) fn set_providers_from_home_file(&self, home: Option<&Path>) -> Option<String> {
         let (selected, warning) = match home.map(selection_from_file) {
             None => ([true, false, false], None),
@@ -456,6 +462,19 @@ impl Agents {
             Some(Err(error)) => ([true, false, false], Some(error)),
         };
         // Both a parsed nonempty selection and the fallback satisfy set_providers.
+        self.set_providers(selected)
+            .expect("nonempty helper selection");
+        warning
+    }
+
+    pub(crate) fn set_providers_from_settings(
+        &self,
+        settings: &Map<String, Value>,
+    ) -> Option<String> {
+        let (selected, warning) = match selection_from_settings(settings) {
+            Ok(selected) => (selected, None),
+            Err(error) => ([true, false, false], Some(error)),
+        };
         self.set_providers(selected)
             .expect("nonempty helper selection");
         warning

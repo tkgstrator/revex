@@ -262,10 +262,10 @@ fn helper_selection_csv(selected: [bool; 3]) -> Result<String, String> {
 }
 
 fn stored_helper_selection() -> Result<[bool; 3], String> {
-    let Some(path) = home_file() else {
+    if home_settings_file().is_none() {
         return Ok([true, false, false]);
-    };
-    let settings = read_settings(&path)?;
+    }
+    let settings = load_home_config()?;
     match settings.get("helper_providers") {
         None => Ok([true, false, false]),
         Some(Value::String(csv)) => parse_helper_selection(csv),
@@ -329,6 +329,7 @@ fn setup_view(view: &mut tui::View, cfg: &Cfg) {
         cfg.base.clone()
     };
     view.setup_key.clear();
+    view.setup_clear_key = false;
     view.setup_model = cfg.model.clone().unwrap_or_default();
     view.setup_reasoning = cfg.reasoning.clone().unwrap_or_default();
     view.setup_reasoning_selected = REASONING_CHOICES
@@ -479,7 +480,9 @@ fn edit_buffer(value: &mut String, cursor: &mut usize, key: KeyEvent) -> bool {
 }
 
 fn setup_auth_key(cfg: &Cfg, view: &tui::View) -> String {
-    if !view.setup_key.is_empty() {
+    if view.setup_clear_key {
+        String::new()
+    } else if !view.setup_key.is_empty() {
         view.setup_key.clone()
     } else if view.setup_url.trim().trim_end_matches('/') == cfg.base.trim_end_matches('/') {
         cfg.key.clone()
@@ -516,14 +519,36 @@ fn guard_endpoint_change(
     Ok(())
 }
 
-fn apply_setup_key(cfg: &mut Cfg, settings: &mut Map<String, Value>, view: &tui::View, base: &str) {
-    if !view.setup_key.is_empty() {
+fn apply_setup_key(
+    cfg: &mut Cfg,
+    settings: &mut Map<String, Value>,
+    view: &tui::View,
+    base: &str,
+) -> Result<(), String> {
+    let stored_base = settings
+        .get("base_url")
+        .and_then(Value::as_str)
+        .unwrap_or(&cfg.base)
+        .trim_end_matches('/');
+    let stored_key = settings
+        .get("api_key")
+        .and_then(Value::as_str)
+        .is_some_and(|key| !key.is_empty());
+    if base != stored_base && stored_key && view.setup_key.is_empty() && !view.setup_clear_key {
+        return Err(
+            "The saved API key belongs to the previous URL; enter a replacement or press Ctrl+K in API key to clear it".into(),
+        );
+    }
+    if view.setup_clear_key {
+        settings.insert("api_key".into(), Value::Null);
+        cfg.key.clear();
+    } else if !view.setup_key.is_empty() {
         settings.insert("api_key".into(), Value::String(view.setup_key.clone()));
         cfg.key = view.setup_key.clone();
     } else if base != cfg.base.trim_end_matches('/') {
-        settings.remove("api_key");
         cfg.key.clear();
     }
+    Ok(())
 }
 
 fn save_project_model_settings(
@@ -604,30 +629,21 @@ fn save_setup(
         return Err("Enter a full http:// or https:// API URL".into());
     }
     guard_endpoint_change(&cfg.base, base, std::env::var_os("REVEX_API_KEY").is_some())?;
-    let path = home_file().ok_or("HOME is not set; cannot save settings")?;
-    let mut settings = read_settings(&path)?;
+    let mut settings = load_home_config()?;
     let project_path = cfg.cwd.join(".revex");
-    let project_has_settings = project_path.exists() && project_path != path;
+    let project_has_settings = project_path.is_file();
+    apply_setup_key(cfg, &mut settings, view, base)?;
     settings.insert("base_url".into(), Value::String(base.into()));
     settings.insert(
         "helper_providers".into(),
         Value::String(helper_selection_csv(view.setup_helpers)?),
     );
-    apply_setup_key(cfg, &mut settings, view, base);
     cfg.model = (!view.setup_model.trim().is_empty()).then(|| view.setup_model.trim().into());
     let effort = view.setup_reasoning.trim();
     cfg.reasoning = Some(effort.into());
     cfg.decision_model = decision_model.into();
     cfg.response_language = response_language;
-    if project_has_settings {
-        save_project_model_settings(
-            &project_path,
-            cfg.model.as_deref(),
-            effort,
-            &cfg.decision_model,
-            response_language_name(cfg.response_language),
-        )?;
-    } else {
+    if !project_has_settings {
         if let Some(model) = &cfg.model {
             settings.insert("model".into(), Value::String(model.clone()));
         } else {
@@ -643,9 +659,19 @@ fn save_setup(
             Value::String(response_language_name(cfg.response_language).into()),
         );
     }
-    write_settings_file(&path, &settings)?;
+    save_home_config(&settings)?;
+    if project_has_settings {
+        save_project_model_settings(
+            &project_path,
+            cfg.model.as_deref(),
+            effort,
+            &cfg.decision_model,
+            response_language_name(cfg.response_language),
+        )?;
+    }
     cfg.base = base.into();
     view.setup_key.clear();
+    view.setup_clear_key = false;
     view.model = cfg.model.clone().unwrap_or_else(|| "server default".into());
     view.reasoning = effective_reasoning(cfg);
     view.connection = "checking API".into();
@@ -937,9 +963,18 @@ fn handle_setup_key(
                     }
                 }
             } else {
+                if key.code == KeyCode::Char('k') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    view.setup_key.clear();
+                    view.setup_clear_key = true;
+                    view.cursor = 0;
+                    view.setup_status = "Saved API key will be cleared on Confirm.".into();
+                    invalidate_setup_models(view, request);
+                    return Ok(());
+                }
                 let previous = view.setup_key.clone();
                 edit_buffer(&mut view.setup_key, &mut view.cursor, key);
                 if view.setup_key != previous {
+                    view.setup_clear_key = false;
                     invalidate_setup_models(view, request);
                 }
             }
@@ -2450,6 +2485,7 @@ pub(crate) fn call_summary(call: &Call) -> String {
         }
         Call::Search(pattern, _) => format!("search {}", short(pattern, 100)),
         Call::Sh(cmd) => format!("sh {}", short(cmd, 100)),
+        Call::Mcp(server, tool, _) => format!("mcp {} {}", short(server, 50), short(tool, 50)),
         Call::Spawn(task) => format!("spawn {}", short(task, 100)),
         Call::Wait(ids) => format!("wait {}", short(&ids.join(" "), 100)),
         Call::Invalid(message) => format!("invalid {}", short(message, 100)),
@@ -2982,7 +3018,7 @@ mod tests {
     }
 
     #[test]
-    fn changing_endpoint_drops_previous_key_before_discovery_or_save() {
+    fn blank_api_key_preserves_same_endpoint_and_rejects_changed_endpoint() {
         let agents = Agents::memory(model_fn(|_, _| unreachable!()));
         let mut config = cfg(
             PathBuf::from("/tmp"),
@@ -2999,14 +3035,59 @@ mod tests {
         assert_eq!(setup_auth_key(&config, &view), "");
         let mut settings = Map::new();
         settings.insert("api_key".into(), Value::String("old-secret".into()));
-        apply_setup_key(&mut config, &mut settings, &view, "http://new.example/v1");
+        settings.insert(
+            "base_url".into(),
+            Value::String("http://old.example/v1".into()),
+        );
+        apply_setup_key(&mut config, &mut settings, &view, "http://old.example/v1").unwrap();
+        assert_eq!(settings["api_key"], "old-secret");
+        let error = apply_setup_key(&mut config, &mut settings, &view, "http://new.example/v1")
+            .unwrap_err();
+        assert!(error.contains("Ctrl+K"));
+        assert_eq!(config.key, "old-secret");
+        assert_eq!(settings["api_key"], "old-secret");
+        view.setup_clear_key = true;
+        apply_setup_key(&mut config, &mut settings, &view, "http://new.example/v1").unwrap();
         assert!(config.key.is_empty());
-        assert!(!settings.contains_key("api_key"));
+        assert!(settings["api_key"].is_null());
         view.setup_key = "new-secret".into();
+        view.setup_clear_key = false;
         assert_eq!(setup_auth_key(&config, &view), "new-secret");
         change_setup_url(&mut view, "http://third.example/v1".into());
         assert!(view.setup_key.is_empty());
         assert!(view.setup_status.contains("re-enter"));
+    }
+
+    #[test]
+    fn ctrl_k_marks_saved_api_key_for_clear_without_saving() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let mut config = cfg(
+            PathBuf::from("/tmp"),
+            "http://old.example/v1".into(),
+            &agents,
+        );
+        let mut view = tui::View::default();
+        setup_view(&mut view, &config);
+        view.setup_tab_focus = false;
+        view.setup_field = 2;
+        view.setup_key = "draft-secret".into();
+        let (tx, _rx) = mpsc::channel();
+        let mut session = None;
+        let mut request = 0;
+        let mut exit = false;
+        handle_setup_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            &mut config,
+            &mut view,
+            &mut session,
+            &tx,
+            &mut request,
+            &mut exit,
+        )
+        .unwrap();
+        assert!(view.setup_key.is_empty());
+        assert!(view.setup_clear_key);
+        assert!(setup_auth_key(&config, &view).is_empty());
     }
 
     #[test]
