@@ -104,6 +104,38 @@ enum Api {
     Responses,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResponseLanguage {
+    English,
+    Japanese,
+}
+
+fn parse_response_language(value: &str) -> Option<ResponseLanguage> {
+    match value {
+        "en" => Some(ResponseLanguage::English),
+        "ja" => Some(ResponseLanguage::Japanese),
+        _ => None,
+    }
+}
+
+fn response_language_name(language: ResponseLanguage) -> &'static str {
+    match language {
+        ResponseLanguage::English => "en",
+        ResponseLanguage::Japanese => "ja",
+    }
+}
+
+fn response_language_instruction(language: ResponseLanguage) -> &'static str {
+    match language {
+        ResponseLanguage::English => {
+            "Reply in English by default. Follow an explicit user request for another language. Keep code, commands, paths and identifiers unchanged."
+        }
+        ResponseLanguage::Japanese => {
+            "Reply in Japanese by default. Follow an explicit user request for another language. Keep code, commands, paths and identifiers unchanged."
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Cfg {
     temperature: Option<f64>,
@@ -117,6 +149,7 @@ struct Cfg {
     model: Option<String>,
     /// Model used by `/decisions`, independently of the chat model.
     decision_model: String,
+    response_language: ResponseLanguage,
     /// None: use provider or REVEX_EXTRA; Some(""): explicit Default, omit effort.
     reasoning: Option<String>,
     yes: bool,
@@ -267,7 +300,7 @@ fn chat(cfg: &Cfg, msgs: &[Value]) -> Result<ChatResult, String> {
         }
     }
     apply_reasoning(&mut body, cfg.api, cfg.reasoning.as_deref());
-    add_runtime_model_context(&mut body, cfg.api);
+    add_runtime_model_context(&mut body, cfg.api, cfg.response_language);
     let url = format!("{}/{path}", cfg.base);
     let post = |body: &Value| {
         ureq::post(&url)
@@ -305,7 +338,7 @@ fn chat(cfg: &Cfg, msgs: &[Value]) -> Result<ChatResult, String> {
 
 /// Tell the model only what this request actually selected. A configured ID may
 /// be a provider alias, so it is not proof of the underlying model weights.
-fn add_runtime_model_context(body: &mut Value, api: Api) {
+fn add_runtime_model_context(body: &mut Value, api: Api, language: ResponseLanguage) {
     let model = body
         .get("model")
         .and_then(Value::as_str)
@@ -324,7 +357,8 @@ fn add_runtime_model_context(body: &mut Value, api: Api) {
         format!("configured effort {}", json!(id))
     });
     let context = format!(
-        "\nRuntime request metadata: {model_label}; reasoning effort {effort_label}. You can use the `>>` tools listed above."
+        "\nRuntime request metadata: {model_label}; reasoning effort {effort_label}. You can use the `>>` tools listed above. {}",
+        response_language_instruction(language)
     );
     match api {
         Api::Chat => {
@@ -1746,12 +1780,13 @@ fn mcp(cfg: &Cfg) {
 
 /// Keys a project-local `.revex` may set. `frontier` runs a command and `base_url`
 /// receives the API key, so a cloned repository must not control either.
-const PROJECT_KEYS: [&str; 5] = [
+const PROJECT_KEYS: [&str; 6] = [
     "model",
     "route",
     "api",
     "reasoning_effort",
     "decision_model",
+    "response_language",
 ];
 
 fn die(msg: &str) -> ! {
@@ -2027,6 +2062,11 @@ fn main() {
     if !valid_decision_model_selection(&decision_model) {
         die("decision_model must be self, clef or clef-flash");
     }
+    let response_language = match get("response_language", "REVEX_RESPONSE_LANGUAGE") {
+        None => ResponseLanguage::English,
+        Some(value) => parse_response_language(&value)
+            .unwrap_or_else(|| die("response_language must be en or ja")),
+    };
     let mut cfg = Cfg {
         temperature: None,
         max_tokens: None,
@@ -2044,6 +2084,7 @@ fn main() {
         key: get("api_key", "REVEX_API_KEY").unwrap_or_default(),
         model: get("model", "REVEX_MODEL"),
         decision_model,
+        response_language,
         reasoning: get("reasoning_effort", "REVEX_REASONING_EFFORT"),
         yes: false,
         history: None,
@@ -2196,6 +2237,7 @@ mod reasoning_tests {
                 key: String::new(),
                 model: Some("fake".into()),
                 decision_model: "clef".into(),
+                response_language: ResponseLanguage::English,
                 reasoning: Some("high".into()),
                 yes: false,
                 history: None,
@@ -2233,7 +2275,7 @@ mod reasoning_tests {
                 Api::Chat => json!({"messages": history, "model": "first"}),
                 Api::Responses => json!({"instructions": SYSTEM, "model": "first"}),
             };
-            add_runtime_model_context(&mut body, api);
+            add_runtime_model_context(&mut body, api, ResponseLanguage::English);
             let context = match api {
                 Api::Chat => body["messages"][0]["content"].as_str().unwrap(),
                 Api::Responses => body["instructions"].as_str().unwrap(),
@@ -2246,7 +2288,7 @@ mod reasoning_tests {
                 Api::Chat => json!({"messages": history, "model": "second"}),
                 Api::Responses => json!({"instructions": SYSTEM, "model": "second"}),
             };
-            add_runtime_model_context(&mut switched, api);
+            add_runtime_model_context(&mut switched, api, ResponseLanguage::English);
             let context = match api {
                 Api::Chat => switched["messages"][0]["content"].as_str().unwrap(),
                 Api::Responses => switched["instructions"].as_str().unwrap(),
@@ -2255,7 +2297,7 @@ mod reasoning_tests {
             assert!(!context.contains("configured model ID \"first\""));
 
             switched.as_object_mut().unwrap().remove("model");
-            add_runtime_model_context(&mut switched, api);
+            add_runtime_model_context(&mut switched, api, ResponseLanguage::English);
             let context = match api {
                 Api::Chat => switched["messages"][0]["content"].as_str().unwrap(),
                 Api::Responses => switched["instructions"].as_str().unwrap(),
@@ -2271,7 +2313,7 @@ mod reasoning_tests {
                 Api::Chat => json!({"messages": fresh_history(), "model": "selected-alias"}),
                 Api::Responses => json!({"instructions": SYSTEM, "model": "selected-alias"}),
             };
-            add_runtime_model_context(&mut body, api);
+            add_runtime_model_context(&mut body, api, ResponseLanguage::English);
             let prompt = match api {
                 Api::Chat => body["messages"][0]["content"].as_str().unwrap(),
                 Api::Responses => body["instructions"].as_str().unwrap(),
@@ -2280,6 +2322,40 @@ mod reasoning_tests {
             assert!(!prompt.contains("For questions about your model identity"));
             assert!(!prompt.contains("If asked your model identity"));
         }
+    }
+
+    #[test]
+    fn language_preference_applies_per_request_without_changing_history() {
+        let history = fresh_history();
+        for api in [Api::Chat, Api::Responses] {
+            for (language, expected) in [
+                (ResponseLanguage::English, "Reply in English by default"),
+                (ResponseLanguage::Japanese, "Reply in Japanese by default"),
+            ] {
+                let mut body = match api {
+                    Api::Chat => json!({"messages": history}),
+                    Api::Responses => json!({"instructions": SYSTEM}),
+                };
+                add_runtime_model_context(&mut body, api, language);
+                let prompt = match api {
+                    Api::Chat => body["messages"][0]["content"].as_str().unwrap(),
+                    Api::Responses => body["instructions"].as_str().unwrap(),
+                };
+                assert!(prompt.contains(expected));
+                assert!(prompt.contains("Follow an explicit user request for another language"));
+                assert!(prompt.contains("Keep code, commands, paths and identifiers unchanged"));
+            }
+        }
+        assert_eq!(history[0]["content"], SYSTEM);
+        assert_eq!(
+            parse_response_language("en"),
+            Some(ResponseLanguage::English)
+        );
+        assert_eq!(
+            parse_response_language("ja"),
+            Some(ResponseLanguage::Japanese)
+        );
+        assert_eq!(parse_response_language("auto"), None);
     }
 }
 
@@ -2299,6 +2375,7 @@ mod model_identity_tests {
             key: "never-print-this-key".into(),
             model: Some("selected-alias".into()),
             decision_model: "clef".into(),
+            response_language: ResponseLanguage::English,
             reasoning: Some("high".into()),
             yes: false,
             history: None,
@@ -2384,6 +2461,7 @@ mod direct_helper_tests {
             key: "never-print-this-key".into(),
             model: Some("local-model".into()),
             decision_model: "clef".into(),
+            response_language: ResponseLanguage::English,
             reasoning: None,
             yes: false,
             history: Some(history.clone()),
@@ -2435,6 +2513,7 @@ mod smart_route_tests {
             key: "test-secret".into(),
             model: Some("deepseek-v4.1-flash-uncensored".into()),
             decision_model: "clef".into(),
+            response_language: ResponseLanguage::English,
             reasoning: None,
             yes: false,
             history: None,
@@ -2863,6 +2942,7 @@ mod history_tests {
             key: String::new(),
             model: None,
             decision_model: "clef".into(),
+            response_language: ResponseLanguage::English,
             reasoning: None,
             yes: false,
             history: Some(h),
@@ -2895,6 +2975,7 @@ mod history_tests {
                 key: String::new(),
                 model: None,
                 decision_model: "clef".into(),
+                response_language: ResponseLanguage::English,
                 reasoning: None,
                 yes: false,
                 cwd: PathBuf::from("."),
@@ -2958,6 +3039,7 @@ mod history_tests {
             key: String::new(),
             model: None,
             decision_model: "clef".into(),
+            response_language: ResponseLanguage::English,
             reasoning: None,
             yes: false,
             history: Some(h.clone()),
@@ -3109,6 +3191,7 @@ mod history_tests {
             key: String::new(),
             model: None,
             decision_model: "clef".into(),
+            response_language: ResponseLanguage::English,
             reasoning: None,
             yes: true,
             history: None,

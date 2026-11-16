@@ -341,6 +341,10 @@ fn setup_view(view: &mut tui::View, cfg: &Cfg) {
         .iter()
         .position(|value| *value == cfg.decision_model)
         .unwrap_or(1);
+    view.setup_response_language_selected = match cfg.response_language {
+        ResponseLanguage::English => 0,
+        ResponseLanguage::Japanese => 1,
+    };
     let helper_status = match stored_helper_selection() {
         Ok(selected) => {
             view.setup_helpers = selected;
@@ -527,6 +531,7 @@ fn save_project_model_settings(
     model: Option<&str>,
     effort: &str,
     decision_model: &str,
+    response_language: &str,
 ) -> Result<(), String> {
     let mut settings = read_settings(path)?;
     settings.retain(|key, _| PROJECT_KEYS.contains(&key.as_str()));
@@ -539,6 +544,10 @@ fn save_project_model_settings(
     settings.insert(
         "decision_model".into(),
         Value::String(decision_model.into()),
+    );
+    settings.insert(
+        "response_language".into(),
+        Value::String(response_language.into()),
     );
     write_settings_file(path, &settings)
 }
@@ -574,6 +583,11 @@ fn save_setup(
     request: &mut u64,
 ) -> Result<(), String> {
     let decision_model = selected_decision_model(view)?;
+    let response_language = match view.setup_response_language_selected {
+        0 => ResponseLanguage::English,
+        1 => ResponseLanguage::Japanese,
+        _ => return Err("Choose English or Japanese for response language".into()),
+    };
     if view.setup_provider_committed.is_none() {
         return Err("Choose a model server provider with Enter".into());
     }
@@ -604,12 +618,14 @@ fn save_setup(
     let effort = view.setup_reasoning.trim();
     cfg.reasoning = Some(effort.into());
     cfg.decision_model = decision_model.into();
+    cfg.response_language = response_language;
     if project_has_settings {
         save_project_model_settings(
             &project_path,
             cfg.model.as_deref(),
             effort,
             &cfg.decision_model,
+            response_language_name(cfg.response_language),
         )?;
     } else {
         if let Some(model) = &cfg.model {
@@ -621,6 +637,10 @@ fn save_setup(
         settings.insert(
             "decision_model".into(),
             Value::String(cfg.decision_model.clone()),
+        );
+        settings.insert(
+            "response_language".into(),
+            Value::String(response_language_name(cfg.response_language).into()),
         );
     }
     write_settings_file(&path, &settings)?;
@@ -637,6 +657,7 @@ fn save_setup(
         session.cfg.model = cfg.model.clone();
         session.cfg.reasoning = cfg.reasoning.clone();
         session.cfg.decision_model = cfg.decision_model.clone();
+        session.cfg.response_language = cfg.response_language;
         view.page = tui::Page::Chat;
         view.overlay = tui::Overlay::None;
         append(
@@ -998,7 +1019,16 @@ fn handle_setup_key(
                 view.setup_decision_model_selected = (view.setup_decision_model_selected + 1) % 3;
             }
             KeyCode::Enter => {
-                view.setup_tab_fields[1] = 7;
+                view.setup_field = 8;
+            }
+            _ => {}
+        },
+        8 => match key.code {
+            KeyCode::Up | KeyCode::Down => {
+                view.setup_response_language_selected = 1 - view.setup_response_language_selected;
+            }
+            KeyCode::Enter => {
+                view.setup_tab_fields[1] = 8;
                 view.setup_tab = 2;
                 view.setup_field = 5;
             }
@@ -2507,6 +2537,7 @@ mod tests {
             frontier: None,
             route: Route::Off,
             decision_model: "clef".into(),
+            response_language: ResponseLanguage::English,
             api: Api::Chat,
             base,
             key: String::new(),
@@ -3306,6 +3337,36 @@ mod tests {
             }
         }
         assert_eq!(view.setup_decision_model_selected, 2);
+        assert_eq!(view.setup_field, 8);
+        assert_eq!(view.setup_tab, 1);
+    }
+
+    #[test]
+    fn model_tab_selects_response_language_before_helpers() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let mut config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
+        let mut view = tui::View::default();
+        setup_view(&mut view, &config);
+        view.setup_tab = 1;
+        view.setup_tab_focus = false;
+        view.setup_field = 7;
+        let (tx, _rx) = mpsc::channel();
+        let mut session = None;
+        let mut request = 0;
+        let mut exit = false;
+        for code in [KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
+            handle_setup_key(
+                KeyEvent::new(code, KeyModifiers::NONE),
+                &mut config,
+                &mut view,
+                &mut session,
+                &tx,
+                &mut request,
+                &mut exit,
+            )
+            .unwrap();
+        }
+        assert_eq!(view.setup_response_language_selected, 1);
         assert_eq!(view.setup_field, 5);
         assert_eq!(view.setup_tab, 2);
     }
@@ -3447,17 +3508,19 @@ mod tests {
         let dir = temp_dir("project-effort");
         let project = dir.join(".revex");
         std::fs::write(&project, r#"{"model":"old","route":"off"}"#).unwrap();
-        save_project_model_settings(&project, Some("new"), "high", "clef-flash").unwrap();
+        save_project_model_settings(&project, Some("new"), "high", "clef-flash", "ja").unwrap();
         let saved = read_settings(&project).unwrap();
         assert_eq!(saved["model"], "new");
         assert_eq!(saved["reasoning_effort"], "high");
         assert_eq!(saved["decision_model"], "clef-flash");
+        assert_eq!(saved["response_language"], "ja");
         assert_eq!(saved["route"], "off");
-        save_project_model_settings(&project, None, "", "self").unwrap();
+        save_project_model_settings(&project, None, "", "self", "en").unwrap();
         let cleared = read_settings(&project).unwrap();
         assert!(!cleared.contains_key("model"));
         assert_eq!(cleared["reasoning_effort"], "");
         assert_eq!(cleared["decision_model"], "self");
+        assert_eq!(cleared["response_language"], "en");
         std::fs::remove_dir_all(dir).ok();
     }
 

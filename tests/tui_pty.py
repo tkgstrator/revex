@@ -517,7 +517,7 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.wait_for_screen("> Ask Revex to do anything")
                 terminal.send(b"/model new-model\r")
                 terminal.wait_for(b"Reasoning")
-                terminal.send(b"\x1b[B\x1b[B\x1b[B\r\x1b[B\r\r\r")  # High, clef-flash, helpers, confirm.
+                terminal.send(b"\x1b[B\x1b[B\x1b[B\r\x1b[B\r\x1b[B\r\r\r")  # High, clef-flash, Japanese, confirm.
                 until = time.monotonic() + 3
                 while time.monotonic() < until:
                     saved = json.loads(project.read_text())
@@ -527,6 +527,7 @@ class TuiPtyTests(unittest.TestCase):
                 self.assertEqual(saved["model"], "new-model")
                 self.assertEqual(saved["reasoning_effort"], "high")
                 self.assertEqual(saved["decision_model"], "clef-flash")
+                self.assertEqual(saved["response_language"], "ja")
                 until = time.monotonic() + 4
                 while time.monotonic() < until:
                     screen = terminal.screen_text()
@@ -636,10 +637,11 @@ class TuiPtyTests(unittest.TestCase):
                 first.wait_for(b"Provider:")
                 first.send(b"\r\r\r\r")  # Open Server, commit provider, URL, key -> Model.
                 first.read_for(0.1)
-                first.send(b"fake-model\r\r\r\r\r")
+                first.send(b"fake-model\r\r\r\r\r\r")
                 first.wait_for_screen("> Ask Revex to do anything")
                 self.assertTrue(pathlib.Path(home, ".revex").is_file())
                 self.assertEqual(json.loads(pathlib.Path(home, ".revex").read_text())["decision_model"], "clef")
+                self.assertEqual(json.loads(pathlib.Path(home, ".revex").read_text())["response_language"], "en")
                 first.send(b"/exit\r")
                 first.exit()
             finally:
@@ -726,7 +728,7 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.send(b"/config\r")
                 terminal.wait_for(b"Provider:")
                 terminal.send(b"\r\r")  # Open Server and confirm saved Custom API.
-                terminal.send(b"x\r\r\r\r\r\r\r")  # Change URL, then final Confirm.
+                terminal.send(b"x\r\r\r\r\r\r\r\r")  # Change URL, then final Confirm.
                 terminal.wait_for(b"REVEX_API_KEY")
                 self.assertEqual(json.loads(settings.read_text()), original)
                 self.assertNotIn(b"test-secret", terminal.output)
@@ -746,7 +748,7 @@ class TuiPtyTests(unittest.TestCase):
                 first.wait_for(b"workspace?")
                 first.send(b"\r")
                 first.wait_for(b"Provider:")
-                first.send(b"\r\r\r\r\r\r\r")  # Server bar, provider, URL, key, model, reasoning, decision -> helpers.
+                first.send(b"\r\r\r\r\r\r\r\r")  # Server bar, provider, URL, key, model, reasoning, decision, language -> helpers.
                 first.wait_for(b"Up/Down helper")
                 first.wait_for(b"Codex")
                 first.wait_for(b"Claude")

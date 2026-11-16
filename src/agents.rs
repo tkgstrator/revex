@@ -1299,6 +1299,7 @@ mod tests {
             key: String::new(),
             model: Some("m".into()),
             decision_model: "clef".into(),
+            response_language: ResponseLanguage::English,
             reasoning: None,
             yes: false,
             history: None,

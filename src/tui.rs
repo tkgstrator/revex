@@ -65,6 +65,7 @@ pub(crate) struct View {
     pub(crate) setup_reasoning_selected: usize,
     pub(crate) setup_reasoning_manual: bool,
     pub(crate) setup_decision_model_selected: usize,
+    pub(crate) setup_response_language_selected: usize,
     pub(crate) setup_helpers: [bool; 3],
     pub(crate) setup_helper_selected: usize,
     pub(crate) setup_helper_available: [bool; 3],
@@ -490,6 +491,22 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
             ));
             lines.push(Line::from(Span::styled(
                 "    self uses the current chat model; Up/Down choose",
+                Style::default().fg(MUTED),
+            )));
+            let languages = ["English", "Japanese"];
+            let selected = view
+                .setup_response_language_selected
+                .min(languages.len() - 1);
+            if view.setup_field == 8 {
+                active_row = lines.len();
+                editable = None;
+            }
+            lines.push(focused(
+                format!("Response language: {}", languages[selected]),
+                !view.setup_tab_focus && view.setup_field == 8,
+            ));
+            lines.push(Line::from(Span::styled(
+                "    Up/Down choose response language",
                 Style::default().fg(MUTED),
             )));
         }
@@ -1622,6 +1639,20 @@ mod tests {
         };
         let output = screen(&view, &[], 80, 24);
         assert!(output.contains("> Decision model: clef-flash"));
+        assert!(!output.contains("HELPER PROVIDERS"));
+    }
+
+    #[test]
+    fn model_tab_shows_selected_response_language() {
+        let view = View {
+            page: Page::Setup,
+            setup_tab: 1,
+            setup_field: 8,
+            setup_response_language_selected: 1,
+            ..View::default()
+        };
+        let output = screen(&view, &[], 80, 24);
+        assert!(output.contains("> Response language: Japanese"));
         assert!(!output.contains("HELPER PROVIDERS"));
     }
 
