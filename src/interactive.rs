@@ -319,6 +319,10 @@ fn setup_view(view: &mut tui::View, cfg: &Cfg) {
         "http://127.0.0.1:8000/v1" => 2,
         _ => 3,
     };
+    view.setup_provider_committed = (!cfg.base.is_empty()).then_some(view.setup_provider);
+    view.setup_tab = 0;
+    view.setup_tab_focus = true;
+    view.setup_tab_fields = [0, 3, 5];
     view.setup_url = if cfg.base.is_empty() {
         preset_url(0).into()
     } else {
@@ -333,6 +337,10 @@ fn setup_view(view: &mut tui::View, cfg: &Cfg) {
         .unwrap_or(0);
     view.setup_reasoning_manual = !view.setup_reasoning.is_empty()
         && !REASONING_CHOICES.contains(&view.setup_reasoning.as_str());
+    view.setup_decision_model_selected = ["self", "clef", "clef-flash"]
+        .iter()
+        .position(|value| *value == cfg.decision_model)
+        .unwrap_or(1);
     let helper_status = match stored_helper_selection() {
         Ok(selected) => {
             view.setup_helpers = selected;
@@ -486,6 +494,13 @@ fn change_setup_url(view: &mut tui::View, url: String) {
     }
 }
 
+fn invalidate_setup_models(view: &mut tui::View, request: &mut u64) {
+    *request += 1;
+    view.setup_models.clear();
+    view.setup_model_selected = 0;
+    view.setup_manual = !view.setup_model.is_empty();
+}
+
 fn guard_endpoint_change(
     current: &str,
     requested: &str,
@@ -511,6 +526,7 @@ fn save_project_model_settings(
     path: &Path,
     model: Option<&str>,
     effort: &str,
+    decision_model: &str,
 ) -> Result<(), String> {
     let mut settings = read_settings(path)?;
     settings.retain(|key, _| PROJECT_KEYS.contains(&key.as_str()));
@@ -520,6 +536,10 @@ fn save_project_model_settings(
         settings.remove("model");
     }
     settings.insert("reasoning_effort".into(), Value::String(effort.into()));
+    settings.insert(
+        "decision_model".into(),
+        Value::String(decision_model.into()),
+    );
     write_settings_file(path, &settings)
 }
 
@@ -535,6 +555,17 @@ fn start_model_check(view: &mut tui::View, cfg: &Cfg, tx: &Sender<Event>, reques
     );
 }
 
+fn selected_decision_model(view: &tui::View) -> Result<&'static str, String> {
+    let selected = ["self", "clef", "clef-flash"]
+        .get(view.setup_decision_model_selected)
+        .copied()
+        .ok_or("Choose a valid decision model")?;
+    if selected == "self" && view.setup_model.trim().is_empty() {
+        return Err("decision_model=self needs a configured chat model ID".into());
+    }
+    Ok(selected)
+}
+
 fn save_setup(
     cfg: &mut Cfg,
     view: &mut tui::View,
@@ -542,6 +573,10 @@ fn save_setup(
     tx: &Sender<Event>,
     request: &mut u64,
 ) -> Result<(), String> {
+    let decision_model = selected_decision_model(view)?;
+    if view.setup_provider_committed.is_none() {
+        return Err("Choose a model server provider with Enter".into());
+    }
     if !view.setup_helpers.iter().any(|selected| *selected) {
         return Err("Select at least one helper provider with Space".into());
     }
@@ -568,8 +603,14 @@ fn save_setup(
     cfg.model = (!view.setup_model.trim().is_empty()).then(|| view.setup_model.trim().into());
     let effort = view.setup_reasoning.trim();
     cfg.reasoning = Some(effort.into());
+    cfg.decision_model = decision_model.into();
     if project_has_settings {
-        save_project_model_settings(&project_path, cfg.model.as_deref(), effort)?;
+        save_project_model_settings(
+            &project_path,
+            cfg.model.as_deref(),
+            effort,
+            &cfg.decision_model,
+        )?;
     } else {
         if let Some(model) = &cfg.model {
             settings.insert("model".into(), Value::String(model.clone()));
@@ -577,6 +618,10 @@ fn save_setup(
             settings.remove("model");
         }
         settings.insert("reasoning_effort".into(), Value::String(effort.into()));
+        settings.insert(
+            "decision_model".into(),
+            Value::String(cfg.decision_model.clone()),
+        );
     }
     write_settings_file(&path, &settings)?;
     cfg.base = base.into();
@@ -591,6 +636,7 @@ fn save_setup(
         session.cfg.key = cfg.key.clone();
         session.cfg.model = cfg.model.clone();
         session.cfg.reasoning = cfg.reasoning.clone();
+        session.cfg.decision_model = cfg.decision_model.clone();
         view.page = tui::Page::Chat;
         view.overlay = tui::Overlay::None;
         append(
@@ -692,11 +738,15 @@ fn submit_chat(
                 );
             } else if id.is_empty() {
                 setup_view(view, cfg);
+                view.setup_tab = 1;
+                view.setup_tab_focus = false;
                 view.setup_field = 3;
                 view.setup_manual = false;
                 start_model_check(view, cfg, &session.events, request);
             } else {
                 setup_view(view, cfg);
+                view.setup_tab = 1;
+                view.setup_tab_focus = false;
                 view.setup_model = id.into();
                 view.setup_manual = true;
                 view.setup_field = 4;
@@ -719,7 +769,7 @@ fn submit_chat(
                     ),
                 }
             } else {
-                append(view, "Route must be off, auto, local or remote.");
+                append(view, "Route must be off, auto, smart, local or remote.");
             }
         }
         _ if line.starts_with('/') => {
@@ -769,7 +819,10 @@ fn handle_setup_key(
     exit: &mut bool,
 ) -> Result<(), String> {
     if key.code == KeyCode::Esc {
-        if session.is_some() {
+        if !view.setup_tab_focus {
+            view.setup_tab_fields[view.setup_tab] = view.setup_field;
+            view.setup_tab_focus = true;
+        } else if session.is_some() {
             view.page = tui::Page::Chat;
             view.setup_key.clear();
         } else {
@@ -777,77 +830,121 @@ fn handle_setup_key(
         }
         return Ok(());
     }
+    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        if !view.setup_tab_focus {
+            view.setup_tab_fields[view.setup_tab] = view.setup_field;
+        }
+        view.setup_tab = if key.code == KeyCode::Tab {
+            (view.setup_tab + 1) % 3
+        } else {
+            (view.setup_tab + 2) % 3
+        };
+        view.setup_tab_focus = true;
+        return Ok(());
+    }
+    if view.setup_tab_focus {
+        match key.code {
+            KeyCode::Left | KeyCode::Up => view.setup_tab = (view.setup_tab + 2) % 3,
+            KeyCode::Right | KeyCode::Down => view.setup_tab = (view.setup_tab + 1) % 3,
+            KeyCode::Enter => {
+                view.setup_tab_focus = false;
+                view.setup_field = view.setup_tab_fields[view.setup_tab];
+                view.cursor = match view.setup_field {
+                    1 => view.setup_url.chars().count(),
+                    2 => view.setup_key.chars().count(),
+                    3 => view.setup_model.chars().count(),
+                    4 => view.setup_reasoning.chars().count(),
+                    _ => 0,
+                };
+                if view.setup_field == 3 && view.setup_models.is_empty() {
+                    start_model_check(view, cfg, tx, request);
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
     match view.setup_field {
         0 => match key.code {
-            KeyCode::Up | KeyCode::Left => {
+            KeyCode::Up => {
                 view.setup_provider = (view.setup_provider + 3) % 4;
-                change_setup_url(view, preset_url(view.setup_provider).into());
             }
-            KeyCode::Down | KeyCode::Right => {
+            KeyCode::Down => {
                 view.setup_provider = (view.setup_provider + 1) % 4;
-                change_setup_url(view, preset_url(view.setup_provider).into());
             }
             KeyCode::Char('1'..='4') => {
                 if let KeyCode::Char(ch) = key.code {
                     view.setup_provider = ch.to_digit(10).unwrap() as usize - 1;
-                    change_setup_url(view, preset_url(view.setup_provider).into());
                 }
             }
-            KeyCode::Enter | KeyCode::Tab => {
+            KeyCode::Enter => {
+                let changed = view.setup_provider_committed != Some(view.setup_provider);
+                view.setup_provider_committed = Some(view.setup_provider);
+                if changed {
+                    let previous = view.setup_url.clone();
+                    change_setup_url(view, preset_url(view.setup_provider).into());
+                    if view.setup_url != previous {
+                        invalidate_setup_models(view, request);
+                    }
+                }
                 view.setup_field = 1;
                 view.cursor = view.setup_url.chars().count();
             }
             _ => {}
         },
         1 | 2 => {
-            if matches!(key.code, KeyCode::Enter | KeyCode::Tab) {
-                view.setup_field += 1;
-                view.cursor = if view.setup_field == 2 {
-                    view.setup_key.chars().count()
+            if key.code == KeyCode::Enter {
+                if view.setup_field == 1 {
+                    view.setup_field = 2;
+                    view.cursor = view.setup_key.chars().count();
                 } else {
-                    view.setup_model.chars().count()
-                };
-                if view.setup_field == 3 {
+                    view.setup_tab_fields[0] = 2;
+                    view.setup_tab = 1;
+                    view.setup_field = 3;
+                    view.cursor = view.setup_model.chars().count();
                     start_model_check(view, cfg, tx, request);
                 }
-            } else if key.code == KeyCode::BackTab {
-                view.setup_field -= 1;
-                view.cursor = if view.setup_field == 0 {
-                    0
-                } else {
-                    view.setup_url.chars().count()
-                };
             } else if view.setup_field == 1 {
                 let previous = view.setup_url.clone();
                 edit_buffer(&mut view.setup_url, &mut view.cursor, key);
-                if view.setup_url != previous && !view.setup_key.is_empty() {
-                    view.setup_key.clear();
-                    view.setup_status =
-                        "URL changed; re-enter the API key for this endpoint.".into();
+                if view.setup_url != previous {
+                    invalidate_setup_models(view, request);
+                    if !view.setup_key.is_empty() {
+                        view.setup_key.clear();
+                        view.setup_status =
+                            "URL changed; re-enter the API key for this endpoint.".into();
+                    }
                 }
             } else {
+                let previous = view.setup_key.clone();
                 edit_buffer(&mut view.setup_key, &mut view.cursor, key);
+                if view.setup_key != previous {
+                    invalidate_setup_models(view, request);
+                }
             }
         }
         3 => match key.code {
-            KeyCode::Enter => view.setup_field = 4,
-            KeyCode::BackTab => {
-                view.setup_field = 2;
-                view.cursor = view.setup_key.chars().count();
+            KeyCode::Enter => {
+                view.setup_field = 4;
+                view.cursor = view.setup_reasoning.chars().count();
             }
-            KeyCode::Tab if !view.setup_models.is_empty() => {
-                view.setup_manual = !view.setup_manual;
-                view.cursor = view.setup_model.chars().count();
-            }
-            KeyCode::Up if !view.setup_manual && !view.setup_models.is_empty() => {
-                view.setup_model_selected = view.setup_model_selected.saturating_sub(1);
+            KeyCode::Up | KeyCode::Down if !view.setup_models.is_empty() => {
+                if view.setup_manual {
+                    view.setup_manual = false;
+                    view.setup_model_selected = view
+                        .setup_models
+                        .iter()
+                        .position(|model| model == &view.setup_model)
+                        .unwrap_or(0);
+                } else if key.code == KeyCode::Up {
+                    view.setup_model_selected = view.setup_model_selected.saturating_sub(1);
+                } else {
+                    view.setup_model_selected =
+                        (view.setup_model_selected + 1).min(view.setup_models.len() - 1);
+                }
                 view.setup_model = view.setup_models[view.setup_model_selected].clone();
             }
-            KeyCode::Down if !view.setup_manual && !view.setup_models.is_empty() => {
-                view.setup_model_selected =
-                    (view.setup_model_selected + 1).min(view.setup_models.len() - 1);
-                view.setup_model = view.setup_models[view.setup_model_selected].clone();
-            }
+            KeyCode::Left | KeyCode::Right if !view.setup_manual => {}
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 start_model_check(view, cfg, tx, request)
             }
@@ -861,29 +958,23 @@ fn handle_setup_key(
             }
         },
         4 => match key.code {
-            KeyCode::Enter => view.setup_field = 5,
-            KeyCode::BackTab => {
-                view.setup_field = 3;
-                view.cursor = view.setup_model.chars().count();
+            KeyCode::Enter => {
+                view.setup_field = 7;
             }
-            KeyCode::Tab => {
-                view.setup_reasoning_manual = !view.setup_reasoning_manual;
-                if !view.setup_reasoning_manual {
-                    view.setup_reasoning = REASONING_CHOICES[view.setup_reasoning_selected].into();
+            KeyCode::Up | KeyCode::Down => {
+                if view.setup_reasoning_manual {
+                    view.setup_reasoning_manual = false;
+                } else if key.code == KeyCode::Up {
+                    view.setup_reasoning_selected =
+                        (view.setup_reasoning_selected + REASONING_CHOICES.len() - 1)
+                            % REASONING_CHOICES.len();
+                } else {
+                    view.setup_reasoning_selected =
+                        (view.setup_reasoning_selected + 1) % REASONING_CHOICES.len();
                 }
-                view.cursor = view.setup_reasoning.chars().count();
-            }
-            KeyCode::Up | KeyCode::Left if !view.setup_reasoning_manual => {
-                view.setup_reasoning_selected =
-                    (view.setup_reasoning_selected + REASONING_CHOICES.len() - 1)
-                        % REASONING_CHOICES.len();
                 view.setup_reasoning = REASONING_CHOICES[view.setup_reasoning_selected].into();
             }
-            KeyCode::Down | KeyCode::Right if !view.setup_reasoning_manual => {
-                view.setup_reasoning_selected =
-                    (view.setup_reasoning_selected + 1) % REASONING_CHOICES.len();
-                view.setup_reasoning = REASONING_CHOICES[view.setup_reasoning_selected].into();
-            }
+            KeyCode::Left | KeyCode::Right if !view.setup_reasoning_manual => {}
             KeyCode::Char('1'..='6') if !view.setup_reasoning_manual => {
                 if let KeyCode::Char(ch) = key.code {
                     view.setup_reasoning_selected = ch.to_digit(10).unwrap() as usize - 1;
@@ -899,13 +990,23 @@ fn handle_setup_key(
                 edit_buffer(&mut view.setup_reasoning, &mut view.cursor, key);
             }
         },
+        7 => match key.code {
+            KeyCode::Up => {
+                view.setup_decision_model_selected = (view.setup_decision_model_selected + 2) % 3;
+            }
+            KeyCode::Down => {
+                view.setup_decision_model_selected = (view.setup_decision_model_selected + 1) % 3;
+            }
+            KeyCode::Enter => {
+                view.setup_tab_fields[1] = 7;
+                view.setup_tab = 2;
+                view.setup_field = 5;
+            }
+            _ => {}
+        },
         5 => match key.code {
-            KeyCode::Up | KeyCode::Left => {
-                view.setup_helper_selected = (view.setup_helper_selected + 2) % 3;
-            }
-            KeyCode::Down | KeyCode::Right => {
-                view.setup_helper_selected = (view.setup_helper_selected + 1) % 3;
-            }
+            KeyCode::Up => view.setup_helper_selected = (view.setup_helper_selected + 2) % 3,
+            KeyCode::Down => view.setup_helper_selected = (view.setup_helper_selected + 1) % 3,
             KeyCode::Char(' ') => {
                 let selected = view.setup_helper_selected;
                 view.setup_helpers[selected] = !view.setup_helpers[selected];
@@ -924,7 +1025,6 @@ fn handle_setup_key(
                     view.setup_status = "Select at least one helper provider with Space.".into();
                 }
             }
-            KeyCode::BackTab => view.setup_field = 4,
             _ => {}
         },
         _ => match key.code {
@@ -933,14 +1033,15 @@ fn handle_setup_key(
                     view.setup_status = format!("Cannot save: {e}");
                 }
             }
-            KeyCode::BackTab | KeyCode::Left => {
-                view.setup_field = 5;
-            }
+            KeyCode::Up => view.setup_field = 5,
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 start_model_check(view, cfg, tx, request)
             }
             _ => {}
         },
+    }
+    if view.page == tui::Page::Setup {
+        view.setup_tab_fields[view.setup_tab] = view.setup_field;
     }
     Ok(())
 }
@@ -2405,6 +2506,7 @@ mod tests {
             quiet: false,
             frontier: None,
             route: Route::Off,
+            decision_model: "clef".into(),
             api: Api::Chat,
             base,
             key: String::new(),
@@ -2524,6 +2626,7 @@ mod tests {
         let mut request = 0;
         let mut exit = false;
         assert_eq!(view.setup_provider, 0);
+        view.setup_tab_focus = false;
         handle_setup_key(
             KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
             &mut config,
@@ -2535,7 +2638,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(view.setup_provider, 2);
+        assert_eq!(view.setup_url, preset_url(0));
+        handle_setup_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut config,
+            &mut view,
+            &mut session,
+            &tx,
+            &mut request,
+            &mut exit,
+        )
+        .unwrap();
         assert_eq!(view.setup_url, "http://127.0.0.1:8000/v1");
+        view.setup_field = 0;
         handle_setup_key(
             KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE),
             &mut config,
@@ -2547,7 +2662,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(view.setup_provider, 3);
-        assert!(view.setup_url.is_empty());
+        assert_eq!(view.setup_url, preset_url(2));
     }
 
     #[test]
@@ -2557,6 +2672,8 @@ mod tests {
         config.model = None;
         let mut view = tui::View::default();
         setup_view(&mut view, &config);
+        view.setup_tab = 1;
+        view.setup_tab_focus = false;
         view.setup_field = 3;
         view.setup_status = "Connection failed".into();
         let (tx, _rx) = mpsc::channel();
@@ -2982,6 +3099,8 @@ mod tests {
         let mut config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
         let mut view = tui::View::default();
         setup_view(&mut view, &config);
+        view.setup_tab = 1;
+        view.setup_tab_focus = false;
         view.setup_field = 3;
         let (tx, _rx) = mpsc::channel();
         let mut session = None;
@@ -3021,7 +3140,192 @@ mod tests {
             &mut exit,
         )
         .unwrap();
+        assert_eq!(view.setup_field, 7);
+    }
+
+    #[test]
+    fn setup_tabs_preserve_draft_and_provider_needs_enter() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let mut config = cfg(PathBuf::from("/tmp"), String::new(), &agents);
+        let mut view = tui::View::default();
+        setup_view(&mut view, &config);
+        let (tx, _rx) = mpsc::channel();
+        let mut session = None;
+        let mut request = 0;
+        let mut exit = false;
+        macro_rules! press {
+            ($code:expr) => {
+                handle_setup_key(
+                    KeyEvent::new($code, KeyModifiers::NONE),
+                    &mut config,
+                    &mut view,
+                    &mut session,
+                    &tx,
+                    &mut request,
+                    &mut exit,
+                )
+                .unwrap()
+            };
+        }
+        press!(KeyCode::Right);
+        assert_eq!(view.setup_tab, 1);
+        press!(KeyCode::Tab);
+        assert_eq!(view.setup_tab, 2);
+        press!(KeyCode::BackTab);
+        assert_eq!(view.setup_tab, 1);
+        press!(KeyCode::BackTab);
+        assert_eq!(view.setup_tab, 0);
+        press!(KeyCode::Enter); // Focus Provider.
+        press!(KeyCode::Down); // Candidate LM Studio; no URL change yet.
+        assert_eq!(view.setup_url, preset_url(0));
+        assert_eq!(view.setup_provider_committed, None);
+        press!(KeyCode::Enter);
+        assert_eq!(view.setup_provider_committed, Some(1));
+        assert_eq!(view.setup_url, preset_url(1));
+    }
+
+    #[test]
+    fn left_right_inside_provider_does_not_change_tabs_or_choice() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let mut config = cfg(PathBuf::from("/tmp"), String::new(), &agents);
+        let mut view = tui::View::default();
+        setup_view(&mut view, &config);
+        view.setup_tab_focus = false;
+        let (tx, _rx) = mpsc::channel();
+        let mut session = None;
+        let mut request = 0;
+        let mut exit = false;
+        handle_setup_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &mut config,
+            &mut view,
+            &mut session,
+            &tx,
+            &mut request,
+            &mut exit,
+        )
+        .unwrap();
+        assert_eq!(view.setup_tab, 0);
+        assert_eq!(view.setup_provider, 0);
+    }
+
+    #[test]
+    fn confirming_saved_custom_provider_keeps_existing_url() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let mut config = cfg(
+            PathBuf::from("/tmp"),
+            "http://custom.example/v1".into(),
+            &agents,
+        );
+        let mut view = tui::View::default();
+        setup_view(&mut view, &config);
+        view.setup_tab_focus = false;
+        let (tx, _rx) = mpsc::channel();
+        let mut session = None;
+        let mut request = 0;
+        let mut exit = false;
+        handle_setup_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut config,
+            &mut view,
+            &mut session,
+            &tx,
+            &mut request,
+            &mut exit,
+        )
+        .unwrap();
+        assert_eq!(view.setup_url, "http://custom.example/v1");
+    }
+
+    #[test]
+    fn changing_setup_endpoint_invalidates_pending_model_list() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let mut config = cfg(
+            PathBuf::from("/tmp"),
+            "http://old.example/v1".into(),
+            &agents,
+        );
+        let mut view = tui::View::default();
+        setup_view(&mut view, &config);
+        view.setup_tab_focus = false;
+        view.setup_field = 1;
+        view.cursor = view.setup_url.chars().count();
+        let (tx, _rx) = mpsc::channel();
+        let mut session = None;
+        let mut request = 1;
+        let mut exit = false;
+        handle_setup_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut config,
+            &mut view,
+            &mut session,
+            &tx,
+            &mut request,
+            &mut exit,
+        )
+        .unwrap();
+        assert_eq!(request, 2);
+        handle_worker_event(
+            Event::ModelsFetched {
+                request: 1,
+                result: Ok(vec!["old-model".into()]),
+            },
+            &mut view,
+            &mut session,
+            request,
+        );
+        assert!(view.setup_models.is_empty());
+    }
+
+    #[test]
+    fn model_tab_selects_decision_model_before_helpers() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let mut config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
+        let mut view = tui::View::default();
+        setup_view(&mut view, &config);
+        view.setup_tab = 1;
+        view.setup_tab_focus = false;
+        view.setup_field = 4;
+        let (tx, _rx) = mpsc::channel();
+        let mut session = None;
+        let mut request = 0;
+        let mut exit = false;
+        for code in [KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
+            handle_setup_key(
+                KeyEvent::new(code, KeyModifiers::NONE),
+                &mut config,
+                &mut view,
+                &mut session,
+                &tx,
+                &mut request,
+                &mut exit,
+            )
+            .unwrap();
+            if code == KeyCode::Enter && view.setup_field == 7 {
+                assert_eq!(view.setup_decision_model_selected, 1);
+            }
+        }
+        assert_eq!(view.setup_decision_model_selected, 2);
         assert_eq!(view.setup_field, 5);
+        assert_eq!(view.setup_tab, 2);
+    }
+
+    #[test]
+    fn decision_model_self_requires_explicit_chat_model_id() {
+        let view = tui::View {
+            setup_decision_model_selected: 0,
+            ..Default::default()
+        };
+        let error = selected_decision_model(&view).unwrap_err();
+        assert_eq!(
+            error,
+            "decision_model=self needs a configured chat model ID"
+        );
+        let view = tui::View {
+            setup_model: "deepseek".into(),
+            ..view
+        };
+        assert_eq!(selected_decision_model(&view), Ok("self"));
     }
 
     #[test]
@@ -3030,6 +3334,8 @@ mod tests {
         let mut config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
         let mut view = tui::View::default();
         setup_view(&mut view, &config);
+        view.setup_tab = 2;
+        view.setup_tab_focus = false;
         view.setup_field = 5;
         view.setup_helpers = [true, false, false];
         view.setup_helper_selected = 0;
@@ -3137,19 +3443,21 @@ mod tests {
     }
 
     #[test]
-    fn project_model_and_effort_settings_persist_together() {
+    fn project_model_effort_and_decision_settings_persist_together() {
         let dir = temp_dir("project-effort");
         let project = dir.join(".revex");
         std::fs::write(&project, r#"{"model":"old","route":"off"}"#).unwrap();
-        save_project_model_settings(&project, Some("new"), "high").unwrap();
+        save_project_model_settings(&project, Some("new"), "high", "clef-flash").unwrap();
         let saved = read_settings(&project).unwrap();
         assert_eq!(saved["model"], "new");
         assert_eq!(saved["reasoning_effort"], "high");
+        assert_eq!(saved["decision_model"], "clef-flash");
         assert_eq!(saved["route"], "off");
-        save_project_model_settings(&project, None, "").unwrap();
+        save_project_model_settings(&project, None, "", "self").unwrap();
         let cleared = read_settings(&project).unwrap();
         assert!(!cleared.contains_key("model"));
         assert_eq!(cleared["reasoning_effort"], "");
+        assert_eq!(cleared["decision_model"], "self");
         std::fs::remove_dir_all(dir).ok();
     }
 

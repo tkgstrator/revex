@@ -50,6 +50,10 @@ pub(crate) struct View {
     pub(crate) status: String,
     pub(crate) workspace_selected: usize,
     pub(crate) setup_provider: usize,
+    pub(crate) setup_provider_committed: Option<usize>,
+    pub(crate) setup_tab: usize,
+    pub(crate) setup_tab_focus: bool,
+    pub(crate) setup_tab_fields: [usize; 3],
     pub(crate) setup_field: usize,
     pub(crate) setup_url: String,
     pub(crate) setup_key: String,
@@ -60,6 +64,7 @@ pub(crate) struct View {
     pub(crate) setup_reasoning: String,
     pub(crate) setup_reasoning_selected: usize,
     pub(crate) setup_reasoning_manual: bool,
+    pub(crate) setup_decision_model_selected: usize,
     pub(crate) setup_helpers: [bool; 3],
     pub(crate) setup_helper_selected: usize,
     pub(crate) setup_helper_available: [bool; 3],
@@ -224,11 +229,14 @@ fn draw_footer(frame: &mut Frame, view: &View, area: Rect) {
     }
     let hint = match view.page {
         Page::Workspace => "Up/Down choose  |  Enter confirm",
-        Page::Setup if view.setup_field == 5 && area.width >= 60 => {
-            "Up/Down choose helper  |  Space toggle  |  Enter continue"
+        Page::Setup if view.setup_tab_focus => {
+            "Tab/Shift+Tab or Left/Right screens  |  Enter open  |  Esc back"
         }
-        Page::Setup if view.setup_field == 5 => "Up/Down Space Enter",
-        Page::Setup => "Tab/Up/Down move  |  Enter confirm  |  Esc back",
+        Page::Setup if view.setup_tab == 2 && area.width < 60 => "Up/Down Space Enter",
+        Page::Setup if view.setup_tab == 2 => {
+            "Tab/Shift+Tab screens  |  Up/Down helper  |  Space toggle  |  Esc tabs"
+        }
+        Page::Setup => "Tab/Shift+Tab screens  |  Enter choose  |  Esc tabs",
         Page::Chat => "Enter send  |  /agents  /status  /config  /exit",
     };
     let status = if view.status.is_empty() {
@@ -274,186 +282,261 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
     if area.height == 0 {
         return;
     }
-    let providers = ["Ollama", "LM Studio", "oMLX", "Custom API"];
-    let provider = providers
-        .get(view.setup_provider)
-        .copied()
-        .unwrap_or("Custom API");
     let block = panel(" Setup ");
     let inner = block.inner(area);
-    let key = if view.setup_key.is_empty() {
-        "(optional)".to_owned()
-    } else {
-        "*".repeat(view.setup_key.chars().count())
-    };
-    let model = if view.setup_manual {
-        single(view, &view.setup_model)
-    } else {
-        view.setup_models
-            .get(view.setup_model_selected)
-            .map(|m| single(view, m))
-            .unwrap_or_else(|| single(view, &view.setup_model))
-    };
-    let model = if model.is_empty() {
-        "(choose or enter a model)".into()
-    } else {
-        model
-    };
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "MODEL SERVER  |  Connect an OpenAI-compatible model server",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-    ];
-    lines.push(focused(
-        format!("Provider: {provider}"),
-        view.setup_field == 0,
-    ));
-    let choices = providers
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            if i == view.setup_provider {
-                format!("[{name}]")
-            } else {
-                name.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("  ");
-    lines.push(Line::from(Span::styled(
-        format!("    {choices}"),
-        Style::default().fg(SECONDARY),
-    )));
-    let url_active = view.setup_field == 1;
-    let (url, url_cursor) = field_window(
-        &single(view, &view.setup_url),
-        if url_active { view.cursor } else { 0 },
-        inner.width.saturating_sub(7) as usize,
-    );
-    lines.push(focused(format!("URL: {url}"), url_active));
-    let key_active = view.setup_field == 2;
-    let (key, key_cursor) = field_window(
-        &key,
-        if key_active { view.cursor } else { 0 },
-        inner.width.saturating_sub(11) as usize,
-    );
-    lines.push(focused(format!("API key: {key}"), key_active));
-    let model_active = view.setup_field == 3;
-    let (model, model_cursor) = field_window(
-        &model,
-        if model_active && view.setup_manual {
-            view.cursor
+    let mut tabs = vec![Span::raw(if view.setup_tab_focus { "> " } else { "  " })];
+    for (index, name) in ["Server", "Model", "Helpers"].iter().enumerate() {
+        if index > 0 {
+            tabs.push(Span::raw("  "));
+        }
+        let style = if index == view.setup_tab {
+            Style::default()
+                .fg(Color::White)
+                .bg(ACTIVE_BG)
+                .add_modifier(Modifier::BOLD)
         } else {
-            0
-        },
-        inner.width.saturating_sub(9) as usize,
-    );
-    lines.push(focused(format!("Model: {model}"), model_active));
-    if view.setup_manual {
-        lines.push(Line::from(Span::styled(
-            "    Manual model ID (edit here)",
-            Style::default().fg(MUTED),
-        )));
-    } else if view.setup_models.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "    Model list unavailable; enter an ID manually",
-            Style::default().fg(MUTED),
-        )));
-    } else if view.setup_field == 3 {
-        let selected = view.setup_model_selected.min(view.setup_models.len() - 1);
-        let start = selected.saturating_sub(1);
-        for (index, name) in view.setup_models.iter().enumerate().skip(start).take(3) {
+            Style::default().fg(SECONDARY)
+        };
+        tabs.push(Span::styled(*name, style));
+    }
+    let mut lines = vec![Line::from(tabs), Line::raw("")];
+    let mut active_row = 0;
+    let mut editable = None;
+    match view.setup_tab {
+        0 => {
+            lines.push(Line::from(Span::styled(
+                "MODEL SERVER  |  Connect an OpenAI-compatible model server",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::raw(""));
+            let providers = ["Ollama", "LM Studio", "oMLX", "Custom API"];
+            let provider = providers
+                .get(view.setup_provider)
+                .copied()
+                .unwrap_or("Custom API");
+            let suffix = match view.setup_provider_committed {
+                None => " (suggested)",
+                Some(selected) if selected != view.setup_provider => " (press Enter to choose)",
+                _ => "",
+            };
+            active_row = 4;
             lines.push(focused(
-                format!("  {}", single(view, name)),
-                index == selected && view.setup_field == 3,
+                format!("Provider: {provider}{suffix}"),
+                !view.setup_tab_focus && view.setup_field == 0,
+            ));
+            let choices = providers
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    if view.setup_provider_committed == Some(index) {
+                        format!("[{name}]")
+                    } else {
+                        name.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("  ");
+            lines.push(Line::from(Span::styled(
+                format!("    {choices}"),
+                Style::default().fg(SECONDARY),
+            )));
+            let (url, url_cursor) = field_window(
+                &single(view, &view.setup_url),
+                if !view.setup_tab_focus && view.setup_field == 1 {
+                    view.cursor
+                } else {
+                    0
+                },
+                inner.width.saturating_sub(7) as usize,
+            );
+            if view.setup_field == 1 {
+                active_row = lines.len();
+                editable = Some((7, url_cursor));
+            }
+            lines.push(focused(
+                format!("URL: {url}"),
+                !view.setup_tab_focus && view.setup_field == 1,
+            ));
+            let key = if view.setup_key.is_empty() {
+                "(optional)".to_owned()
+            } else {
+                "*".repeat(view.setup_key.chars().count())
+            };
+            let (key, key_cursor) = field_window(
+                &key,
+                if !view.setup_tab_focus && view.setup_field == 2 {
+                    view.cursor
+                } else {
+                    0
+                },
+                inner.width.saturating_sub(11) as usize,
+            );
+            if view.setup_field == 2 {
+                active_row = lines.len();
+                editable = Some((11, key_cursor));
+            }
+            lines.push(focused(
+                format!("API key: {key}"),
+                !view.setup_tab_focus && view.setup_field == 2,
             ));
         }
-        lines.push(Line::from(Span::styled(
-            "    Type to use a manual model ID",
-            Style::default().fg(MUTED),
-        )));
-    } else {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "    {} models available; Enter to choose",
-                view.setup_models.len()
-            ),
-            Style::default().fg(MUTED),
-        )));
-    }
-    let reasoning_choices = ["Default", "low", "medium", "high", "xhigh", "max"];
-    let reasoning = if view.setup_reasoning_manual {
-        let value = single(view, &view.setup_reasoning);
-        if value.is_empty() {
-            "(enter effort)".to_owned()
-        } else {
-            value
-        }
-    } else {
-        reasoning_choices
-            .get(view.setup_reasoning_selected)
-            .copied()
-            .unwrap_or("Default")
-            .to_owned()
-    };
-    let reasoning_active = view.setup_field == 4;
-    let (reasoning, reasoning_cursor) = field_window(
-        &reasoning,
-        if reasoning_active && view.setup_reasoning_manual {
-            view.cursor
-        } else {
-            0
-        },
-        inner.width.saturating_sub(13) as usize,
-    );
-    let reasoning_row = lines.len();
-    lines.push(focused(format!("Reasoning: {reasoning}"), reasoning_active));
-    lines.push(Line::from(Span::styled(
-        "    Default / low / medium / high / xhigh / max | Tab manual",
-        Style::default().fg(MUTED),
-    )));
-    let helpers_row = lines.len();
-    lines.push(Line::from(Span::styled(
-        "HELPER PROVIDERS  |  Select any",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    )));
-    for (index, name) in ["Local", "Codex", "Claude"].iter().enumerate() {
-        let mark = if view.setup_helpers[index] { 'x' } else { ' ' };
-        let availability = if index == 0 {
-            if view.setup_helper_available[index] {
-                "built in"
+        1 => {
+            lines.push(Line::from(Span::styled(
+                "MODEL  |  Choose an ID and reasoning effort",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::raw(""));
+            let model = if view.setup_manual {
+                single(view, &view.setup_model)
             } else {
-                "unavailable"
+                view.setup_models
+                    .get(view.setup_model_selected)
+                    .map(|value| single(view, value))
+                    .unwrap_or_else(|| single(view, &view.setup_model))
+            };
+            let model = if model.is_empty() {
+                "(choose or enter a model)".into()
+            } else {
+                model
+            };
+            let (model, model_cursor) = field_window(
+                &model,
+                if !view.setup_tab_focus && view.setup_field == 3 && view.setup_manual {
+                    view.cursor
+                } else {
+                    0
+                },
+                inner.width.saturating_sub(9) as usize,
+            );
+            active_row = lines.len();
+            if view.setup_manual {
+                editable = Some((9, model_cursor));
             }
-        } else if view.setup_helper_available[index] {
-            "CLI available"
-        } else {
-            "CLI unavailable"
-        };
-        lines.push(focused(
-            format!("[{mark}] {name} ({availability})"),
-            view.setup_field == 5 && view.setup_helper_selected == index,
-        ));
+            lines.push(focused(
+                format!("Model: {model}"),
+                !view.setup_tab_focus && view.setup_field == 3,
+            ));
+            if view.setup_manual {
+                lines.push(Line::from(Span::styled(
+                    "    Manual ID; Up/Down returns to server list",
+                    Style::default().fg(MUTED),
+                )));
+            } else if view.setup_models.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "    Model list unavailable; type an ID manually",
+                    Style::default().fg(MUTED),
+                )));
+            } else {
+                let selected = view.setup_model_selected.min(view.setup_models.len() - 1);
+                let start = selected.saturating_sub(1);
+                for (index, name) in view.setup_models.iter().enumerate().skip(start).take(3) {
+                    lines.push(focused(
+                        format!("  {}", single(view, name)),
+                        !view.setup_tab_focus && view.setup_field == 3 && index == selected,
+                    ));
+                }
+                lines.push(Line::from(Span::styled(
+                    "    Type to use a manual model ID",
+                    Style::default().fg(MUTED),
+                )));
+            }
+            let choices = ["Default", "low", "medium", "high", "xhigh", "max"];
+            let reasoning = if view.setup_reasoning_manual {
+                let value = single(view, &view.setup_reasoning);
+                if value.is_empty() {
+                    "(enter effort)".into()
+                } else {
+                    value
+                }
+            } else {
+                choices
+                    .get(view.setup_reasoning_selected)
+                    .copied()
+                    .unwrap_or("Default")
+                    .to_owned()
+            };
+            let (reasoning, cursor) = field_window(
+                &reasoning,
+                if !view.setup_tab_focus && view.setup_field == 4 && view.setup_reasoning_manual {
+                    view.cursor
+                } else {
+                    0
+                },
+                inner.width.saturating_sub(13) as usize,
+            );
+            if view.setup_field == 4 {
+                active_row = lines.len();
+                editable = view.setup_reasoning_manual.then_some((13, cursor));
+            }
+            lines.push(focused(
+                format!("Reasoning: {reasoning}"),
+                !view.setup_tab_focus && view.setup_field == 4,
+            ));
+            lines.push(Line::from(Span::styled(
+                "    Up/Down choose; type for manual effort",
+                Style::default().fg(MUTED),
+            )));
+            let decision_models = ["self", "clef", "clef-flash"];
+            let selected = view
+                .setup_decision_model_selected
+                .min(decision_models.len() - 1);
+            if view.setup_field == 7 {
+                active_row = lines.len();
+                editable = None;
+            }
+            lines.push(focused(
+                format!("Decision model: {}", decision_models[selected]),
+                !view.setup_tab_focus && view.setup_field == 7,
+            ));
+            lines.push(Line::from(Span::styled(
+                "    self uses the current chat model; Up/Down choose",
+                Style::default().fg(MUTED),
+            )));
+        }
+        _ => {
+            lines.push(Line::from(Span::styled(
+                "HELPER PROVIDERS  |  Select any",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::raw(""));
+            for (index, name) in ["Local", "Codex", "Claude"].iter().enumerate() {
+                let mark = if view.setup_helpers[index] { 'x' } else { ' ' };
+                let availability = if index == 0 {
+                    "built in"
+                } else if view.setup_helper_available[index] {
+                    "CLI available"
+                } else {
+                    "CLI unavailable"
+                };
+                if view.setup_field == 5 && view.setup_helper_selected == index {
+                    active_row = lines.len();
+                }
+                lines.push(focused(
+                    format!("[{mark}] {name} ({availability})"),
+                    !view.setup_tab_focus
+                        && view.setup_field == 5
+                        && view.setup_helper_selected == index,
+                ));
+            }
+            if view.setup_field == 6 {
+                active_row = lines.len();
+            }
+            lines.push(focused(
+                "Confirm / Continue".into(),
+                !view.setup_tab_focus && view.setup_field == 6,
+            ));
+        }
     }
-    let connect_row = lines.len();
-    lines.push(focused("Confirm / Continue".into(), view.setup_field == 6));
     if !view.setup_status.is_empty() {
         lines.push(Line::from(Span::styled(
             single(view, &view.setup_status),
             Style::default().fg(ACCENT),
         )));
     }
-    let active_row = match view.setup_field {
-        0 => 2,
-        1 => 4,
-        2 => 5,
-        3 => 6,
-        4 => reasoning_row,
-        5 => helpers_row + 1 + view.setup_helper_selected.min(2),
-        _ => connect_row,
-    };
+    if view.setup_tab_focus {
+        active_row = 0;
+        editable = None;
+    }
     let scroll = active_row.saturating_sub(inner.height.saturating_sub(1) as usize);
     frame.render_widget(
         Paragraph::new(lines)
@@ -461,23 +544,17 @@ fn draw_setup(frame: &mut Frame, view: &View, area: Rect) {
             .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         area,
     );
-    if view.overlay == Overlay::None && inner.width > 0 && inner.height > 0 {
-        let editable = match view.setup_field {
-            1 => Some((7, url_cursor)),
-            2 => Some((11, key_cursor)),
-            3 if view.setup_manual => Some((9, model_cursor)),
-            4 if view.setup_reasoning_manual => Some((13, reasoning_cursor)),
-            _ => None,
-        };
-        if let Some((prefix, offset)) = editable
-            && active_row >= scroll
-            && active_row - scroll < inner.height as usize
-        {
-            let x = inner.x.saturating_add(
-                (prefix + offset).min(inner.width.saturating_sub(1) as usize) as u16,
-            );
-            frame.set_cursor_position((x, inner.y + (active_row - scroll) as u16));
-        }
+    if view.overlay == Overlay::None
+        && inner.width > 0
+        && inner.height > 0
+        && let Some((prefix, offset)) = editable
+        && active_row >= scroll
+        && active_row - scroll < inner.height as usize
+    {
+        let x = inner
+            .x
+            .saturating_add((prefix + offset).min(inner.width.saturating_sub(1) as usize) as u16);
+        frame.set_cursor_position((x, inner.y + (active_row - scroll) as u16));
     }
 }
 
@@ -1501,8 +1578,9 @@ mod tests {
             ..View::default()
         };
         let output = screen(&view, &[], 80, 24);
-        assert!(output.contains("Provider: Ollama"));
-        assert!(output.contains("[Ollama]  LM Studio  oMLX  Custom API"));
+        assert!(output.contains("Server  Model  Helpers"));
+        assert!(output.contains("Provider: Ollama (suggested)"));
+        assert!(!output.contains("[Ollama]"));
     }
 
     #[test]
@@ -1510,6 +1588,7 @@ mod tests {
         let view = View {
             page: Page::Setup,
             setup_provider: 2,
+            setup_provider_committed: Some(2),
             ..View::default()
         };
         let output = screen(&view, &[], 80, 24);
@@ -1521,20 +1600,36 @@ mod tests {
     fn setup_reasoning_picker_has_default_and_known_efforts() {
         let view = View {
             page: Page::Setup,
+            setup_tab: 1,
             setup_field: 4,
             setup_reasoning_selected: 3,
             ..View::default()
         };
         let output = screen(&view, &[], 80, 24);
         assert!(output.contains("> Reasoning: high"));
-        assert!(output.contains("Default / low / medium / high / xhigh / max"));
-        assert!(output.contains("Confirm / Continue"));
+        assert!(output.contains("Up/Down choose; type for manual effort"));
+        assert!(!output.contains("Confirm / Continue"));
+    }
+
+    #[test]
+    fn model_tab_shows_selected_decision_model() {
+        let view = View {
+            page: Page::Setup,
+            setup_tab: 1,
+            setup_field: 7,
+            setup_decision_model_selected: 2,
+            ..View::default()
+        };
+        let output = screen(&view, &[], 80, 24);
+        assert!(output.contains("> Decision model: clef-flash"));
+        assert!(!output.contains("HELPER PROVIDERS"));
     }
 
     #[test]
     fn manual_reasoning_field_shows_insertion_cursor() {
         let view = View {
             page: Page::Setup,
+            setup_tab: 1,
             setup_field: 4,
             setup_reasoning_manual: true,
             setup_reasoning: "ultra".into(),
@@ -1543,13 +1638,14 @@ mod tests {
         };
         let (output, cursor) = screen_with_cursor(&view, &[], 80, 24);
         assert!(output.contains("Reasoning: ultra"));
-        assert_eq!(cursor, (16, 12));
+        assert_eq!(cursor, (16, 10));
     }
 
     #[test]
     fn setup_confirm_is_field_six() {
         let view = View {
             page: Page::Setup,
+            setup_tab: 2,
             setup_field: 6,
             ..View::default()
         };
@@ -1561,6 +1657,7 @@ mod tests {
     fn setup_helper_list_shows_selection_and_cli_availability() {
         let view = View {
             page: Page::Setup,
+            setup_tab: 2,
             setup_field: 5,
             setup_helpers: [true, true, false],
             setup_helper_selected: 1,
@@ -1575,9 +1672,10 @@ mod tests {
     }
 
     #[test]
-    fn config_start_shows_saved_helpers_even_with_cached_models() {
+    fn helpers_tab_shows_saved_helpers_even_with_cached_models() {
         let view = View {
             page: Page::Setup,
+            setup_tab: 2,
             setup_field: 0,
             setup_models: vec!["m1".into(), "m2".into(), "m3".into()],
             setup_helpers: [true, false, true],
@@ -1594,6 +1692,7 @@ mod tests {
     fn narrow_helper_list_keeps_selected_choice_and_hint_visible() {
         let view = View {
             page: Page::Setup,
+            setup_tab: 2,
             setup_field: 5,
             setup_helper_selected: 2,
             setup_helpers: [false, false, true],
@@ -1869,8 +1968,8 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| render(frame, &view, &[])).unwrap();
         let buffer = terminal.backend().buffer();
-        assert!(buffer[(3, 4)].modifier.contains(Modifier::BOLD));
-        assert_ne!(buffer[(3, 6)].bg, Color::Reset);
+        assert!(buffer[(3, 6)].modifier.contains(Modifier::BOLD));
+        assert_ne!(buffer[(3, 8)].bg, Color::Reset);
     }
 
     #[test]
@@ -2649,7 +2748,7 @@ mod tests {
         };
         let (output, cursor) = screen_with_cursor(&view, &[], 80, 24);
         assert!(output.contains("URL: ab界"));
-        assert_eq!(cursor, (12, 8));
+        assert_eq!(cursor, (12, 10));
     }
 
     #[test]
@@ -2664,13 +2763,14 @@ mod tests {
         let (output, cursor) = screen_with_cursor(&view, &[], 80, 24);
         assert!(output.contains("API key: ***"));
         assert!(!output.contains("a界b"));
-        assert_eq!(cursor, (14, 9));
+        assert_eq!(cursor, (14, 11));
     }
 
     #[test]
     fn manual_model_cursor_tracks_unicode_cell_width() {
         let view = View {
             page: Page::Setup,
+            setup_tab: 1,
             setup_field: 3,
             setup_manual: true,
             setup_model: "m界x".into(),
@@ -2679,7 +2779,7 @@ mod tests {
         };
         let (output, cursor) = screen_with_cursor(&view, &[], 80, 24);
         assert!(output.contains("Model: m界"));
-        assert_eq!(cursor, (13, 10));
+        assert_eq!(cursor, (13, 8));
     }
 
     #[test]

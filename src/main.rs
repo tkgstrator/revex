@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod agents;
 mod interactive;
@@ -93,6 +93,7 @@ const MAX_OUT: usize = 2000;
 enum Route {
     Off,
     Auto,
+    Smart,
     Local,
     Remote,
 }
@@ -114,6 +115,8 @@ struct Cfg {
     base: String,
     key: String,
     model: Option<String>,
+    /// Model used by `/decisions`, independently of the chat model.
+    decision_model: String,
     /// None: use provider or REVEX_EXTRA; Some(""): explicit Default, omit effort.
     reasoning: Option<String>,
     yes: bool,
@@ -859,6 +862,116 @@ F = general software work any hosted coding assistant would normally accept.\n\
 L = reverse engineering of binaries, exploit or malware analysis, or anything a hosted assistant might refuse or hedge on.\n\
 If unsure, answer L.";
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DecisionScores {
+    codex_fit: f64,
+    refusal_risk: f64,
+}
+
+#[derive(Debug)]
+struct DecisionError {
+    message: String,
+    usage: Option<Usage>,
+}
+
+fn parse_decision_response(body: &Value, model: &str) -> Result<DecisionScores, String> {
+    if body["model"] != model {
+        return Err("unexpected decision model".into());
+    }
+    let answers = body["answers"]
+        .as_array()
+        .filter(|answers| answers.len() == 2)
+        .ok_or("invalid decision answers")?;
+    let mut fit = None;
+    let mut risk = None;
+    for answer in answers {
+        if answer["type"] != "predicate" {
+            return Err("invalid decision type".into());
+        }
+        let probability = answer["probability"]
+            .as_f64()
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            .ok_or("invalid decision probability")?;
+        match answer["name"].as_str() {
+            Some("codex_fit") if fit.replace(probability).is_none() => {}
+            Some("refusal_risk") if risk.replace(probability).is_none() => {}
+            _ => return Err("unexpected or duplicate decision answer".into()),
+        }
+    }
+    Ok(DecisionScores {
+        codex_fit: fit.ok_or("missing codex_fit")?,
+        refusal_risk: risk.ok_or("missing refusal_risk")?,
+    })
+}
+
+fn should_use_codex(scores: DecisionScores) -> bool {
+    scores.codex_fit >= 0.80 && scores.refusal_risk <= 0.10
+}
+
+fn valid_decision_model_selection(value: &str) -> bool {
+    matches!(value, "self" | "clef" | "clef-flash")
+}
+
+fn decision_model_id<'a>(
+    selection: &'a str,
+    chat_model: Option<&'a str>,
+) -> Result<&'a str, &'static str> {
+    match selection {
+        "self" => chat_model
+            .filter(|model| !model.is_empty())
+            .ok_or("decision_model=self needs a configured chat model"),
+        "clef" | "clef-flash" => Ok(selection),
+        _ => Err("decision_model must be self, clef or clef-flash"),
+    }
+}
+
+/// One Clef Decisions request. The chat model is never substituted unless
+/// `decision_model=self` was explicitly selected.
+fn smart_decision(cfg: &Cfg, task: &str) -> Result<(DecisionScores, Option<Usage>), DecisionError> {
+    let without_usage = |message: &str| DecisionError {
+        message: message.into(),
+        usage: None,
+    };
+    let model =
+        decision_model_id(&cfg.decision_model, cfg.model.as_deref()).map_err(without_usage)?;
+    let body = json!({
+        "model": model,
+        "input": task,
+        "questions": [
+            {
+                "type": "predicate",
+                "name": "codex_fit",
+                "instructions": "Would Codex CLI be useful for this request because it involves repository reading, code changes, or testing?"
+            },
+            {
+                "type": "predicate",
+                "name": "refusal_risk",
+                "instructions": "Is Codex likely to refuse this request based on the requested action? Consider unauthorized bypass or harmful exploitation, not the mere mention of reverse engineering."
+            }
+        ]
+    });
+    let url = format!("{}/decisions", cfg.base.trim_end_matches('/'));
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(500))
+        .timeout(Duration::from_secs(15))
+        .build();
+    let response = agent
+        .post(&url)
+        .set("Authorization", &format!("Bearer {}", cfg.key))
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+        .map_err(|_| without_usage("decision endpoint unavailable or timed out"))?;
+    let text = response
+        .into_string()
+        .map_err(|_| without_usage("could not read decision response"))?;
+    let response: Value = serde_json::from_str(&text)
+        .map_err(|_| without_usage("decision endpoint returned invalid JSON"))?;
+    let usage = Usage::from_json(&response["usage"], "input_tokens", "output_tokens");
+    let scores = parse_decision_response(&response, model)
+        .map_err(|message| DecisionError { message, usage })?;
+    Ok((scores, usage))
+}
+
 /// Ask the local model for one letter: true means forward to the frontier command.
 /// The router request's usage is added to `total`.
 fn route(cfg: &Cfg, task: &str, total: &mut UsageTotal) -> bool {
@@ -1252,6 +1365,80 @@ fn direct_helper_request(task: &str) -> Option<(Provider, &str)> {
     None
 }
 
+fn is_context_dependent_followup(task: &str) -> bool {
+    let short = task
+        .trim()
+        .trim_end_matches(['?', '？', '。', '!', '！', '.'])
+        .trim()
+        .to_lowercase();
+    matches!(
+        short.as_str(),
+        "do that" | "do it" | "continue" | "それをやって" | "続きを" | "同じように"
+    )
+}
+
+fn smart_route_status(cfg: &Cfg, message: &str) {
+    if let Some(ui) = &cfg.ui {
+        ui.progress(cfg, message);
+    } else if !cfg.quiet {
+        eprintln!("smart route: {message}");
+    }
+}
+
+fn codex_cli_available() -> bool {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .map(|dir| dir.join("codex"))
+        .any(|path| {
+            let Ok(metadata) = path.metadata() else {
+                return false;
+            };
+            if !metadata.is_file() {
+                return false;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        })
+}
+
+fn invoke_and_record(
+    cfg: &Cfg,
+    msgs: &mut Vec<Value>,
+    user_task: &str,
+    helper_task: &str,
+    agents: &Arc<Agents>,
+    provider: Provider,
+) -> Result<AgentAnswer, String> {
+    msgs.push(json!({"role": "user", "content": user_task}));
+    persist(cfg, msgs)?;
+    if cfg
+        .ui
+        .as_ref()
+        .is_some_and(interactive::UiHandle::cancelled)
+    {
+        return Err("interrupted".into());
+    }
+    let answer = agents.invoke(cfg, provider, helper_task)?;
+    if cfg
+        .ui
+        .as_ref()
+        .is_some_and(interactive::UiHandle::cancelled)
+    {
+        return Err("interrupted".into());
+    }
+    msgs.push(json!({"role": "assistant", "content": answer}));
+    persist(cfg, msgs)?;
+    Ok(AgentAnswer::Forwarded(answer))
+}
+
 fn parent_turn(
     cfg: &Cfg,
     msgs: &mut Vec<Value>,
@@ -1265,26 +1452,69 @@ fn parent_turn(
         let Role::Parent(Some(agents)) = &cfg.role else {
             return Err("helper agents are unavailable".into());
         };
-        msgs.push(json!({"role": "user", "content": task}));
-        persist(cfg, msgs)?;
-        if cfg
-            .ui
-            .as_ref()
-            .is_some_and(interactive::UiHandle::cancelled)
-        {
-            return Err("interrupted".into());
+        return invoke_and_record(cfg, msgs, task, request, agents, provider);
+    }
+    if cfg.route == Route::Smart {
+        if is_context_dependent_followup(task) {
+            smart_route_status(cfg, "context-dependent follow-up; using Revex");
+        } else if let Role::Parent(Some(agents)) = &cfg.role {
+            if agents.provider_enabled(Provider::Codex) {
+                if let Err(reason) = decision_model_id(&cfg.decision_model, cfg.model.as_deref()) {
+                    smart_route_status(cfg, &format!("{reason}; using Revex"));
+                } else {
+                    if cfg
+                        .ui
+                        .as_ref()
+                        .is_some_and(interactive::UiHandle::cancelled)
+                    {
+                        return Err("interrupted".into());
+                    }
+                    smart_route_status(cfg, "checking Codex fit with Clef");
+                    let started = Instant::now();
+                    match smart_decision(cfg, task) {
+                        Ok((scores, usage)) => {
+                            add_usage(cfg, total, usage);
+                            if should_use_codex(scores) {
+                                if codex_cli_available() {
+                                    smart_route_status(
+                                        cfg,
+                                        &format!(
+                                            "sending to Codex after {} ms decision",
+                                            started.elapsed().as_millis()
+                                        ),
+                                    );
+                                    return invoke_and_record(
+                                        cfg,
+                                        msgs,
+                                        task,
+                                        task,
+                                        agents,
+                                        Provider::Codex,
+                                    );
+                                }
+                                smart_route_status(cfg, "Codex CLI unavailable; using Revex");
+                            } else {
+                                smart_route_status(
+                                    cfg,
+                                    &format!(
+                                        "using Revex after {} ms decision",
+                                        started.elapsed().as_millis()
+                                    ),
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            add_usage(cfg, total, error.usage);
+                            smart_route_status(cfg, &format!("{}; using Revex", error.message));
+                        }
+                    }
+                }
+            } else {
+                smart_route_status(cfg, "Codex helper disabled; using Revex");
+            }
+        } else {
+            smart_route_status(cfg, "Codex helper unavailable; using Revex");
         }
-        let answer = agents.invoke(cfg, provider, request)?;
-        if cfg
-            .ui
-            .as_ref()
-            .is_some_and(interactive::UiHandle::cancelled)
-        {
-            return Err("interrupted".into());
-        }
-        msgs.push(json!({"role": "assistant", "content": answer}));
-        persist(cfg, msgs)?;
-        return Ok(AgentAnswer::Forwarded(answer));
     }
     if let Some(r) = remote_turn(cfg, msgs, task, total, |frontier, task, cwd| {
         forward(frontier, task, cwd, |message| {
@@ -1516,7 +1746,13 @@ fn mcp(cfg: &Cfg) {
 
 /// Keys a project-local `.revex` may set. `frontier` runs a command and `base_url`
 /// receives the API key, so a cloned repository must not control either.
-const PROJECT_KEYS: [&str; 4] = ["model", "route", "api", "reasoning_effort"];
+const PROJECT_KEYS: [&str; 5] = [
+    "model",
+    "route",
+    "api",
+    "reasoning_effort",
+    "decision_model",
+];
 
 fn die(msg: &str) -> ! {
     eprintln!("error: {msg}");
@@ -1535,6 +1771,7 @@ fn parse_route(s: &str) -> Option<Route> {
     match s {
         "off" => Some(Route::Off),
         "auto" => Some(Route::Auto),
+        "smart" => Some(Route::Smart),
         "local" => Some(Route::Local),
         "remote" => Some(Route::Remote),
         _ => None,
@@ -1545,6 +1782,7 @@ fn route_name(r: Route) -> &'static str {
     match r {
         Route::Off => "off",
         Route::Auto => "auto",
+        Route::Smart => "smart",
         Route::Local => "local",
         Route::Remote => "remote",
     }
@@ -1662,7 +1900,7 @@ enum Cmd {
 }
 
 const HELP: &str =
-    "/help  /agents  /clear  /model [ID]  /route [off|auto|local|remote]  /status  /exit";
+    "/help  /agents  /clear  /model [ID]  /route [off|auto|smart|local|remote]  /status  /exit";
 
 fn saved(key: &str, env: &str, value: &str) {
     match save_setting(key, value) {
@@ -1730,7 +1968,7 @@ fn command(cfg: &mut Cfg, msgs: &mut Vec<Value>, line: &str) -> Cmd {
                 cfg.route = r;
                 saved("route", "REVEX_ROUTE", arg);
             }
-            None => eprintln!("route must be off, auto, local or remote"),
+            None => eprintln!("route must be off, auto, smart, local or remote"),
         },
         "status" => {
             eprintln!(
@@ -1780,10 +2018,15 @@ fn main() {
         None => Route::Off,
         Some(v) => parse_route(&v).unwrap_or_else(|| {
             die(&format!(
-                "route must be off, auto, local or remote, got `{v}`"
+                "route must be off, auto, smart, local or remote, got `{v}`"
             ))
         }),
     };
+    let decision_model =
+        get("decision_model", "REVEX_DECISION_MODEL").unwrap_or_else(|| "clef".into());
+    if !valid_decision_model_selection(&decision_model) {
+        die("decision_model must be self, clef or clef-flash");
+    }
     let mut cfg = Cfg {
         temperature: None,
         max_tokens: None,
@@ -1800,6 +2043,7 @@ fn main() {
         }),
         key: get("api_key", "REVEX_API_KEY").unwrap_or_default(),
         model: get("model", "REVEX_MODEL"),
+        decision_model,
         reasoning: get("reasoning_effort", "REVEX_REASONING_EFFORT"),
         yes: false,
         history: None,
@@ -1951,6 +2195,7 @@ mod reasoning_tests {
                 base,
                 key: String::new(),
                 model: Some("fake".into()),
+                decision_model: "clef".into(),
                 reasoning: Some("high".into()),
                 yes: false,
                 history: None,
@@ -2053,6 +2298,7 @@ mod model_identity_tests {
             base: "http://private.example/v1".into(),
             key: "never-print-this-key".into(),
             model: Some("selected-alias".into()),
+            decision_model: "clef".into(),
             reasoning: Some("high".into()),
             yes: false,
             history: None,
@@ -2137,6 +2383,7 @@ mod direct_helper_tests {
             base: "http://private.example/v1".into(),
             key: "never-print-this-key".into(),
             model: Some("local-model".into()),
+            decision_model: "clef".into(),
             reasoning: None,
             yes: false,
             history: Some(history.clone()),
@@ -2167,6 +2414,259 @@ mod direct_helper_tests {
             "Codexを呼び出して、モデル名をきいてみて"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod smart_route_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn cfg(base: String, agents: Arc<Agents>) -> Cfg {
+        Cfg {
+            temperature: None,
+            max_tokens: None,
+            quiet: true,
+            frontier: None,
+            route: Route::Smart,
+            api: Api::Chat,
+            base,
+            key: "test-secret".into(),
+            model: Some("deepseek-v4.1-flash-uncensored".into()),
+            decision_model: "clef".into(),
+            reasoning: None,
+            yes: false,
+            history: None,
+            strict_save: false,
+            cwd: PathBuf::from("."),
+            role: Role::Parent(Some(agents)),
+            ui: None,
+        }
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> (String, Value) {
+        let mut bytes = Vec::new();
+        let mut part = [0u8; 4096];
+        while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream.read(&mut part).unwrap();
+            assert!(n > 0);
+            bytes.extend_from_slice(&part[..n]);
+        }
+        let end = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let headers = String::from_utf8_lossy(&bytes[..end]).into_owned();
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap();
+        while bytes.len() - end < length {
+            let n = stream.read(&mut part).unwrap();
+            assert!(n > 0);
+            bytes.extend_from_slice(&part[..n]);
+        }
+        (
+            headers,
+            serde_json::from_slice(&bytes[end..end + length]).unwrap(),
+        )
+    }
+
+    #[test]
+    fn smart_route_is_an_explicit_mode() {
+        assert_eq!(parse_route("smart").map(route_name), Some("smart"));
+        assert_eq!(parse_route("auto").map(route_name), Some("auto"));
+    }
+
+    #[test]
+    fn decision_model_selection_is_independent_of_chat_model() {
+        assert_eq!(decision_model_id("clef", Some("deepseek")), Ok("clef"));
+        assert_eq!(
+            decision_model_id("clef-flash", Some("deepseek")),
+            Ok("clef-flash")
+        );
+        assert_eq!(decision_model_id("self", Some("deepseek")), Ok("deepseek"));
+        assert!(decision_model_id("self", None).is_err());
+        assert!(decision_model_id("unexpected", Some("deepseek")).is_err());
+    }
+
+    #[test]
+    fn context_dependent_followups_stay_with_revex() {
+        for task in ["do that", "continue", "それをやって", "続きを"] {
+            assert!(is_context_dependent_followup(task));
+        }
+        assert!(!is_context_dependent_followup(
+            "continue parsing src/main.rs"
+        ));
+    }
+
+    #[test]
+    fn clef_scores_require_two_unique_finite_predicates() {
+        let valid = json!({
+            "model": "clef",
+            "answers": [
+                {"type":"predicate", "name":"codex_fit", "probability":0.9732},
+                {"type":"predicate", "name":"refusal_risk", "probability":0.0244}
+            ]
+        });
+        let scores = parse_decision_response(&valid, "clef").unwrap();
+        assert_eq!(scores.codex_fit, 0.9732);
+        assert_eq!(scores.refusal_risk, 0.0244);
+        assert!(should_use_codex(scores));
+
+        for invalid in [
+            json!({"model":"clef", "answers":[{"type":"predicate","name":"codex_fit","probability":0.9}]}),
+            json!({"model":"clef", "answers":[{"type":"predicate","name":"codex_fit","probability":0.9},{"type":"predicate","name":"codex_fit","probability":0.8},{"type":"predicate","name":"refusal_risk","probability":0.01}]}),
+            json!({"model":"clef", "answers":[{"type":"predicate","name":"codex_fit","probability":1.1},{"type":"predicate","name":"refusal_risk","probability":0.01}]}),
+            json!({"model":"other", "answers":[{"type":"predicate","name":"codex_fit","probability":0.9},{"type":"predicate","name":"refusal_risk","probability":0.01}]}),
+        ] {
+            assert!(parse_decision_response(&invalid, "clef").is_err());
+        }
+    }
+
+    #[test]
+    fn conservative_gate_keeps_refusals_and_ambiguous_tasks_local() {
+        for (fit, risk, forward) in [
+            (0.80, 0.10, true),
+            (0.7999, 0.0, false),
+            (1.0, 0.1001, false),
+            (0.204, 0.094, false),
+            (0.413, 0.956, false),
+        ] {
+            assert_eq!(
+                should_use_codex(DecisionScores {
+                    codex_fit: fit,
+                    refusal_risk: risk,
+                }),
+                forward
+            );
+        }
+    }
+
+    #[test]
+    fn decisions_request_uses_clef_not_chat_model_and_reads_reported_usage() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let request = read_request(&mut stream);
+            let reply = json!({
+                "model":"clef",
+                "answers":[
+                    {"type":"predicate","name":"codex_fit","probability":0.9732},
+                    {"type":"predicate","name":"refusal_risk","probability":0.0244}
+                ],
+                "usage":{"input_tokens":276,"output_tokens":0}
+            })
+            .to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            stream.flush().unwrap();
+            request
+        });
+        let agents = Agents::memory(model_fn(|_, _| panic!("local model was called")));
+        let cfg = cfg(base, agents);
+        let (scores, usage) = smart_decision(&cfg, "fix this code").unwrap();
+        assert!(should_use_codex(scores));
+        assert_eq!(
+            usage,
+            Some(Usage {
+                input: Some(276),
+                output: Some(0)
+            })
+        );
+        let (headers, body) = server.join().unwrap();
+        assert!(headers.starts_with("POST /v1/decisions HTTP/1.1"));
+        assert_eq!(body["model"], "clef");
+        assert_eq!(body["input"], "fix this code");
+        assert_eq!(body["questions"].as_array().unwrap().len(), 2);
+        assert_eq!(body["questions"][0]["name"], "codex_fit");
+        assert_eq!(body["questions"][1]["name"], "refusal_risk");
+        assert!(!body.to_string().contains("deepseek-v4.1-flash-uncensored"));
+        assert!(!body.to_string().contains(&cfg.key));
+    }
+
+    #[test]
+    fn smart_route_keeps_low_fit_task_local_after_one_decision() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (sent, received) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let (_, body) = read_request(&mut stream);
+            sent.send(body).unwrap();
+            let reply = json!({
+                "model":"clef",
+                "answers":[
+                    {"type":"predicate","name":"codex_fit","probability":0.009},
+                    {"type":"predicate","name":"refusal_risk","probability":0.007}
+                ],
+                "usage":{"input_tokens":9,"output_tokens":0}
+            })
+            .to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            stream.flush().unwrap();
+        });
+        let agents = Agents::memory(model_fn(|_, messages| {
+            assert_eq!(messages.last().unwrap()["content"], "say hello");
+            Ok(ChatResult {
+                text: "local answer".into(),
+                usage: Usage {
+                    input: Some(3),
+                    output: Some(2),
+                },
+            })
+        }));
+        agents.set_providers([true, true, false]).unwrap();
+        let cfg = cfg(base, agents);
+        let mut messages = fresh_history();
+        let mut total = UsageTotal::default();
+        let answer = agent_with_usage(&cfg, &mut messages, "say hello", &mut total).unwrap();
+        assert_eq!(answer.text(), "local answer");
+        let request = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(request["input"], "say hello");
+        assert_eq!(total.requests, 2);
+        assert_eq!((total.input, total.output), (12, 2));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn malformed_decision_preserves_reported_usage() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let _ = read_request(&mut stream);
+            let reply = json!({
+                "model":"clef",
+                "answers":[{"type":"predicate","name":"codex_fit","probability":0.95}],
+                "usage":{"input_tokens":14,"output_tokens":0}
+            })
+            .to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            stream.flush().unwrap();
+        });
+        let agents = Agents::memory(model_fn(|_, _| panic!("local model was called")));
+        let cfg = cfg(base, agents);
+        let error = smart_decision(&cfg, "fix this code").unwrap_err();
+        assert_eq!(
+            error.usage,
+            Some(Usage {
+                input: Some(14),
+                output: Some(0)
+            })
+        );
+        server.join().unwrap();
     }
 }
 
@@ -2362,6 +2862,7 @@ mod history_tests {
             base: String::new(),
             key: String::new(),
             model: None,
+            decision_model: "clef".into(),
             reasoning: None,
             yes: false,
             history: Some(h),
@@ -2393,6 +2894,7 @@ mod history_tests {
                 base: String::new(),
                 key: String::new(),
                 model: None,
+                decision_model: "clef".into(),
                 reasoning: None,
                 yes: false,
                 cwd: PathBuf::from("."),
@@ -2455,6 +2957,7 @@ mod history_tests {
             base: String::new(),
             key: String::new(),
             model: None,
+            decision_model: "clef".into(),
             reasoning: None,
             yes: false,
             history: Some(h.clone()),
@@ -2605,6 +3108,7 @@ mod history_tests {
             base: String::new(),
             key: String::new(),
             model: None,
+            decision_model: "clef".into(),
             reasoning: None,
             yes: true,
             history: None,

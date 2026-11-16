@@ -85,6 +85,17 @@ Revex keeps these limits to remain a compact local-model client.
 
 ## Install
 
+After a tagged release is published, install the prebuilt binary:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/tkgstrator/revex/master/install.sh | sh
+```
+
+The installer verifies the release SHA-256 and installs to `~/.local/bin`
+(or `REVEX_INSTALL_DIR` if set). It supports macOS arm64 and Linux x86_64/arm64.
+The command requires a published release; until the first one is available,
+install with Cargo:
+
 ```sh
 cargo install --git https://github.com/tkgstrator/revex
 ```
@@ -95,8 +106,8 @@ Or build from source:
 cargo build --release
 ```
 
-Prebuilt binaries for macOS (arm64) and Linux (x86_64, arm64) are attached to each
-[release](https://github.com/tkgstrator/revex/releases).
+Prebuilt archives and checksums appear on the
+[releases page](https://github.com/tkgstrator/revex/releases) once published.
 
 ## Configuration
 
@@ -127,7 +138,8 @@ Enter a task in the fixed input area; `/config` opens connection settings.
 | `REVEX_REASONING_EFFORT` | no | Optional reasoning effort sent with model requests; the server must support the chosen value |
 | `REVEX_API_KEY`  | no       | Sent as `Authorization: Bearer <key>`; setup can save it in private `~/.revex` |
 | `REVEX_FRONTIER` | no | Command that handles a task instead of the local model, for example `claude -p`. The task is appended as the last argument |
-| `REVEX_ROUTE` | no | Set to `auto` to let the local model decide per task whether to forward it. Off by default |
+| `REVEX_ROUTE` | no | `auto` uses the local model's existing one-letter frontier route; `smart` uses a Clef Decisions score gate for Codex. Off by default |
+| `REVEX_DECISION_MODEL` | no | Decisions model for `smart`: `clef` (default), `clef-flash`, or `self` (the configured chat model). Saved as `decision_model` |
 | `REVEX_EXTRA`    | no       | JSON object merged into every request body                                                                             |
 | `REVEX_DEBUG`    | no       | Set to print raw SSE lines to stderr                                                                                   |
 
@@ -163,7 +175,7 @@ Environment variables beat both.
 
 | Key | Allowed in `./.revex` | Environment variable |
 | --- | --- | --- |
-| `model`, `reasoning_effort`, `route`, `api` | yes | `REVEX_MODEL`, `REVEX_REASONING_EFFORT`, `REVEX_ROUTE`, `REVEX_API` |
+| `model`, `decision_model`, `reasoning_effort`, `route`, `api` | yes | `REVEX_MODEL`, `REVEX_DECISION_MODEL`, `REVEX_REASONING_EFFORT`, `REVEX_ROUTE`, `REVEX_API` |
 | `frontier`, `base_url`, `api_key` | no, `~/.revex` only | `REVEX_FRONTIER`, `REVEX_BASE_URL`, `REVEX_API_KEY` |
 | `helper_providers` | no, `~/.revex` only | none |
 
@@ -198,7 +210,7 @@ In the interactive mode these slash commands are available:
 | `/config` | Edit the API URL, key, model and reasoning effort in the setup screen |
 | `/clear` | Clear parent and helper history, state and token totals when no helper is active |
 | `/model [ID]` | Select a model (or provide its ID), then set an optional reasoning effort |
-| `/route [off\|auto\|local\|remote]` | Show or switch the forwarding mode |
+| `/route [off\|auto\|smart\|local\|remote]` | Show or switch the forwarding mode |
 | `/status` | Show the active API, model, route, parent state, queued tasks and directory |
 | `/exit` or `exit` | Quit |
 
@@ -349,6 +361,17 @@ revex --local  "Disassemble main in ./a.out"         # never forward
 | `--remote` | flag | Forward the task to `REVEX_FRONTIER` |
 | `--local` | flag | Run locally even if `REVEX_ROUTE=auto` |
 | Auto | `REVEX_ROUTE=auto` | The local model answers `F` (forward) or `L` (local) at temperature 0 |
+| Smart | `REVEX_ROUTE=smart` | The local `/decisions` endpoint scores Codex fit and refusal risk; only high-fit, low-risk tasks use an enabled Codex CLI helper |
+
+`smart` sends only the current task to `{REVEX_BASE_URL}/decisions`, with the
+separate `decision_model` selection. `clef` is the default, `clef-flash` is
+another local model, and `self` uses the selected chat model if it supports
+Decisions. It sends a task to Codex only when fit is at least 0.80 and refusal
+risk is at most 0.10; otherwise Revex handles it locally. A missing or invalid
+decision, unavailable endpoint, disabled Codex helper, or missing Codex CLI also
+keeps the task local. Once Codex starts, a failure is reported without retrying
+the task locally because Codex may have changed files. Explicit leading Codex
+or Claude invocation requests bypass `smart` and keep their existing behavior.
 
 If the command cannot start, exits with an error, returns nothing, or reports a
 refusal, `revex` says so on stderr and handles the task locally. The task is never

@@ -443,6 +443,10 @@ impl Agents {
         Ok(())
     }
 
+    pub(crate) fn provider_enabled(&self, provider: Provider) -> bool {
+        self.lock().providers[provider.index()]
+    }
+
     /// Noninteractive sessions keep running when home helper selection is invalid.
     /// Invalid settings can never opt into an external, editable helper.
     pub(crate) fn set_providers_from_home_file(&self, home: Option<&Path>) -> Option<String> {
@@ -1294,6 +1298,7 @@ mod tests {
             base: String::new(),
             key: String::new(),
             model: Some("m".into()),
+            decision_model: "clef".into(),
             reasoning: None,
             yes: false,
             history: None,

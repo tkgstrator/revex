@@ -517,7 +517,7 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.wait_for_screen("> Ask Revex to do anything")
                 terminal.send(b"/model new-model\r")
                 terminal.wait_for(b"Reasoning")
-                terminal.send(b"\x1b[B\x1b[B\x1b[B\r\r\r")  # Select high, helpers, confirm.
+                terminal.send(b"\x1b[B\x1b[B\x1b[B\r\x1b[B\r\r\r")  # High, clef-flash, helpers, confirm.
                 until = time.monotonic() + 3
                 while time.monotonic() < until:
                     saved = json.loads(project.read_text())
@@ -526,6 +526,7 @@ class TuiPtyTests(unittest.TestCase):
                     terminal.read_for(0.05)
                 self.assertEqual(saved["model"], "new-model")
                 self.assertEqual(saved["reasoning_effort"], "high")
+                self.assertEqual(saved["decision_model"], "clef-flash")
                 until = time.monotonic() + 4
                 while time.monotonic() < until:
                     screen = terminal.screen_text()
@@ -541,6 +542,43 @@ class TuiPtyTests(unittest.TestCase):
             finally:
                 terminal.close()
 
+    def test_setup_tabs_keep_provider_uncommitted_until_enter(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            terminal = Terminal(cwd, home)
+            settings = pathlib.Path(home, ".revex")
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("Provider: Ollama (suggested)")
+                self.assertNotIn("[Ollama]", terminal.screen_text())
+                self.assertFalse(settings.exists())
+                terminal.send(b"\x1b[C")  # Tab bar: Server -> Model.
+                terminal.wait_for_screen("Decision model: clef")
+                terminal.send(b"\t")  # Model -> Helpers.
+                terminal.wait_for_screen("HELPER PROVIDERS")
+                terminal.send(b"\x1b[Z")  # Shift+Tab -> Model.
+                terminal.wait_for_screen("Decision model: clef")
+                terminal.send(b"\x1b[Z")  # Model -> Server.
+                terminal.wait_for_screen("Provider: Ollama (suggested)")
+                terminal.send(b"\r\x1b[B")  # Focus Provider, candidate LM Studio.
+                terminal.wait_for_screen("Provider: LM Studio (suggested)")
+                self.assertIn("URL: http://127.0.0.1:11434/v1", terminal.screen_text())
+                self.assertFalse(settings.exists())
+                terminal.send(b"\r")  # Commit LM Studio to draft only.
+                terminal.wait_for_screen("URL: http://127.0.0.1:1234/v1")
+                self.assertFalse(settings.exists())
+                terminal.send(b"x\t")  # Edit URL, then leave Server.
+                terminal.wait_for_screen("Decision model: clef")
+                terminal.send(b"\x1b[Z\r")  # Return to Server URL field.
+                terminal.wait_for_screen("URL: http://127.0.0.1:1234/v1x")
+                terminal.send(b"\x1b")
+                terminal.read_for(0.15)
+                terminal.send(b"\x1b")
+                terminal.exit()
+                self.assertFalse(settings.exists())
+            finally:
+                terminal.close()
+
     def test_setup_and_chat_hardware_cursor_follows_editing(self):
         with tempfile.TemporaryDirectory() as home:
             terminal = Terminal(ROOT, home)
@@ -548,7 +586,7 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.wait_for(b"workspace?")
                 terminal.send(b"\r")
                 terminal.wait_for(b"Provider:")
-                terminal.send(b"\r")  # Provider -> editable URL.
+                terminal.send(b"\r\r")  # Open Server, commit Provider -> editable URL.
                 url_frame = terminal.read_for(0.15)
                 self.assertTrue(terminal.cursor_visible())
                 url_row, url_x = Terminal.last_cursor(url_frame)
@@ -558,7 +596,7 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.send(b"\x1b[D")
                 left_frame = terminal.read_for(0.15)
                 self.assertEqual(Terminal.last_cursor(left_frame), (url_row, url_x))
-                terminal.send(b"\t")
+                terminal.send(b"\r")
                 key_frame = terminal.read_for(0.15)
                 self.assertTrue(terminal.cursor_visible())
                 key_row, key_x = Terminal.last_cursor(key_frame)
@@ -567,6 +605,8 @@ class TuiPtyTests(unittest.TestCase):
                 secret_frame = terminal.read_for(0.15)
                 self.assertEqual(Terminal.last_cursor(secret_frame), (key_row, key_x + 6))
                 self.assertNotIn(b"secret", secret_frame)
+                terminal.send(b"\x1b")
+                terminal.read_for(0.15)
                 terminal.send(b"\x1b")
                 terminal.exit()
             finally:
@@ -594,11 +634,12 @@ class TuiPtyTests(unittest.TestCase):
                 first.wait_for(str(ROOT).encode())
                 first.send(b"\r")
                 first.wait_for(b"Provider:")
-                first.send(b"\r\t\t")
+                first.send(b"\r\r\r\r")  # Open Server, commit provider, URL, key -> Model.
                 first.read_for(0.1)
-                first.send(b"fake-model\r\r\r\r")
+                first.send(b"fake-model\r\r\r\r\r")
                 first.wait_for_screen("> Ask Revex to do anything")
                 self.assertTrue(pathlib.Path(home, ".revex").is_file())
+                self.assertEqual(json.loads(pathlib.Path(home, ".revex").read_text())["decision_model"], "clef")
                 first.send(b"/exit\r")
                 first.exit()
             finally:
@@ -684,11 +725,13 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.wait_for_screen("> Ask Revex to do anything")
                 terminal.send(b"/config\r")
                 terminal.wait_for(b"Provider:")
-                terminal.send(b"\r")  # URL field.
-                terminal.send(b"x\r\r\r\r\r\r")  # Change URL, skip key/model/effort/helpers, confirm.
+                terminal.send(b"\r\r")  # Open Server and confirm saved Custom API.
+                terminal.send(b"x\r\r\r\r\r\r\r")  # Change URL, then final Confirm.
                 terminal.wait_for(b"REVEX_API_KEY")
                 self.assertEqual(json.loads(settings.read_text()), original)
                 self.assertNotIn(b"test-secret", terminal.output)
+                terminal.send(b"\x1b")
+                terminal.read_for(0.15)
                 terminal.send(b"\x1b")
                 terminal.read_for(0.15)
                 terminal.send(b"exit\r")
@@ -703,8 +746,8 @@ class TuiPtyTests(unittest.TestCase):
                 first.wait_for(b"workspace?")
                 first.send(b"\r")
                 first.wait_for(b"Provider:")
-                first.send(b"\r\r\r\r\r")  # Provider, URL, key, model, reasoning -> helpers.
-                first.wait_for(b"choose helper")
+                first.send(b"\r\r\r\r\r\r\r")  # Server bar, provider, URL, key, model, reasoning, decision -> helpers.
+                first.wait_for(b"Up/Down helper")
                 first.wait_for(b"Codex")
                 first.wait_for(b"Claude")
                 first.send(b" \x1b[B \x1b[B \r\r")  # Local off, Codex + Claude on, save.
@@ -725,7 +768,7 @@ class TuiPtyTests(unittest.TestCase):
                 returning.send(b"/config\r")
                 returning.wait_for(b"Provider:")
                 returning.output = b""
-                returning.send(b"\r\r\r\r\r\r\r")  # Confirm unchanged selection.
+                returning.send(b"\t\t\r\r\r")  # Helpers tab, then Confirm unchanged selection.
                 returning.wait_for_screen("> Ask Revex to do anything")
                 settings = json.loads(pathlib.Path(home, ".revex").read_text())
                 self.assertEqual(settings["helper_providers"], "codex,claude")
