@@ -2846,6 +2846,7 @@ pub(crate) fn call_summary(call: &Call) -> String {
         Call::Search(pattern, _) => format!("search {}", short(pattern, 100)),
         Call::Sh(cmd) => format!("sh {}", short(cmd, 100)),
         Call::Mcp(server, tool, _) => format!("mcp {} {}", short(server, 50), short(tool, 50)),
+        Call::Review(scope) => format!("review {}", short(scope, 100)),
         Call::Spawn(task) => format!("spawn {}", short(task, 100)),
         Call::Wait(ids) => format!("wait {}", short(&ids.join(" "), 100)),
         Call::Invalid(message) => format!("invalid {}", short(message, 100)),

@@ -383,13 +383,14 @@ class FakeHeldResponseSteeringServer:
 class FakeHelperDispatchServer:
     """Parent SSE sequence that asks for two helpers, waits, then finishes."""
 
-    def __init__(self, interrupt_first=False):
+    def __init__(self, interrupt_first=False, review_handoff_marker=None):
         self.listener = socket.socket()
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen(8)
         self.listener.settimeout(7)
         self.base = f"http://127.0.0.1:{self.listener.getsockname()[1]}"
         self.interrupt_first = interrupt_first
+        self.review_handoff_marker = review_handoff_marker
         self.blocked = threading.Event()
         self.release = threading.Event()
         self.finished = threading.Event()
@@ -425,7 +426,22 @@ class FakeHelperDispatchServer:
                     assert b"POST /chat/completions" in headers
                     posts += 1
                     body = json.loads(body_read[:length])
-                    if self.interrupt_first:
+                    if self.review_handoff_marker is not None:
+                        if posts == 1:
+                            assert "Analyze sample.bin parser validation." in body["messages"][-1]["content"]
+                            reply = ">> review @codex Analyze sample.bin parser validation."
+                        elif posts == 2:
+                            last = body["messages"][-1]["content"]
+                            assert "reviewed:r1" in last, last
+                            assert not self.review_handoff_marker.exists(), "execution began before review acceptance"
+                            reply = ">> spawn @codex reviewed:r1"
+                        elif posts == 3:
+                            reply = ">> wait a1"
+                        else:
+                            last = body["messages"][-1]["content"]
+                            assert "parser finding: parse_header checks magic" in last, last
+                            reply = "The parser validates the magic in parse_header."
+                    elif self.interrupt_first:
                         if posts == 1:
                             self.blocked.set()
                             assert self.release.wait(5), "interrupted request was never released"
@@ -1400,6 +1416,61 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.send(b"\x1b")
                 terminal.read_for(0.15)
                 terminal.send(b"exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_codex_review_acceptance_hands_off_exact_scope_before_execution(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            marker = pathlib.Path(home, "codex-executed")
+            server = FakeHelperDispatchServer(review_handoff_marker=marker)
+            scripts = pathlib.Path(home, "bin")
+            scripts.mkdir()
+            codex = scripts / "codex"
+            codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, pathlib, sys\n"
+                "home = pathlib.Path(os.environ['HOME'])\n"
+                "scope = 'Analyze sample.bin parser validation.'\n"
+                "task = sys.stdin.read()\n"
+                "review = '--sandbox' in sys.argv\n"
+                "if review:\n"
+                "    assert sys.argv[sys.argv.index('--sandbox') + 1] == 'read-only'\n"
+                "    assert '--dangerously-bypass-approvals-and-sandbox' not in sys.argv\n"
+                "    assert scope in task\n"
+                "    (home / 'codex-review-args').write_text(json.dumps(sys.argv))\n"
+                "    answer = json.dumps({'canTake': True, 'approved': True, 'scope': scope,"
+                " 'comments': 'Scope is bounded.'})\n"
+                "else:\n"
+                "    assert '--dangerously-bypass-approvals-and-sandbox' in sys.argv\n"
+                "    assert task.strip() == scope\n"
+                "    (home / 'codex-executed').write_text(task)\n"
+                "    answer = 'parser finding: parse_header checks magic'\n"
+                "print(json.dumps({'type': 'item.completed', 'item':"
+                " {'type': 'agent_message', 'text': answer}}))\n"
+                "print(json.dumps({'type': 'turn.completed', 'usage':"
+                " {'input_tokens': 7, 'output_tokens': 3}}))\n"
+            )
+            codex.chmod(0o755)
+            seed_settings(home, {
+                "base_url": server.base,
+                "model": "fake-parent",
+                "helper_providers": "codex",
+            })
+            terminal = Terminal(cwd, home, {"PATH": str(scripts) + os.pathsep + os.environ.get("PATH", "")})
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"Analyze sample.bin parser validation.\r")
+                terminal.wait_for_screen("The parser validates the magic", seconds=12)
+                self.assertEqual(marker.read_text(), "Analyze sample.bin parser validation.")
+                review_args = json.loads(pathlib.Path(home, "codex-review-args").read_text())
+                self.assertIn("--ephemeral", review_args)
+                self.assertIn("--ignore-user-config", review_args)
+                self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", review_args)
+                terminal.send(b"/exit\r")
                 terminal.exit()
             finally:
                 terminal.close()
