@@ -382,6 +382,62 @@ class FakeSingleReplyServer:
         assert self.finished.is_set(), "single reply server did not finish"
 
 
+class CountingModelServer:
+    """Allow startup model discovery while counting local generation requests."""
+
+    def __init__(self):
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(4)
+        self.listener.settimeout(0.1)
+        self.base = f"http://127.0.0.1:{self.listener.getsockname()[1]}"
+        self.model_lists = 0
+        self.model_posts = 0
+        self.error = None
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        try:
+            while not self.stopping.is_set():
+                try:
+                    conn, _ = self.listener.accept()
+                except socket.timeout:
+                    continue
+                with conn:
+                    conn.settimeout(2)
+                    head = b""
+                    while b"\r\n" not in head:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        head += chunk
+                    request_line = head.split(b"\r\n", 1)[0]
+                    if request_line.startswith(b"GET /models "):
+                        self.model_lists += 1
+                        payload = b'{"data":[{"id":"fake-local"}]}'
+                        conn.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                            + f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode()
+                            + payload
+                        )
+                    elif request_line.startswith(b"POST /chat/completions "):
+                        self.model_posts += 1
+                        conn.sendall(b"HTTP/1.1 500 Unexpected local model request\r\nContent-Length: 0\r\n\r\n")
+                    else:
+                        raise AssertionError(f"unexpected model server request: {request_line!r}")
+        except Exception as exc:
+            self.error = exc
+
+    def close(self):
+        self.stopping.set()
+        self.thread.join(timeout=2)
+        self.listener.close()
+        if self.error:
+            raise self.error
+
+
 class TuiPtyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -470,6 +526,16 @@ class TuiPtyTests(unittest.TestCase):
                     terminal.read_for(0.05)
                 self.assertEqual(saved["model"], "new-model")
                 self.assertEqual(saved["reasoning_effort"], "high")
+                until = time.monotonic() + 4
+                while time.monotonic() < until:
+                    screen = terminal.screen_text()
+                    if ("> Ask Revex to do anything" in screen
+                            and "new-model" in screen.splitlines()[-1]
+                            and "Reasoning:" not in screen):
+                        break
+                    terminal.read_for(0.05)
+                else:
+                    self.fail(f"settings did not return to chat: {terminal.screen_text()[-500:]!r}")
                 terminal.send(b"exit\r")
                 terminal.exit()
             finally:
@@ -669,10 +735,11 @@ class TuiPtyTests(unittest.TestCase):
             finally:
                 returning.close()
 
-    def test_simple_model_identity_is_local_and_uses_configured_id(self):
+    def test_simple_model_identity_uses_model_reply_without_canned_text(self):
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            server = FakeSingleReplyServer()
             terminal = Terminal(cwd, home, {
-                "REVEX_BASE_URL": "http://127.0.0.1:9/v1",
+                "REVEX_BASE_URL": server.base,
                 "REVEX_MODEL": "selected-alias",
                 "REVEX_REASONING_EFFORT": "high",
                 "REVEX_API_KEY": "test-secret",
@@ -682,31 +749,64 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.send(b"\r")
                 terminal.wait_for_screen("> Ask Revex to do anything")
                 terminal.send("あなたのモデルは？\r".encode())
-                state = pathlib.Path(home, ".local/state/revex")
-                until = time.monotonic() + 3
-                answer = ""
-                while time.monotonic() < until:
-                    terminal.read_for(0.05)
-                    histories = list(state.glob("history-*.json"))
-                    if histories:
-                        messages = json.loads(histories[0].read_text())["messages"]
-                        if len(messages) >= 3:
-                            answer = messages[-1]["content"]
-                            break
-                self.assertIn("selected-alias", answer)
-                self.assertIn("high", answer)
-                self.assertNotIn("test-secret", answer)
-                self.assertNotIn("127.0.0.1", answer)
-                self.assertNotIn(b"Thinking", terminal.output)
-                self.assertNotIn(b"[main] started", terminal.output)
-                until = time.monotonic() + 4
-                while "selected-alias" not in terminal.screen_text().split("-- INPUT")[0] and time.monotonic() < until:
-                    terminal.read_for(0.05)
-                self.assertIn("selected-alias", terminal.screen_text().split("-- INPUT")[0])
+                self.assertTrue(server.finished.wait(4), "identity question did not reach the model")
+                self.assertEqual(server.user_input, "あなたのモデルは？")
+                terminal.wait_for_screen("multiline done")
+                messages = json.loads(next(pathlib.Path(home, ".local/state/revex").glob("history-*.json")).read_text())["messages"]
+                self.assertEqual(messages[-1]["content"], "multiline done")
                 terminal.send(b"\x04")
                 terminal.exit()
             finally:
                 terminal.close()
+                server.close()
+
+    def test_explicit_codex_invocation_calls_cli_once_without_local_model_request(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            server = CountingModelServer()
+            scripts = pathlib.Path(home, "bin")
+            scripts.mkdir()
+            codex = scripts / "codex"
+            codex.write_text(
+                "#!/bin/sh\n"
+                'printf "call\\n" >> "$HOME/codex-calls"\n'
+                'cat > "$HOME/codex-task"\n'
+                "printf '%s\\n' "
+                "'{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"codex-direct-ok\"}}' "
+                "'{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}'\n"
+            )
+            codex.chmod(0o755)
+            pathlib.Path(home, ".revex").write_text(json.dumps({
+                "base_url": server.base,
+                "model": "fake-local",
+                "helper_providers": "codex",
+                "route": "auto",
+                "frontier": "missing-frontier-command",
+            }))
+            terminal = Terminal(cwd, home, {"PATH": str(scripts) + os.pathsep + os.environ.get("PATH", "")})
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                prompt = "Codexを呼び出して、モデル名をきいてみて"
+                terminal.send((prompt + "\r").encode())
+                terminal.wait_for_screen("codex-direct-ok", seconds=8)
+                self.assertEqual(pathlib.Path(home, "codex-calls").read_text().splitlines(), ["call"])
+                self.assertEqual(pathlib.Path(home, "codex-task").read_text(), "モデル名をきいてみて")
+                self.assertEqual(server.model_posts, 0)
+                state = pathlib.Path(home, ".local/state/revex")
+                messages = json.loads(next(state.glob("history-*.json")).read_text())["messages"]
+                self.assertEqual(messages[-2]["content"], prompt)
+                self.assertEqual(messages[-1]["content"], "codex-direct-ok")
+                record_paths = list(state.glob("agents-history-*/a*.json"))
+                records = [json.loads(path.read_text()) for path in record_paths]
+                self.assertEqual(len(records), 1, [str(path.relative_to(state)) for path in record_paths])
+                self.assertEqual(records[0]["provider"], "codex")
+                self.assertEqual(records[0]["status"], "done")
+                terminal.send(b"exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
 
     def test_alt_enter_keeps_multiline_prompt_in_one_model_turn(self):
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
@@ -743,14 +843,15 @@ class TuiPtyTests(unittest.TestCase):
             })
             try:
                 terminal.wait_for(b"workspace?")
-                terminal.wait_for(b"\x1b[>1u")  # Request unambiguous modified keys.
+                terminal.wait_for(b"\x1b[>9u")  # Request CSI-u for all keys, including Enter.
                 terminal.send(b"\r")
                 terminal.wait_for_screen("> Ask Revex to do anything")
-                self.assertIn("Ctrl+J newline", terminal.screen_text())
+                self.assertIn("-- INPUT", terminal.screen_text())
+                self.assertNotIn("Ctrl+J newline", terminal.screen_text())
                 terminal.send(b"first\x1b[13;2usecond")  # CSI-u Shift+Enter.
                 terminal.read_for(0.2)
                 self.assertFalse(server.finished.is_set(), "Shift+Enter submitted early")
-                terminal.send(b"\r")
+                terminal.send(b"\x1b[13u")  # Unmodified Enter still submits in enhanced mode.
                 self.assertTrue(server.finished.wait(4), "multiline request was not sent")
                 self.assertEqual(server.user_input, "first\nsecond")
                 terminal.wait_for(b"multiline")

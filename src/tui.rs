@@ -789,6 +789,7 @@ fn transcript_rows(view: &View, width: usize) -> Vec<Line<'static>> {
         }
         if user {
             rows.push(user_padding(width));
+            rows.push(Line::raw(""));
         } else if assistant {
             rows.push(Line::raw(""));
         }
@@ -1037,7 +1038,13 @@ fn draw_chat(frame: &mut Frame, view: &View, agents: &[AgentInfo], area: Rect) {
     let divider_y = composer_y.saturating_sub(1);
     let transcript_area = rect(area, 0, divider_y);
     if transcript_area.height > 0 {
-        let lines = transcript_rows(view, transcript_area.width as usize);
+        let mut lines = transcript_rows(view, transcript_area.width as usize);
+        if let Some(activity) = chat_activity(view) {
+            lines.push(Line::styled(
+                format!("* {activity}"),
+                Style::default().fg(SECONDARY),
+            ));
+        }
         let top_padding = (transcript_area.height as usize)
             .saturating_sub(lines.len())
             .min(u16::MAX as usize) as u16;
@@ -1056,17 +1063,9 @@ fn draw_chat(frame: &mut Frame, view: &View, agents: &[AgentInfo], area: Rect) {
         );
     }
 
-    let mut divider = "-- INPUT | Ctrl+J newline | Enter send".to_owned();
-    if let Some(activity) = chat_activity(view)
-        && Line::raw(&divider).width() + 3 + Line::raw(&activity).width() <= area.width as usize
-    {
-        divider.push_str(" | ");
-        divider.push_str(&activity);
-    }
-    divider.push(' ');
-    divider.push_str(&"-".repeat(area.width as usize));
     frame.render_widget(
-        Paragraph::new(divider).style(Style::default().fg(ACCENT)),
+        Paragraph::new(format!("-- INPUT {}", "-".repeat(area.width as usize)))
+            .style(Style::default().fg(ACCENT)),
         rect(area, divider_y, 1),
     );
     frame.render_widget(
@@ -1116,10 +1115,16 @@ fn draw_chat(frame: &mut Frame, view: &View, agents: &[AgentInfo], area: Rect) {
     }
 
     let footer = rect(area, area.height.saturating_sub(1), 1);
+    let footer_text = Rect::new(
+        footer.x.saturating_add(2),
+        footer.y,
+        footer.width.saturating_sub(2),
+        footer.height,
+    );
     frame.render_widget(
-        Paragraph::new(chat_footer(view, agents, footer.width as usize))
-            .style(Style::default().fg(SECONDARY)),
-        footer,
+        Paragraph::new(chat_footer(view, agents, footer_text.width as usize))
+            .style(Style::default().fg(Color::LightBlue)),
+        footer_text,
     );
 }
 
@@ -1619,7 +1624,7 @@ mod tests {
             assert!(output.contains(expected), "missing {expected}:\n{output}");
         }
         let footer = output.lines().last().unwrap().trim_end();
-        assert!(footer.starts_with("my-model . /tmp/project"));
+        assert!(footer.starts_with("  my-model . /tmp/project"));
         assert!(footer.ends_with(". - . - . -"));
         assert!(!footer.contains("connected"));
         assert!(!footer.contains("Revex"));
@@ -1647,7 +1652,7 @@ mod tests {
         let output = screen(&view, &[], 80, 20);
         let rows: Vec<_> = output.lines().collect();
         assert!(rows[15].starts_with("-- INPUT"));
-        assert!(rows[15].contains("Ctrl+J newline"));
+        assert!(rows[15].chars().skip(9).all(|ch| ch == '-'));
         assert!(rows[16].trim().is_empty());
         assert!(rows[17].starts_with("> next task"));
         assert!(rows[18].trim().is_empty());
@@ -1691,6 +1696,48 @@ mod tests {
         }
         assert_eq!(buffer[(0, 20)].symbol(), ">");
         assert_eq!(buffer[(2, 21)].symbol(), "s");
+    }
+
+    #[test]
+    fn footer_uses_blue_text_on_default_background() {
+        let view = View {
+            model: "my-model".into(),
+            cwd: "/tmp/project".into(),
+            transcript: vec!["You  restored prompt".into()],
+            input: "next task".into(),
+            ..View::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &view, &[])).unwrap();
+        let buffer = terminal.backend().buffer();
+        for x in 0..80 {
+            assert_eq!(buffer[(x, 23)].bg, Color::Reset, "footer background at {x}");
+        }
+        assert_eq!(buffer[(0, 23)].symbol(), " ");
+        assert_eq!(buffer[(1, 23)].symbol(), " ");
+        assert_eq!(buffer[(2, 23)].symbol(), "m");
+        assert_eq!(buffer[(2, 23)].fg, Color::LightBlue);
+        assert_eq!(buffer[(13, 23)].fg, Color::LightBlue);
+        assert_eq!(buffer[(79, 16)].bg, USER_BG);
+        assert_eq!(buffer[(79, 21)].bg, EDITOR_BG);
+        assert_eq!(buffer[(79, 19)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn indented_footer_keeps_cost_visible_with_long_model_and_workspace() {
+        let view = View {
+            model: "deepseek-v4.1-flash-uncensored-extra-long".into(),
+            reasoning: Some("high".into()),
+            cwd: "/Volumes/Work/VeryLongDirectoryName/Clients/revex/target/release".into(),
+            last_turn_rate: Some(12.7),
+            last_turn_elapsed: Some(Duration::from_secs_f64(22.9)),
+            ..View::default()
+        };
+        let output = screen(&view, &[], 80, 24);
+        let footer = output.lines().last().unwrap().trim_end();
+        assert!(footer.starts_with("  deepseek"), "{footer}");
+        assert!(footer.ends_with(" . 12.7 tok/s . 22.9s . -"), "{footer}");
+        assert_eq!(Line::raw(footer).width(), 80);
     }
 
     #[test]
@@ -1764,7 +1811,7 @@ mod tests {
         assert!(output.contains("> first"));
         assert!(output.contains("> a界 b"), "{output}");
         assert!(output.lines().nth(7).unwrap().starts_with("-- INPUT"));
-        assert!(output.lines().last().unwrap().starts_with("no model"));
+        assert!(output.lines().last().unwrap().starts_with("  no model"));
         assert_eq!(cursor, (6, 9));
     }
 
@@ -1805,11 +1852,11 @@ mod tests {
         };
         let rows = transcript_rows(&view, 40);
         assert_eq!(rows[2].spans[0].style.fg, Some(Color::Cyan));
-        assert_eq!(rows[4].to_string(), "answer");
-        assert_eq!(rows[4].spans[0].style.fg, None);
-        assert_eq!(rows[6].style.fg, Some(Color::Yellow));
-        assert_eq!(rows[7].style.fg, Some(Color::Gray));
-        assert_eq!(rows[8].style.fg, Some(Color::Red));
+        assert_eq!(rows[5].to_string(), "answer");
+        assert_eq!(rows[5].spans[0].style.fg, None);
+        assert_eq!(rows[7].style.fg, Some(Color::Yellow));
+        assert_eq!(rows[8].style.fg, Some(Color::Gray));
+        assert_eq!(rows[9].style.fg, Some(Color::Red));
     }
 
     #[test]
@@ -1837,7 +1884,7 @@ mod tests {
         for width in [24, 80] {
             let output = screen(&view, &[], width, 20);
             let footer = output.lines().last().unwrap().trim_end();
-            assert!(footer.starts_with("server model"));
+            assert!(footer.starts_with("  server model"));
             assert!(!footer.contains("Ready"));
             assert!(!footer.contains("0 agents"));
             assert!(!footer.contains("server default"));
@@ -1852,7 +1899,15 @@ mod tests {
             ..View::default()
         };
         let wide = screen(&view, &[], 80, 20);
-        assert!(wide.contains("-- INPUT | Ctrl+J newline | Enter send | | Thinking 2 queued"));
+        assert!(wide.contains("* | Thinking 2 queued"));
+        assert!(
+            wide.lines()
+                .find(|line| line.starts_with("-- INPUT"))
+                .unwrap()
+                .chars()
+                .skip(9)
+                .all(|ch| ch == '-')
+        );
         assert!(!wide.lines().last().unwrap().contains("running"));
         let narrow = screen(&view, &[], 24, 20);
         assert!(!narrow.lines().last().unwrap().contains("running"));
@@ -1870,7 +1925,7 @@ mod tests {
         let output = screen(&view, &[], 80, 20);
         let lines: Vec<_> = output.lines().collect();
         assert!(lines[0].trim().is_empty());
-        assert!(lines[19].starts_with("local-model . high . /tmp/project"));
+        assert!(lines[19].starts_with("  local-model . high . /tmp/project"));
         assert!(!lines[19].contains("connected"));
     }
 
@@ -1990,10 +2045,13 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
         terminal.draw(|frame| render(frame, &view, &[])).unwrap();
         let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 6)].bg, USER_BG);
         assert_eq!(buffer[(0, 7)].bg, USER_BG);
+        assert_eq!(buffer[(39, 7)].bg, USER_BG);
         assert_eq!(buffer[(0, 8)].bg, USER_BG);
-        assert_eq!(buffer[(39, 8)].bg, USER_BG);
-        assert_eq!(buffer[(0, 9)].bg, USER_BG);
+        for x in 0..40 {
+            assert_eq!(buffer[(x, 9)].bg, Color::Reset, "outer gap at {x},9");
+        }
         assert_eq!(buffer[(0, 10)].bg, Color::Reset);
     }
 
@@ -2006,13 +2064,19 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
         terminal.draw(|frame| render(frame, &view, &[])).unwrap();
         let buffer = terminal.backend().buffer();
-        for y in [8, 9, 10] {
+        for y in [7, 8, 9] {
             for x in 0..40 {
                 assert_eq!(buffer[(x, y)].bg, USER_BG, "user block at {x},{y}");
             }
         }
-        for y in [8, 10] {
+        for y in [7, 9] {
             assert!((0..40).all(|x| buffer[(x, y)].symbol() == " "));
+        }
+        for y in [6, 10] {
+            for x in 0..40 {
+                assert_eq!(buffer[(x, y)].bg, Color::Reset, "outer gap at {x},{y}");
+                assert_eq!(buffer[(x, y)].symbol(), " ");
+            }
         }
     }
 
@@ -2026,17 +2090,18 @@ mod tests {
         terminal.draw(|frame| render(frame, &view, &[])).unwrap();
         let buffer = terminal.backend().buffer();
         for x in 0..80 {
-            assert_eq!(buffer[(x, 15)].bg, Color::Reset, "outer gap at {x}");
-            for y in [16, 17, 18] {
+            assert_eq!(buffer[(x, 14)].bg, Color::Reset, "top outer gap at {x}");
+            for y in [15, 16, 17] {
                 assert_eq!(
                     buffer[(x, y)].bg,
                     Color::Rgb(25, 62, 105),
                     "blue block at {x},{y}"
                 );
             }
+            assert_eq!(buffer[(x, 18)].bg, Color::Reset, "bottom outer gap at {x}");
         }
-        assert_eq!(buffer[(0, 17)].symbol(), ">");
-        assert_eq!(buffer[(2, 17)].fg, Color::White);
+        assert_eq!(buffer[(0, 16)].symbol(), ">");
+        assert_eq!(buffer[(2, 16)].fg, Color::White);
         assert_eq!(buffer[(0, 19)].bg, Color::Reset);
         assert_eq!(buffer[(0, 20)].bg, Color::Rgb(27, 45, 75));
     }
@@ -2070,6 +2135,7 @@ mod tests {
                 "",
                 "> next",
                 "",
+                "",
                 "after",
                 ""
             ]
@@ -2078,7 +2144,7 @@ mod tests {
             assert_eq!(rows[index].style.bg, Some(USER_BG));
             assert_eq!(rows[index].width(), 20);
         }
-        for index in [0, 2, 6, 11] {
+        for index in [0, 2, 6, 10, 12] {
             assert_eq!(rows[index].style.bg, None);
         }
     }
@@ -2090,10 +2156,11 @@ mod tests {
             ..View::default()
         };
         let rows = transcript_rows(&view, 10);
-        assert_eq!(rows.len(), 6);
+        assert_eq!(rows.len(), 7);
         assert_eq!(rows[0].style.bg, None);
         assert_eq!(rows[1].style.bg, Some(USER_BG));
         assert_eq!(rows[5].style.bg, Some(USER_BG));
+        assert_eq!(rows[6].style.bg, None);
         for row in &rows[2..5] {
             assert_eq!(row.width(), 10);
             assert!(row.spans.iter().all(|span| span.style.bg == Some(USER_BG)));
@@ -2132,12 +2199,15 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(20, 12)).unwrap();
         terminal.draw(|frame| render(frame, &view, &[])).unwrap();
         let buffer = terminal.backend().buffer();
-        for y in [3, 4, 5, 6] {
+        for y in [2, 3, 4, 5] {
             assert_eq!(buffer[(0, y)].bg, USER_BG);
             assert_eq!(buffer[(19, y)].bg, USER_BG);
         }
-        assert_eq!(buffer[(0, 2)].bg, Color::Reset);
-        assert_eq!(buffer[(0, 7)].bg, Color::Reset);
+        for y in [1, 6] {
+            for x in 0..20 {
+                assert_eq!(buffer[(x, y)].bg, Color::Reset, "outer gap at {x},{y}");
+            }
+        }
     }
 
     #[test]
@@ -2162,6 +2232,7 @@ mod tests {
                 "",
                 "",
                 "> question",
+                "",
                 "",
                 "first line",
                 "second line",
@@ -2200,6 +2271,7 @@ mod tests {
                 "",
                 "> restored question",
                 "",
+                "",
                 "answer",
                 "",
             ]
@@ -2217,7 +2289,7 @@ mod tests {
             .iter()
             .map(|line| line.to_string().trim_end().to_owned())
             .collect();
-        assert_eq!(rows[..], ["* tool finished", "", "", "> next task", ""]);
+        assert_eq!(rows[..], ["* tool finished", "", "", "> next task", "", ""]);
     }
 
     #[test]

@@ -637,6 +637,75 @@ impl Agents {
             Ok(selected) => selected,
             Err(e) => return format!("error: {e}"),
         };
+        match self.start_selected(&mut g, cfg, provider, task) {
+            Ok((id, Status::Running)) => format!("{id} started"),
+            Ok((id, Status::Queued)) => format!(
+                "{id} queued: {MAX_RUNNING} agents are running; it starts when one finishes"
+            ),
+            Ok((id, _)) => format!("{id} failed to start"),
+            Err(e) => format!("error: {e}"),
+        }
+    }
+
+    /// Run a specifically requested external provider and return its answer unchanged.
+    /// The child still uses the ordinary records, queue, and shutdown path.
+    pub(crate) fn invoke(
+        self: &Arc<Self>,
+        cfg: &Cfg,
+        provider: Provider,
+        task: &str,
+    ) -> Result<String, String> {
+        if provider == Provider::Local {
+            return Err("direct invocation requires an external helper".into());
+        }
+        let id = {
+            let mut g = self.lock();
+            if !g.providers[provider.index()] {
+                return Err(format!(
+                    "helper provider `{}` is not enabled",
+                    provider.name()
+                ));
+            }
+            self.start_selected(&mut g, cfg, provider, task)?.0
+        };
+        let mut g = self.lock();
+        while !g.stopped
+            && g.children
+                .iter()
+                .any(|c| c.info.id == id && !c.info.status.finished())
+        {
+            g = self.changed.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        let c = find(&mut g, &id).ok_or("helper record missing")?;
+        if !c.info.status.finished() {
+            return Err("interrupted: parent session ended".into());
+        }
+        c.delivered = true;
+        let result = if c.info.status == Status::Done {
+            c.result.clone().ok_or("helper returned no result".into())
+        } else {
+            Err(c.error.clone().unwrap_or_else(|| "helper failed".into()))
+        };
+        self.save(c)
+            .map_err(|e| format!("agent record not saved: {e}"))?;
+        result
+    }
+
+    fn start_selected(
+        self: &Arc<Self>,
+        g: &mut State,
+        cfg: &Cfg,
+        provider: Provider,
+        task: &str,
+    ) -> Result<(String, Status), String> {
+        if g.stopped {
+            return Err("the session is ending; no agent was started".into());
+        }
+        if g.queue.len() >= MAX_QUEUED {
+            return Err(format!(
+                "{MAX_QUEUED} agents are already queued; wait for some before spawning more"
+            ));
+        }
         let id = format!("a{}", g.next);
         g.next += 1;
         let child_cfg = Cfg {
@@ -673,26 +742,23 @@ impl Agents {
             unsaved: None,
         };
         if let Err(e) = self.save(&c) {
-            return format!("error: agent record not saved ({e}); no agent was started");
+            return Err(format!(
+                "agent record not saved ({e}); no agent was started"
+            ));
         }
         g.children.push(c);
         g.queue.push_back((id.clone(), child_cfg, provider));
-        self.pump(&mut g);
+        self.pump(g);
         let status = g.children.last().map(|c| c.info.status);
         match status {
-            Some(Status::Running) => format!("{id} started"),
-            Some(Status::Queued) => {
-                format!(
-                    "{id} queued: {MAX_RUNNING} agents are running; it starts when one finishes"
-                )
-            }
-            _ => format!(
+            Some(Status::Running | Status::Queued) => Ok((id, status.unwrap())),
+            _ => Err(format!(
                 "{id} failed to start: {}",
                 g.children
                     .last()
                     .and_then(|c| c.error.clone())
                     .unwrap_or_default()
-            ),
+            )),
         }
     }
 
@@ -863,7 +929,7 @@ impl Agents {
             if let Err(e) = input_result {
                 return Err(format!("{} helper input failed: {e}", provider.name()));
             }
-            parsed.map(|(answer, _, _)| truncate(answer))
+            parsed.map(|(answer, _, _)| answer)
         } else if self.stopped() {
             Err("interrupted: parent session ended".into())
         } else {

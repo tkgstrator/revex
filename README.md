@@ -140,9 +140,10 @@ leaves the choice to the server. An explicit effort is sent as `reasoning_effort
 with Chat Completions or `reasoning.effort` with the Responses API. Available
 values depend on the model and server; a rejected value is reported as an API
 error. An explicit Revex setting takes precedence over `REVEX_EXTRA` for this field.
-Each request also tells the model the effective configured ID and effort so it
-can answer identity questions accurately. If no ID is configured, the backend
-model is reported as unknown; an ID may still be a server alias.
+Each request also includes the effective configured model ID and effort as
+runtime context. Identity questions follow the normal model request path; Revex
+does not generate a fixed answer for them. If no ID is configured, the backend
+model is unknown to Revex; a configured ID may still be a server alias.
 
 ```sh
 export REVEX_BASE_URL=http://localhost:8000/v1
@@ -312,6 +313,13 @@ Bypass Permissions, as selected in setup; those external agents can run commands
 and edit files without another Revex approval. They need their own installed CLI
 and authentication. A failed external start reports an error and does not switch
 providers.
+
+An explicit chat request such as `Codexを呼び出して、モデル名をきいてみて`
+or `Claudeを呼び出して、...` goes straight to the selected external CLI. Revex
+waits for that helper and returns its answer directly, without a local model
+turn or frontier routing. The requested provider must be enabled in helper
+settings; otherwise Revex reports an error. Ordinary mentions of a provider
+still follow the normal conversation path.
 
 At most two helpers run at once; up to eight more queue and start when a slot
 frees. A repeated `wait` reports that the result was already returned instead of

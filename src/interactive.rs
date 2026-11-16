@@ -175,7 +175,10 @@ impl TerminalGuard {
         // ignore this request and continue to send the same CR for both keys.
         if execute!(
             output,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
         )
         .is_ok()
         {
@@ -671,7 +674,7 @@ fn submit_chat(
         }
         "/help" => append(
             view,
-            "/agents  /status  /config  /model [ID] (choose reasoning)  /clear  /exit or exit  Ctrl+D exit  Ctrl+J newline  Alt+Enter newline  Shift+Enter newline when terminal supports it  Ctrl+R retry models",
+            "/agents  /status  /config  /model [ID] (choose reasoning)  /clear  /exit or exit  Ctrl+D exit  Alt+Enter newline  Ctrl+R retry models",
         ),
         _ if line.starts_with("/model") => {
             let id = line.strip_prefix("/model").unwrap_or("").trim();
@@ -2953,8 +2956,14 @@ mod tests {
             &mut exit,
         );
         assert!(view.transcript.last().unwrap().contains("/exit or exit"));
-        assert!(view.transcript.last().unwrap().contains("Ctrl+J newline"));
-        assert!(view.transcript.last().unwrap().contains("Shift+Enter"));
+        assert!(
+            view.transcript
+                .last()
+                .unwrap()
+                .contains("Alt+Enter newline")
+        );
+        assert!(!view.transcript.last().unwrap().contains("Ctrl+J newline"));
+        assert!(!view.transcript.last().unwrap().contains("Shift+Enter"));
         assert!(!exit);
         submit_chat(
             "exit".into(),
@@ -3022,6 +3031,8 @@ mod tests {
         let mut view = tui::View::default();
         setup_view(&mut view, &config);
         view.setup_field = 5;
+        view.setup_helpers = [true, false, false];
+        view.setup_helper_selected = 0;
         let (tx, _rx) = mpsc::channel();
         let mut session = None;
         let mut request = 0;
