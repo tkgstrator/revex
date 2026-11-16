@@ -225,6 +225,8 @@ In the interactive mode these slash commands are available:
 | `/clear` | Clear parent and helper history, state and token totals when no helper is active |
 | `/model [ID]` | Select a model (or provide its ID), then set an optional reasoning effort |
 | `/route [off\|auto\|smart\|local\|remote]` | Show or switch the forwarding mode |
+| `/steer TEXT` | Add an instruction to the active task at its next step |
+| `/queue TEXT` | Run a separate task after the active task finishes |
 | `/status` | Show the active API, model, route, parent state, queued tasks and directory |
 | `/exit` or `exit` | Exit |
 
@@ -233,12 +235,15 @@ In the interactive mode these slash commands are available:
 dropped. If the matching environment variable is set, it still wins on the next start.
 
 The interactive input stays available while a model request or helper runs.
-`/agents` and `/status` work during a task. New natural-language messages steer a
-running model request and remain in the conversation in the order sent. A tool
-already running finishes once before steering applies; later calls from its
-old model reply are skipped. During an external helper CLI call, new messages
-run after that call returns. Ctrl+C hard-cancels the active task and discards
-pending steering messages.
+`/agents` and `/status` work during a task. While busy, Enter sends a new message
+as **Steer**: the current model response finishes, its result stays in the
+conversation, and the new instruction applies at the next model step. A tool
+already running finishes once; later calls from the old model reply are skipped.
+Tab sends a nonempty normal draft as **Queue**, a separate task that starts only
+after the current task finishes. Tab still completes a visible slash suggestion
+first. `/steer TEXT` and `/queue TEXT` choose either behavior explicitly. During
+an external helper CLI call, new messages wait until that call returns. Ctrl+C
+hard-cancels the active task and discards pending steering messages.
 Use Enter to send, Alt+Enter for a newline, PageUp/PageDown to scroll and Esc to
 close an overlay. Terminals that report Shift+Enter or Ctrl+J separately can use
 those for a newline too. Ctrl+D, `/exit` or

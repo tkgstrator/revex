@@ -409,9 +409,8 @@ fn chat(cfg: &Cfg, msgs: &[Value]) -> Result<ChatResult, String> {
     )
 }
 
-/// Interactive requests can be cancelled while the server is still preparing
-/// headers or is silent between SSE chunks. Dropping the future closes the old
-/// request; no detached thread can later run a stale tool reply.
+/// Ctrl+C can cancel a request while the server is preparing headers or is
+/// silent between SSE chunks. Soft steering waits for the current response.
 async fn await_live<F: std::future::Future>(
     ui: &interactive::UiHandle,
     future: F,
@@ -420,9 +419,6 @@ async fn await_live<F: std::future::Future>(
     loop {
         if ui.cancelled() {
             return Err("interrupted".into());
-        }
-        if ui.has_steering() {
-            return Err("steered".into());
         }
         tokio::select! {
             result = &mut future => return Ok(result),
@@ -473,8 +469,8 @@ async fn chat_stream_async(
         .await?
         .map_err(|e| e.to_string())?
     {
-        if ui.has_steering() {
-            return Err("steered".into());
+        if ui.cancelled() {
+            return Err("interrupted".into());
         }
         line_bytes.extend_from_slice(&chunk);
         while let Some(end) = line_bytes.iter().position(|b| *b == b'\n') {
@@ -482,11 +478,7 @@ async fn chat_stream_async(
             let line = std::str::from_utf8(&line)
                 .map_err(|e| format!("invalid provider stream text: {e}"))?
                 .trim_end_matches(['\r', '\n']);
-            if stream.line(line, &mut |chunk| {
-                if !ui.has_steering() {
-                    ui.reasoning_chunk(chunk);
-                }
-            })? {
+            if stream.line(line, &mut |chunk| ui.reasoning_chunk(chunk))? {
                 return stream.finish();
             }
         }
@@ -495,16 +487,12 @@ async fn chat_stream_async(
         }
     }
     if !line_bytes.is_empty() {
-        if ui.has_steering() {
-            return Err("steered".into());
+        if ui.cancelled() {
+            return Err("interrupted".into());
         }
         let line = std::str::from_utf8(&line_bytes)
             .map_err(|e| format!("invalid provider stream text: {e}"))?;
-        stream.line(line, &mut |chunk| {
-            if !ui.has_steering() {
-                ui.reasoning_chunk(chunk);
-            }
-        })?;
+        stream.line(line, &mut |chunk| ui.reasoning_chunk(chunk))?;
     }
     stream.finish()
 }
@@ -2168,7 +2156,8 @@ fn steps(
                 .is_some_and(interactive::UiHandle::cancelled)
     };
     let (mcp, mcp_instructions) = mcp_for_turn(cfg, &cancelled)?;
-    for _ in 0..cfg.max_steps {
+    let mut remaining = cfg.max_steps;
+    while remaining > 0 {
         if stop()
             || cfg
                 .ui
@@ -2177,7 +2166,9 @@ fn steps(
         {
             return Err("interrupted".into());
         }
-        append_steering(cfg, msgs, save)?;
+        if append_steering(cfg, msgs, save)? {
+            remaining = cfg.max_steps;
+        }
         if let Some(ui) = &cfg.ui {
             ui.progress(cfg, "requesting model");
         }
@@ -2204,6 +2195,7 @@ fn steps(
         {
             first["content"] = Value::String(format!("{system}{mcp_instructions}"));
         }
+        remaining -= 1;
         let result = model(cfg, request_messages.as_slice());
         add_usage(cfg, total, result.as_ref().ok().map(|answer| answer.usage));
         if stop()
@@ -2214,17 +2206,21 @@ fn steps(
         {
             return Err("interrupted".into());
         }
-        if append_steering(cfg, msgs, save)? {
-            continue;
-        }
         let ChatResult { text: reply, .. } = result?;
         if reply.trim() == ">>" {
+            if append_steering(cfg, msgs, save)? {
+                remaining = cfg.max_steps;
+            }
             continue;
         }
         msgs.push(json!({"role": "assistant", "content": reply}));
         save(msgs.as_slice())?;
         let calls = parse(&reply);
         if calls.is_empty() {
+            if append_steering(cfg, msgs, save)? {
+                remaining = cfg.max_steps;
+                continue;
+            }
             return Ok(reply.trim().to_string());
         }
         let mut outs = Vec::with_capacity(calls.len());
@@ -2265,6 +2261,9 @@ fn steps(
             json!({"role": "user", "content": format!("<out>\n{}\n</out>", outs.join("\n---\n"))}),
         );
         save(msgs.as_slice())?;
+        if append_steering(cfg, msgs, save)? {
+            remaining = cfg.max_steps;
+        }
     }
     Err(format!(
         "step limit ({}) reached; work so far remains in this conversation. Send a follow-up to continue or raise maxSteps in ~/.revex/settings.json",
@@ -3925,7 +3924,7 @@ mod steering_tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
-    fn steering_discards_stale_tool_reply_and_preserves_both_user_messages() {
+    fn steering_preserves_proposed_tool_and_skips_its_action() {
         let mut cfg = approval_mode_tests::config(std::env::temp_dir(), ApprovalMode::Plan);
         let ui = interactive::steering_test_handle();
         cfg.ui = Some(ui.clone());
@@ -3941,9 +3940,19 @@ mod steering_tests {
             }
             1 => {
                 assert_eq!(request[1]["content"], "original task");
-                assert_eq!(request[2]["content"], "new direction");
-                assert_eq!(request[3]["content"], "one more detail");
-                assert_eq!(request.len(), 4);
+                assert_eq!(
+                    request[2]["content"],
+                    ">> write stale.txt <<EOF\nstale\nEOF"
+                );
+                assert!(
+                    request[3]["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("write skipped after user steering")
+                );
+                assert_eq!(request[4]["content"], "new direction");
+                assert_eq!(request[5]["content"], "one more detail");
+                assert_eq!(request.len(), 6);
                 Ok(ChatResult {
                     text: "revised answer".into(),
                     usage: Usage::default(),
@@ -3963,8 +3972,49 @@ mod steering_tests {
         )
         .unwrap();
         assert_eq!(answer, "revised answer");
-        assert_eq!(messages.len(), 5);
-        assert_eq!(messages[4]["content"], "revised answer");
+        assert_eq!(messages.len(), 7);
+        assert_eq!(messages[6]["content"], "revised answer");
+    }
+
+    #[test]
+    fn steering_after_plain_answer_keeps_that_answer_as_intermediate_history() {
+        let mut cfg = approval_mode_tests::config(std::env::temp_dir(), ApprovalMode::Plan);
+        cfg.max_steps = 1;
+        let ui = interactive::steering_test_handle();
+        cfg.ui = Some(ui.clone());
+        let turns = AtomicUsize::new(0);
+        let model = move |_: &Cfg, request: &[Value]| match turns.fetch_add(1, Ordering::Relaxed) {
+            0 => {
+                ui.queue_steering("another question".into());
+                Ok(ChatResult {
+                    text: "old answer".into(),
+                    usage: Usage::default(),
+                })
+            }
+            1 => {
+                assert_eq!(request[2]["content"], "old answer");
+                assert_eq!(request[3]["content"], "another question");
+                Ok(ChatResult {
+                    text: "new answer".into(),
+                    usage: Usage::default(),
+                })
+            }
+            _ => panic!("unexpected model request"),
+        };
+        let mut messages = fresh_history();
+        messages.push(json!({"role":"user","content":"original"}));
+        let answer = steps(
+            &cfg,
+            &mut messages,
+            &mut UsageTotal::default(),
+            &model,
+            &|| false,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(answer, "new answer");
+        assert_eq!(messages[2]["content"], "old answer");
+        assert_eq!(messages[4]["content"], "new answer");
     }
 
     #[test]

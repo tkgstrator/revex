@@ -132,6 +132,16 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         takes_argument: true,
     },
     SlashCommand {
+        name: "/steer",
+        description: "Add to active task",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/queue",
+        description: "Run after active task",
+        takes_argument: true,
+    },
+    SlashCommand {
         name: "/route",
         description: "Set helper route",
         takes_argument: true,
@@ -1750,8 +1760,8 @@ mod tests {
 
     #[test]
     fn slash_suggestions_filter_and_render_in_narrow_chat() {
-        assert_eq!(slash_matches("/").len(), 9);
-        assert!(slash_matches("/q").is_empty());
+        assert_eq!(slash_matches("/").len(), 11);
+        assert_eq!(slash_matches("/q")[0].name, "/queue");
         assert_eq!(slash_matches("/mo")[0].name, "/model");
         assert!(slash_matches("/model ").is_empty());
         assert!(slash_matches("hello").is_empty());

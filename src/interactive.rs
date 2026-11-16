@@ -815,6 +815,34 @@ fn set_approval_mode(
     }
 }
 
+#[derive(Clone, Copy)]
+enum SubmissionMode {
+    Steer,
+    Queue,
+}
+
+fn submit_task(task: &str, mode: SubmissionMode, view: &mut tui::View, session: &mut Session) {
+    append(view, &format!("You  {task}"));
+    if session.busy {
+        if session.interrupted || matches!(mode, SubmissionMode::Queue) {
+            session.queued.push_back(task.into());
+            append(
+                view,
+                &format!(
+                    "Task queued for after this task ({}).",
+                    session.queued.len()
+                ),
+            );
+        } else if let Some(ui) = &session.cfg.ui {
+            ui.queue_steering(task.into());
+            append(view, "Instruction added; applying at next step.");
+        }
+    } else {
+        begin_turn(view, session);
+        session.start(task.into(), &mut |message| append(view, message));
+    }
+}
+
 fn submit_chat(
     line: String,
     cfg: &mut Cfg,
@@ -822,6 +850,27 @@ fn submit_chat(
     session: &mut Session,
     request: &mut u64,
     exit: &mut bool,
+) {
+    submit_chat_mode(
+        line,
+        cfg,
+        view,
+        session,
+        request,
+        exit,
+        SubmissionMode::Steer,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_chat_mode(
+    line: String,
+    cfg: &mut Cfg,
+    view: &mut tui::View,
+    session: &mut Session,
+    request: &mut u64,
+    exit: &mut bool,
+    normal_mode: SubmissionMode,
 ) {
     let line = line.trim();
     if line.is_empty() {
@@ -885,8 +934,16 @@ fn submit_chat(
         }
         "/help" => append(
             view,
-            "/agents  /status  /config  /model [ID]  /approval [manual|auto|bypass|plan]  /clear  /exit or exit  Ctrl+D exit  Alt+Enter newline  Ctrl+R retry models",
+            "/agents  /status  /config  /model [ID]  /approval [manual|auto|bypass|plan]  /steer TEXT  /queue TEXT  /clear  /exit or exit  Ctrl+D exit  Alt+Enter newline  Ctrl+R retry models",
         ),
+        "/steer" => append(view, "Usage: /steer TEXT"),
+        "/queue" => append(view, "Usage: /queue TEXT"),
+        _ if line.starts_with("/steer ") => {
+            submit_task(line[7..].trim(), SubmissionMode::Steer, view, session)
+        }
+        _ if line.starts_with("/queue ") => {
+            submit_task(line[7..].trim(), SubmissionMode::Queue, view, session)
+        }
         _ if line.starts_with("/model") => {
             let id = line.strip_prefix("/model").unwrap_or("").trim();
             if session.busy
@@ -954,28 +1011,7 @@ fn submit_chat(
         _ if line.starts_with('/') => {
             append(view, "Unknown command. Type /help for available commands.")
         }
-        task => {
-            append(view, &format!("You  {task}"));
-            if session.busy {
-                if session.interrupted {
-                    session.queued.push_back(task.into());
-                    append(view, "Instruction queued after interruption.");
-                } else if let Some(ui) = &session.cfg.ui {
-                    ui.queue_steering(task.into());
-                    append(
-                        view,
-                        if view.model_in_flight {
-                            "Applying new instruction at the next model step."
-                        } else {
-                            "Applying new instruction after the current action."
-                        },
-                    );
-                }
-            } else {
-                begin_turn(view, session);
-                session.start(task.into(), &mut |message| append(view, message));
-            }
-        }
+        task => submit_task(task, normal_mode, view, session),
     }
 }
 
@@ -1500,6 +1536,25 @@ fn handle_chat_key(
             view.cursor = 0;
             view.slash_suggestions_open = false;
             submit_chat(line, cfg, view, session, request, exit);
+        }
+        KeyCode::Tab
+            if key.modifiers.is_empty()
+                && session.busy
+                && !view.input.trim().is_empty()
+                && !view.input.trim_start().starts_with('/') =>
+        {
+            let line = std::mem::take(&mut view.input);
+            view.cursor = 0;
+            view.slash_suggestions_open = false;
+            submit_chat_mode(
+                line,
+                cfg,
+                view,
+                session,
+                request,
+                exit,
+                SubmissionMode::Queue,
+            );
         }
         KeyCode::PageUp => view.scroll = view.scroll.saturating_add(8),
         KeyCode::PageDown => view.scroll = view.scroll.saturating_sub(8),
@@ -3606,9 +3661,66 @@ mod tests {
         assert!(
             view.transcript
                 .iter()
-                .any(|line| line.contains("Applying new instruction at the next model step"))
+                .any(|line| line.contains("Instruction added; applying at next step"))
         );
         assert!(!exit);
+    }
+
+    #[test]
+    fn busy_tab_queues_whole_task_without_steering_and_commands_choose_mode() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let mut config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut active = Session::new(config.clone(), fresh_history(), agents, tx);
+        active.busy = true;
+        let mut session = Some(active);
+        let mut view = tui::View {
+            input: "run this afterward".into(),
+            cursor: "run this afterward".chars().count(),
+            ..tui::View::default()
+        };
+        let mut request = 0;
+        let mut exit = false;
+        handle_chat_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut config,
+            &mut view,
+            &mut session,
+            &mut request,
+            &mut exit,
+        );
+        let active = session.as_mut().unwrap();
+        assert_eq!(
+            active.queued.front().map(String::as_str),
+            Some("run this afterward")
+        );
+        assert!(!active.cfg.ui.as_ref().unwrap().has_steering());
+        assert!(view.input.is_empty());
+        assert!(view.transcript.last().unwrap().contains("Task queued"));
+        submit_chat(
+            "/queue another task".into(),
+            &mut config,
+            &mut view,
+            active,
+            &mut request,
+            &mut exit,
+        );
+        submit_chat(
+            "/steer correction".into(),
+            &mut config,
+            &mut view,
+            active,
+            &mut request,
+            &mut exit,
+        );
+        assert_eq!(
+            active.queued.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["run this afterward", "another task"]
+        );
+        assert_eq!(
+            active.cfg.ui.as_ref().unwrap().take_steering(),
+            ["correction"]
+        );
     }
 
     #[test]
