@@ -227,6 +227,8 @@ In the interactive mode these slash commands are available:
 | `/route [off\|auto\|smart\|local\|remote]` | Show or switch the forwarding mode |
 | `/steer TEXT` | Add an instruction to the active task at its next step |
 | `/queue TEXT` | Run a separate task after the active task finishes |
+| `/goal [--max-turns N] OBJECTIVE` | Save a workspace goal and start its first turn when idle |
+| `/goal status`, `/goal pause`, `/goal resume [--max-turns N]`, `/goal clear` | Inspect, pause, resume or remove the goal |
 | `/status` | Show the active API, model, route, parent state, queued tasks and directory |
 | `/exit` or `exit` | Exit |
 
@@ -244,6 +246,17 @@ after the current task finishes. Tab still completes a visible slash suggestion
 first. `/steer TEXT` and `/queue TEXT` choose either behavior explicitly. During
 an external helper CLI call, new messages wait until that call returns. Ctrl+C
 hard-cancels the active task and discards pending steering messages.
+
+For example, `/goal --max-turns 5 Analyze the parser and verify its error paths`
+starts a saved goal. After each turn, a separate tool-free model check assesses
+the observed result before another turn starts. The default budget is 20 total
+turns (maximum 200). Automatic turns wait for an idle session and yield to
+queued user work; Plan mode does not start them. Ctrl+C and a restart pause the
+goal, and `/goal resume` continues it. Queueing another task during a goal
+turn pauses the goal until resumed. `/clear` removes its saved state too.
+Goal progress is stored beside this workspace's history. Use one active Revex
+session per workspace; concurrent sessions do not lock or reconcile goal state.
+
 Use Enter to send, Alt+Enter for a newline, PageUp/PageDown to scroll and Esc to
 close an overlay. Terminals that report Shift+Enter or Ctrl+J separately can use
 those for a newline too. Ctrl+D, `/exit` or
@@ -367,6 +380,22 @@ ends are stopped and marked `interrupted`.
 
 Because `sh` is the escape hatch, reverse-engineering tools need no dedicated
 wrappers. `objdump`, `otool`, `nm`, `strings`, `radare2` and `lldb` work as they are.
+
+### Plans and reverse engineering reports
+
+For substantial reverse engineering or multistep work, ask Revex to make a plan
+before execution. When file writes are permitted, save it under `docs/plans/`
+in the selected workspace. Include the objective, scope, acceptance checks,
+steps, delegated work, and a read-only Codex scope review when applicable. In
+Plan approval mode, Revex can propose the plan in chat but cannot write the
+file until the mode changes. Trivial questions do not need an artifact.
+
+Save reverse engineering findings as Markdown under `docs/reports/` in the same
+workspace. Separate confirmed findings from uncertain interpretations, cite
+the commands, offsets, symbols or file excerpts behind each finding, and list
+the next checks. Link a related plan and update both documents as evidence
+changes. Keep credentials and other secrets out of these files; inspect the
+evidence before relying on a conclusion.
 
 ## Forwarding to a hosted agent
 

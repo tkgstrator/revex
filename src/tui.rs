@@ -132,6 +132,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         takes_argument: true,
     },
     SlashCommand {
+        name: "/goal",
+        description: "Set or inspect a goal",
+        takes_argument: true,
+    },
+    SlashCommand {
         name: "/steer",
         description: "Add to active task",
         takes_argument: true,
@@ -1760,7 +1765,8 @@ mod tests {
 
     #[test]
     fn slash_suggestions_filter_and_render_in_narrow_chat() {
-        assert_eq!(slash_matches("/").len(), 11);
+        assert_eq!(slash_matches("/").len(), 12);
+        assert_eq!(slash_matches("/go")[0].name, "/goal");
         assert_eq!(slash_matches("/q")[0].name, "/queue");
         assert_eq!(slash_matches("/mo")[0].name, "/model");
         assert!(slash_matches("/model ").is_empty());

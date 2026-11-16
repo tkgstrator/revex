@@ -2,6 +2,7 @@
 //! model and helper threads communicate through events and never read stdin.
 
 use super::*;
+use crate::goals::{self, GoalStatus, GoalStore, GoalVerdict, IdleGate, TurnPermit};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     self as terminal_event, Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -194,6 +195,11 @@ enum Event {
         answer: Sender<bool>,
     },
     Finished(Result<AgentAnswer, String>, Vec<Value>),
+    GoalEvaluated {
+        revision: u64,
+        turn: u32,
+        result: Result<GoalVerdict, String>,
+    },
     ModelsFetched {
         request: u64,
         result: Result<Vec<String>, String>,
@@ -462,6 +468,15 @@ fn activate_chat(
         .map_err(|e| format!("workspace {}: {e}", cfg.cwd.display()))?;
     let history = history_for(&state_dir()?, &cwd);
     let prompt_history = PromptHistory::load(&history)?;
+    let (goal, goal_warning) = match GoalStore::load(&history.path, &history.cwd) {
+        Ok(goal) => (Some(goal), None),
+        Err(error) => (
+            None,
+            Some(format!(
+                "Goal state unavailable; normal chat remains usable. Saved goal file left unchanged: {error}"
+            )),
+        ),
+    };
     let agents = Agents::open(agents_dir(&history), model_fn(chat))?;
     let helper_selection = stored_helper_selection()?;
     agents.set_providers(helper_selection)?;
@@ -483,11 +498,27 @@ fn activate_chat(
     view.transcript.clear();
     seed_transcript(&msgs, view);
     let mut active = Session::new(cfg.clone(), msgs, agents, tx.clone());
+    active.goal = goal;
     active.prompt_history = Some(prompt_history);
     active.helper_selection = helper_selection;
     active.tui = true;
     if let Some(ui) = active.cfg.ui.as_mut() {
         ui.suppress_routine = true;
+    }
+    if let Some(state) = active.goal.as_ref().and_then(GoalStore::status) {
+        append(
+            view,
+            &format!(
+                "Goal {} ({}/{}): {}",
+                state.status.name(),
+                state.turns_used,
+                state.max_turns,
+                state.detail.as_deref().unwrap_or(&state.objective)
+            ),
+        );
+    }
+    if let Some(warning) = goal_warning {
+        append(view, &warning);
     }
     *session = Some(active);
     Ok(())
@@ -785,6 +816,7 @@ fn save_setup(
             view,
             "Settings saved. New requests will use the updated provider.",
         );
+        maybe_start_goal(view, session);
     } else {
         activate_chat(cfg, view, session, tx)?;
     }
@@ -819,6 +851,8 @@ fn set_approval_mode(
     }
     if session.busy {
         append(view, "The new approval mode applies to the next task.");
+    } else {
+        maybe_start_goal(view, session);
     }
 }
 
@@ -828,7 +862,71 @@ enum SubmissionMode {
     Queue,
 }
 
+enum GoalCommand {
+    Status,
+    Pause,
+    Resume(Option<u32>),
+    Clear,
+    Set {
+        objective: String,
+        max_turns: Option<u32>,
+    },
+}
+
+fn parse_goal_turn_limit(text: &str) -> Result<(Option<u32>, &str), String> {
+    let Some(rest) = text.strip_prefix("--max-turns") else {
+        return Ok((None, text));
+    };
+    let rest = rest.trim_start();
+    let (number, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let count = number
+        .parse::<u32>()
+        .map_err(|_| format!("--max-turns needs a number from 1 to {}", goals::MAX_TURNS))?;
+    if !(1..=goals::MAX_TURNS).contains(&count) {
+        return Err(format!(
+            "--max-turns must be from 1 to {}",
+            goals::MAX_TURNS
+        ));
+    }
+    Ok((Some(count), tail.trim()))
+}
+
+fn parse_goal_command(rest: &str) -> Result<GoalCommand, String> {
+    let rest = rest.trim();
+    match rest {
+        "" | "status" => return Ok(GoalCommand::Status),
+        "pause" => return Ok(GoalCommand::Pause),
+        "clear" => return Ok(GoalCommand::Clear),
+        "resume" => return Ok(GoalCommand::Resume(None)),
+        _ => {}
+    }
+    if let Some(arg) = rest.strip_prefix("resume ") {
+        let (max_turns, tail) = parse_goal_turn_limit(arg.trim())?;
+        return if max_turns.is_some() && tail.is_empty() {
+            Ok(GoalCommand::Resume(max_turns))
+        } else {
+            Err("Usage: /goal resume [--max-turns N]".into())
+        };
+    }
+    let (max_turns, objective) = parse_goal_turn_limit(rest)?;
+    if objective.is_empty() {
+        return Err("Usage: /goal [--max-turns N] OBJECTIVE".into());
+    }
+    Ok(GoalCommand::Set {
+        objective: objective.into(),
+        max_turns,
+    })
+}
+
 fn submit_task(task: &str, mode: SubmissionMode, view: &mut tui::View, session: &mut Session) {
+    if (matches!(mode, SubmissionMode::Queue) || !session.busy)
+        && (session.goal_turn.is_some() || session.goal_pending.is_some())
+    {
+        session.pause_goal(
+            "User task took priority; use /goal resume to continue.",
+            &mut |message| append(view, message),
+        );
+    }
     append(view, &format!("You  {task}"));
     if session.busy {
         if session.interrupted || matches!(mode, SubmissionMode::Queue) {
@@ -847,6 +945,87 @@ fn submit_task(task: &str, mode: SubmissionMode, view: &mut tui::View, session: 
     } else {
         begin_turn(view, session);
         session.start(task.into(), &mut |message| append(view, message));
+    }
+}
+
+fn handle_goal_command(rest: &str, view: &mut tui::View, session: &mut Session) {
+    let command = match parse_goal_command(rest) {
+        Ok(command) => command,
+        Err(error) => {
+            append(view, &error);
+            return;
+        }
+    };
+    let Some(goal) = session.goal.as_mut() else {
+        append(view, "Goal state is unavailable for this session.");
+        return;
+    };
+    match command {
+        GoalCommand::Status => {
+            if let Some(state) = goal.status() {
+                append(
+                    view,
+                    &format!(
+                        "Goal {} ({}/{}): {}",
+                        state.status.name(),
+                        state.turns_used,
+                        state.max_turns,
+                        state.detail.as_deref().unwrap_or(&state.objective)
+                    ),
+                );
+            } else {
+                append(view, "No goal is set. Use /goal OBJECTIVE.");
+            }
+        }
+        GoalCommand::Pause => {
+            if goal.status().is_none() {
+                append(view, "No goal is set.");
+            } else {
+                session.pause_goal("Paused by user; use /goal resume.", &mut |message| {
+                    append(view, message)
+                });
+            }
+        }
+        GoalCommand::Resume(max_turns) => {
+            if session.busy {
+                append(view, "Wait for the current task before resuming the goal.");
+                return;
+            }
+            match goal.resume(max_turns) {
+                Ok(()) => {
+                    session.goal_revision = session.goal_revision.wrapping_add(1);
+                    session.goal_schedule_blocked = false;
+                    append(view, "Goal resumed.");
+                    maybe_start_goal(view, session);
+                }
+                Err(error) => append(view, &format!("Goal not resumed: {error}")),
+            }
+        }
+        GoalCommand::Clear => match goal.clear() {
+            Ok(()) => {
+                session.goal_revision = session.goal_revision.wrapping_add(1);
+                session.goal_pending = None;
+                session.goal_schedule_blocked = false;
+                append(view, "Goal cleared.");
+            }
+            Err(error) => append(view, &format!("Goal not cleared: {error}")),
+        },
+        GoalCommand::Set {
+            objective,
+            max_turns,
+        } => match goal.set(&objective, max_turns) {
+            Ok(()) => {
+                session.goal_revision = session.goal_revision.wrapping_add(1);
+                session.goal_pending = None;
+                session.goal_schedule_blocked = false;
+                append(view, "Goal saved.");
+                if session.cfg.approval_mode == ApprovalMode::Plan {
+                    append(view, "Goal will start after leaving plan mode.");
+                }
+                maybe_start_goal(view, session);
+            }
+            Err(error) => append(view, &format!("Goal not set: {error}")),
+        },
     }
 }
 
@@ -928,12 +1107,28 @@ fn submit_chat_mode(
             } else if let Some(msgs) = session.msgs.as_mut() {
                 match clear_history(&session.cfg, msgs) {
                     Ok(()) => {
+                        let goal_error = if let Some(goal) = session.goal.as_mut() {
+                            match goal.clear() {
+                                Ok(()) => {
+                                    session.goal_revision = session.goal_revision.wrapping_add(1);
+                                    session.goal_pending = None;
+                                    session.goal_schedule_blocked = false;
+                                    None
+                                }
+                                Err(error) => Some(error),
+                            }
+                        } else {
+                            None
+                        };
                         view.transcript.clear();
                         view.turn_started = None;
                         view.thinking_started = None;
                         view.last_turn_elapsed = None;
                         view.last_turn_rate = None;
                         append(view, "Session history and agent records cleared.");
+                        if let Some(error) = goal_error {
+                            append(view, &format!("Goal state remains: {error}"));
+                        }
                     }
                     Err(e) => append(view, &format!("History not cleared: {e}")),
                 }
@@ -941,8 +1136,11 @@ fn submit_chat_mode(
         }
         "/help" => append(
             view,
-            "/agents  /status  /config  /model [ID]  /approval [manual|auto|bypass|plan]  /steer TEXT  /queue TEXT  /clear  /exit or exit  Ctrl+D exit  Alt+Enter newline  Ctrl+R retry models",
+            "/agents  /status  /config  /model [ID]  /approval [manual|auto|bypass|plan]  /goal [--max-turns N] OBJECTIVE  /goal status|pause|resume|clear  /steer TEXT  /queue TEXT  /clear  /exit or exit  Ctrl+D exit  Alt+Enter newline  Ctrl+R retry models",
         ),
+        _ if line == "/goal" || line.starts_with("/goal ") => {
+            handle_goal_command(line.strip_prefix("/goal").unwrap_or(""), view, session)
+        }
         "/steer" => append(view, "Usage: /steer TEXT"),
         "/queue" => append(view, "Usage: /queue TEXT"),
         _ if line.starts_with("/steer ") => {
@@ -1043,6 +1241,191 @@ fn complete_turn(view: &mut tui::View, session: &Session) {
     view.last_turn_rate = (requests > 0 && missing == 0 && !elapsed.is_zero())
         .then(|| after.output.saturating_sub(before.output) as f64 / elapsed.as_secs_f64());
     view.last_turn_elapsed = Some(elapsed);
+}
+
+fn goal_idle_gate(session: &Session) -> IdleGate {
+    IdleGate {
+        idle: !session.busy && !session.closed && session.msgs.is_some(),
+        pending_user_work: !session.queued.is_empty()
+            || session.cfg.ui.as_ref().is_some_and(UiHandle::has_steering)
+            || session.goal_pending.is_some()
+            || session.goal_turn.is_some(),
+        pending_approval: session.pending.is_some(),
+        plan_mode: session.cfg.approval_mode == ApprovalMode::Plan,
+        interrupted: session.interrupted || session.cancelled.load(Ordering::Acquire),
+    }
+}
+
+fn maybe_start_goal(view: &mut tui::View, session: &mut Session) {
+    if session.goal_schedule_blocked {
+        return;
+    }
+    let mut gate = goal_idle_gate(session);
+    gate.pending_user_work |= !view.input.trim().is_empty()
+        || view.overlay != tui::Overlay::None
+        || view.page != tui::Page::Chat;
+    let Some(goal) = session.goal.as_mut() else {
+        return;
+    };
+    let previous_status = goal.status().map(|state| state.status);
+    let detail = goal
+        .status()
+        .and_then(|state| state.detail.clone())
+        .unwrap_or_default();
+    let permit = match goal.reserve_turn(gate) {
+        Ok(Some(permit)) => permit,
+        Ok(None) => {
+            if previous_status != goal.status().map(|state| state.status)
+                && goal
+                    .status()
+                    .is_some_and(|state| state.status == GoalStatus::BudgetLimited)
+            {
+                append(
+                    view,
+                    "Goal turn budget reached. Use /goal resume --max-turns N to extend it.",
+                );
+            }
+            return;
+        }
+        Err(error) => {
+            session.goal_schedule_blocked = true;
+            append(view, &format!("Goal could not reserve a turn: {error}"));
+            return;
+        }
+    };
+    let automatic = permit.turn > 1;
+    let task = if automatic {
+        format!(
+            "Continue the goal: {}\nAssessed progress: {}\nMake concrete progress, verify the result, and report what changed.",
+            permit.objective, detail
+        )
+    } else {
+        permit.objective.clone()
+    };
+    let history_start = session.msgs.as_ref().map_or(0, Vec::len);
+    session.goal_turn = Some(GoalTurn {
+        permit,
+        revision: session.goal_revision,
+        history_start,
+        automatic,
+    });
+    let turn = session.goal_turn.as_ref().unwrap().permit.turn;
+    let total = turn + session.goal_turn.as_ref().unwrap().permit.remaining;
+    append(view, &format!("Goal turn {turn}/{total} started."));
+    begin_turn(view, session);
+    session.start(task, &mut |message| append(view, message));
+    if !session.busy {
+        session.goal_turn = None;
+        session.pause_goal(
+            "Could not start goal worker; use /goal resume.",
+            &mut |message| append(view, message),
+        );
+    }
+}
+
+fn prepare_goal_judgement(
+    session: &mut Session,
+    result: &Result<AgentAnswer, String>,
+    msgs: &[Value],
+    view: &mut tui::View,
+) -> Option<(u64, u32, Cfg, String, String, Vec<Value>)> {
+    let turn = session.goal_turn.take()?;
+    let active = turn.revision == session.goal_revision
+        && session
+            .goal
+            .as_ref()
+            .and_then(GoalStore::status)
+            .is_some_and(|state| {
+                state.status == GoalStatus::Active
+                    && state.in_flight
+                    && state.turns_used == turn.permit.turn
+            });
+    if !active || session.interrupted {
+        return None;
+    }
+    let answer = match result {
+        Ok(answer) => answer.text().to_string(),
+        Err(error) => {
+            session.pause_goal(
+                &format!("Goal turn failed: {error}. Use /goal resume to continue."),
+                &mut |message| append(view, message),
+            );
+            return None;
+        }
+    };
+    let turn_messages = msgs.get(turn.history_start..).unwrap_or_default().to_vec();
+    let had_tool_activity = turn_messages.iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|content| content.starts_with("<out>\n"))
+    });
+    let revision = turn.revision;
+    let number = turn.permit.turn;
+    let objective = turn.permit.objective.clone();
+    session.goal_pending = Some(GoalPending {
+        turn,
+        had_tool_activity,
+    });
+    let mut cfg = session.cfg.clone();
+    cfg.ui = None;
+    Some((revision, number, cfg, objective, answer, turn_messages))
+}
+
+fn apply_goal_judgement(
+    session: &mut Session,
+    revision: u64,
+    turn: u32,
+    result: Result<GoalVerdict, String>,
+    view: &mut tui::View,
+) {
+    let valid = session.goal_pending.as_ref().is_some_and(|pending| {
+        pending.turn.revision == revision
+            && pending.turn.permit.turn == turn
+            && session.goal_revision == revision
+    });
+    if !valid {
+        return;
+    }
+    let pending = session.goal_pending.take().unwrap();
+    let Some(goal) = session.goal.as_mut() else {
+        return;
+    };
+    match result {
+        Ok(verdict) => {
+            if let Err(error) =
+                goal.finish_turn(verdict, pending.had_tool_activity, pending.turn.automatic)
+            {
+                append(
+                    view,
+                    &format!("Goal evaluation could not be saved: {error}"),
+                );
+                session.pause_goal(
+                    "Evaluation save failed; use /goal resume.",
+                    &mut |message| append(view, message),
+                );
+                return;
+            }
+            if let Some(state) = goal.status() {
+                append(
+                    view,
+                    &format!(
+                        "Goal {} ({}/{}): {}",
+                        state.status.name(),
+                        state.turns_used,
+                        state.max_turns,
+                        state.detail.as_deref().unwrap_or("")
+                    ),
+                );
+            }
+        }
+        Err(error) => {
+            session.pause_goal(
+                &format!("Evaluation failed: {error}. Use /goal resume to continue."),
+                &mut |message| append(view, message),
+            );
+        }
+    }
+    maybe_start_goal(view, session);
 }
 
 fn handle_setup_key(
@@ -1669,10 +2052,42 @@ fn handle_worker_event(
             view.thinking_text.clear();
             if let Some(session) = session.as_mut() {
                 complete_turn(view, session);
+                let judgement = prepare_goal_judgement(session, &result, &msgs, view);
                 session.finished(result, msgs, &mut |message| append(view, message));
                 if session.busy {
                     begin_turn(view, session);
                 }
+                if let Some((revision, turn, cfg, objective, answer, turn_messages)) = judgement {
+                    let events = session.events.clone();
+                    let spawned = std::thread::Builder::new()
+                        .name("revex-goal-judge".into())
+                        .spawn(move || {
+                            let result = judge_goal(&cfg, &objective, &answer, &turn_messages);
+                            let _ = events.send(Event::GoalEvaluated {
+                                revision,
+                                turn,
+                                result,
+                            });
+                        });
+                    if let Err(error) = spawned {
+                        session.goal_pending = None;
+                        session.pause_goal(
+                            &format!("Evaluation could not start: {error}. Use /goal resume."),
+                            &mut |message| append(view, message),
+                        );
+                    }
+                } else {
+                    maybe_start_goal(view, session);
+                }
+            }
+        }
+        Event::GoalEvaluated {
+            revision,
+            turn,
+            result,
+        } => {
+            if let Some(session) = session.as_mut() {
+                apply_goal_judgement(session, revision, turn, result, view);
             }
         }
         Event::ModelsFetched {
@@ -1792,12 +2207,28 @@ pub(crate) fn run_tui(mut cfg: Cfg) -> Result<(), String> {
             handle_worker_event(event, &mut view, &mut session, request);
             dirty = true;
         }
+        if let Some(active) = session.as_mut() {
+            let before = view.transcript.len();
+            let was_busy = active.busy;
+            maybe_start_goal(&mut view, active);
+            if view.transcript.len() != before || active.busy != was_busy {
+                dirty = true;
+            }
+        }
         if session.as_ref().is_some_and(|s| s.closed) {
             break;
         }
         if let Some(session) = session.as_ref() {
             let main = &session.agents.snapshot()[0];
-            let status = format!("{}  |  {} queued", main.status.name(), session.queued.len());
+            let mut status = format!("{}  |  {} queued", main.status.name(), session.queued.len());
+            if let Some(goal) = session.goal.as_ref().and_then(GoalStore::status) {
+                status.push_str(&format!(
+                    "  |  goal {} {}/{}",
+                    goal.status.name(),
+                    goal.turns_used,
+                    goal.max_turns
+                ));
+            }
             if view.status != status {
                 view.status = status;
                 dirty = true;
@@ -2479,6 +2910,23 @@ struct Session {
     prompt_history: Option<PromptHistory>,
     helper_selection: [bool; 3],
     tui: bool,
+    goal: Option<GoalStore>,
+    goal_revision: u64,
+    goal_turn: Option<GoalTurn>,
+    goal_pending: Option<GoalPending>,
+    goal_schedule_blocked: bool,
+}
+
+struct GoalTurn {
+    permit: TurnPermit,
+    revision: u64,
+    history_start: usize,
+    automatic: bool,
+}
+
+struct GoalPending {
+    turn: GoalTurn,
+    had_tool_activity: bool,
 }
 
 impl Session {
@@ -2507,14 +2955,48 @@ impl Session {
             prompt_history: None,
             helper_selection: [true, false, false],
             tui: false,
+            goal: None,
+            goal_revision: 0,
+            goal_turn: None,
+            goal_pending: None,
+            goal_schedule_blocked: false,
+        }
+    }
+
+    fn pause_goal(&mut self, reason: &str, out: &mut dyn FnMut(&str)) {
+        let Some(goal) = self.goal.as_mut() else {
+            return;
+        };
+        if goal
+            .status()
+            .is_some_and(|state| state.status == GoalStatus::Active)
+        {
+            match goal.pause(reason) {
+                Ok(()) => {
+                    self.goal_revision = self.goal_revision.wrapping_add(1);
+                    self.goal_pending = None;
+                    out(&format!("Goal paused: {reason}"));
+                }
+                Err(error) => out(&format!("Goal could not be paused: {error}")),
+            }
         }
     }
 
     fn interrupt_turn(&mut self, out: &mut dyn FnMut(&str)) {
         if !self.busy {
-            out("No task is running. Ctrl+D exits Revex.");
+            if self
+                .goal
+                .as_ref()
+                .and_then(GoalStore::status)
+                .is_some_and(|state| state.status == GoalStatus::Active)
+            {
+                self.pause_goal("Interrupted; use /goal resume to continue.", out);
+            } else {
+                out("No task is running. Ctrl+D exits Revex.");
+            }
             return;
         }
+        self.pause_goal("Interrupted; use /goal resume to continue.", out);
         self.cancelled.store(true, Ordering::Release);
         #[cfg(unix)]
         if let Some(ui) = &self.cfg.ui
@@ -2575,6 +3057,7 @@ impl Session {
     }
 
     fn close(&mut self, out: &mut dyn FnMut(&str)) {
+        self.pause_goal("Session ended; use /goal resume to continue.", out);
         self.cancelled.store(true, Ordering::Release);
         #[cfg(unix)]
         if let Some(ui) = &self.cfg.ui
@@ -2787,6 +3270,7 @@ fn run_loop(
                 }
             }
             Ok(Event::Finished(result, msgs)) => session.finished(result, msgs, out),
+            Ok(Event::GoalEvaluated { .. }) => {}
             Ok(Event::ModelsFetched { .. }) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => session.close(out),
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -2949,6 +3433,179 @@ mod tests {
             role: Role::Parent(Some(agents.clone())),
             ui: None,
         }
+    }
+
+    #[test]
+    fn goal_command_parses_controls_and_turn_limit() {
+        assert!(matches!(parse_goal_command(""), Ok(GoalCommand::Status)));
+        assert!(matches!(
+            parse_goal_command("status"),
+            Ok(GoalCommand::Status)
+        ));
+        assert!(matches!(
+            parse_goal_command("pause"),
+            Ok(GoalCommand::Pause)
+        ));
+        assert!(matches!(
+            parse_goal_command("resume --max-turns 30"),
+            Ok(GoalCommand::Resume(Some(30)))
+        ));
+        assert!(matches!(
+            parse_goal_command("clear"),
+            Ok(GoalCommand::Clear)
+        ));
+        assert!(matches!(
+            parse_goal_command("--max-turns 4 inspect parser"),
+            Ok(GoalCommand::Set { objective, max_turns: Some(4) }) if objective == "inspect parser"
+        ));
+        assert!(parse_goal_command("--max-turns nope inspect parser").is_err());
+        assert!(parse_goal_command("--max-turns 4").is_err());
+    }
+
+    #[test]
+    fn queued_user_task_pauses_goal_and_skips_old_turn_judgement() {
+        let dir = temp_dir("goal-queue-priority");
+        let history = history_for(&dir, Path::new("/work/goal-queue-priority"));
+        let mut goal = GoalStore::load(&history.path, &history.cwd).unwrap();
+        goal.set("Inspect parser", Some(3)).unwrap();
+        let permit = goal
+            .reserve_turn(IdleGate {
+                idle: true,
+                ..IdleGate::default()
+            })
+            .unwrap()
+            .unwrap();
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let config = cfg(dir.clone(), "http://unused".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut session = Session::new(config, fresh_history(), agents, tx);
+        session.goal = Some(goal);
+        session.goal_turn = Some(GoalTurn {
+            permit,
+            revision: 0,
+            history_start: 1,
+            automatic: false,
+        });
+        session.busy = true;
+        let mut view = tui::View::default();
+        submit_task(
+            "User's next task",
+            SubmissionMode::Queue,
+            &mut view,
+            &mut session,
+        );
+        assert_eq!(
+            session.queued.front().map(String::as_str),
+            Some("User's next task")
+        );
+        assert_eq!(
+            session.goal.as_ref().unwrap().status().unwrap().status,
+            GoalStatus::Paused
+        );
+        assert_eq!(session.goal_revision, 1);
+        assert!(
+            prepare_goal_judgement(
+                &mut session,
+                &Ok(AgentAnswer::Streamed("old answer".into())),
+                &fresh_history(),
+                &mut view
+            )
+            .is_none()
+        );
+        assert!(session.goal_pending.is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn paused_goal_ignores_late_evaluator_result() {
+        let dir = temp_dir("goal-stale-evaluator");
+        let history = history_for(&dir, Path::new("/work/goal-stale-evaluator"));
+        let mut goal = GoalStore::load(&history.path, &history.cwd).unwrap();
+        goal.set("Inspect parser", Some(3)).unwrap();
+        let permit = goal
+            .reserve_turn(IdleGate {
+                idle: true,
+                ..IdleGate::default()
+            })
+            .unwrap()
+            .unwrap();
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let config = cfg(dir.clone(), "http://unused".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut session = Session::new(config, fresh_history(), agents, tx);
+        session.goal = Some(goal);
+        session.goal_pending = Some(GoalPending {
+            turn: GoalTurn {
+                permit,
+                revision: 0,
+                history_start: 1,
+                automatic: false,
+            },
+            had_tool_activity: true,
+        });
+        let mut view = tui::View::default();
+        handle_goal_command("pause", &mut view, &mut session);
+        apply_goal_judgement(
+            &mut session,
+            0,
+            1,
+            Ok(GoalVerdict::Complete {
+                evidence: "stale conclusion".into(),
+            }),
+            &mut view,
+        );
+        let state = session.goal.as_ref().unwrap().status().unwrap();
+        assert_eq!(state.status, GoalStatus::Paused);
+        assert_eq!(state.turns_used, 1);
+        assert!(session.goal_pending.is_none());
+        handle_goal_command("clear", &mut view, &mut session);
+        apply_goal_judgement(
+            &mut session,
+            0,
+            1,
+            Ok(GoalVerdict::Complete {
+                evidence: "another stale conclusion".into(),
+            }),
+            &mut view,
+        );
+        assert!(session.goal.as_ref().unwrap().status().is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn failed_goal_reservation_reports_once_and_never_starts_worker() {
+        let dir = temp_dir("goal-reservation-error");
+        let history = history_for(&dir, Path::new("/work/goal-reservation-error"));
+        let mut goal = GoalStore::load(&history.path, &history.cwd).unwrap();
+        goal.set("Inspect parser", Some(2)).unwrap();
+        let sidecar = history.path.with_extension("goal.json");
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::create_dir(&sidecar).unwrap();
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let config = cfg(dir.clone(), "http://unused".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut session = Session::new(config, fresh_history(), agents, tx);
+        session.goal = Some(goal);
+        let mut view = tui::View {
+            page: tui::Page::Chat,
+            ..tui::View::default()
+        };
+        maybe_start_goal(&mut view, &mut session);
+        maybe_start_goal(&mut view, &mut session);
+        assert!(!session.busy);
+        assert!(session.goal_schedule_blocked);
+        assert_eq!(
+            view.transcript
+                .iter()
+                .filter(|line| line.contains("Goal could not reserve a turn"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            session.goal.as_ref().unwrap().status().unwrap().turns_used,
+            0
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

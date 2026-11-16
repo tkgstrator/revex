@@ -35,6 +35,14 @@ def auth_file(home):
     return pathlib.Path(home, ".revex", "auth.json")
 
 
+def goal_file(home, cwd):
+    identity = str(pathlib.Path(cwd).resolve()).encode()
+    value = 0xCBF29CE484222325
+    for byte in identity:
+        value = ((value ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return pathlib.Path(home, ".local/state/revex", f"history-{value:016x}.goal.json")
+
+
 def seed_settings(home, data):
     path = settings_file(home)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -477,6 +485,89 @@ class FakeHelperDispatchServer:
         if self.error:
             raise self.error
         assert self.finished.is_set(), "helper dispatch server did not finish"
+
+
+class FakeGoalServer:
+    """Two tool-bearing turns and independent tool-free goal judgements."""
+
+    def __init__(self):
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(8)
+        self.listener.settimeout(8)
+        self.base = f"http://127.0.0.1:{self.listener.getsockname()[1]}"
+        self.requests = []
+        self.finished = threading.Event()
+        self.error = None
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        try:
+            while len(self.requests) < 6:
+                conn, _ = self.listener.accept()
+                conn.settimeout(5)
+                with conn:
+                    head = b""
+                    while b"\r\n\r\n" not in head:
+                        head += conn.recv(4096)
+                    headers, body_read = head.split(b"\r\n\r\n", 1)
+                    length = next(
+                        (int(line.split(b":", 1)[1].strip()) for line in headers.split(b"\r\n")
+                         if line.lower().startswith(b"content-length:")), 0
+                    )
+                    while len(body_read) < length:
+                        body_read += conn.recv(4096)
+                    if b"GET /models" in headers:
+                        body = b'{"data":[{"id":"fake-goal"}]}'
+                        conn.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                            + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                            + body
+                        )
+                        continue
+                    assert b"POST /chat/completions" in headers
+                    request = json.loads(body_read[:length])
+                    self.requests.append(request)
+                    number = len(self.requests)
+                    is_judge = "tool-free evaluator" in request["messages"][0]["content"]
+                    if number == 1:
+                        assert not is_judge
+                        reply = ">> read evidence.txt"
+                    elif number == 2:
+                        assert not is_judge
+                        reply = "Initial parser trace collected."
+                    elif number == 3:
+                        assert is_judge
+                        reply = json.dumps({
+                            "status": "continue", "progress": True,
+                            "evidence": "Parser trace collected; verify it once more.", "quote": "",
+                        })
+                    elif number == 4:
+                        assert not is_judge
+                        assert "Continue the goal" in request["messages"][-1]["content"]
+                        reply = ">> read evidence.txt"
+                    elif number == 5:
+                        assert not is_judge
+                        reply = "Validated parser trace."
+                    else:
+                        assert is_judge
+                        reply = json.dumps({
+                            "status": "complete", "progress": True,
+                            "evidence": "The evidence file confirms the parser behavior.",
+                            "quote": "parser verified in evidence file",
+                        })
+                    sse(conn, reply)
+            self.finished.set()
+        except Exception as exc:
+            self.error = exc
+
+    def close(self):
+        self.thread.join(timeout=8)
+        self.listener.close()
+        if self.error:
+            raise self.error
+        assert self.finished.is_set(), "goal server did not finish"
 
 
 class FakeSingleReplyServer:
@@ -1470,6 +1561,57 @@ class TuiPtyTests(unittest.TestCase):
                 self.assertIn("--ephemeral", review_args)
                 self.assertIn("--ignore-user-config", review_args)
                 self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", review_args)
+                terminal.send(b"/exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_goal_continues_once_then_completes_from_tool_evidence(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            pathlib.Path(cwd, "evidence.txt").write_text("parser verified in evidence file\n")
+            server = FakeGoalServer()
+            seed_settings(home, {"base_url": server.base, "model": "fake-goal"})
+            terminal = Terminal(cwd, home)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"/goal Inspect parser evidence.\r")
+                terminal.wait_for_screen("Goal complete (2/20)", seconds=12)
+                self.assertTrue(server.finished.is_set())
+                self.assertEqual(len(server.requests), 6)
+                self.assertIn(
+                    "Inspect parser evidence.",
+                    server.requests[0]["messages"][-1]["content"],
+                )
+                goal_files = list(pathlib.Path(home, ".local/state/revex").rglob("*.goal.json"))
+                self.assertEqual(len(goal_files), 1)
+                state = json.loads(goal_files[0].read_text())["goal"]
+                self.assertEqual(state["status"], "complete")
+                self.assertEqual(state["turns_used"], 2)
+                terminal.send(b"/exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_corrupt_goal_sidecar_warns_but_normal_chat_still_works(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            sidecar = goal_file(home, cwd)
+            sidecar.parent.mkdir(parents=True)
+            sidecar.write_bytes(b"{malformed-goal")
+            server = FakeSingleReplyServer()
+            seed_settings(home, {"base_url": server.base, "model": "fake-model"})
+            terminal = Terminal(cwd, home)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("Goal state unavailable")
+                terminal.send(b"Normal chat still works\r")
+                terminal.wait_for_screen("multiline done")
+                self.assertEqual(sidecar.read_bytes(), b"{malformed-goal")
+                self.assertEqual(len(server.requests), 1)
                 terminal.send(b"/exit\r")
                 terminal.exit()
             finally:
