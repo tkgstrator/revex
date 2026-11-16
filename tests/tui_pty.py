@@ -230,7 +230,7 @@ def sse(conn, text):
 
 
 class FakeServer:
-    def __init__(self):
+    def __init__(self, first_reply=None):
         self.listener = socket.socket()
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen(8)
@@ -240,6 +240,8 @@ class FakeServer:
         self.release = threading.Event()
         self.finished = threading.Event()
         self.error = None
+        self.requests = []
+        self.first_reply = first_reply or ">> write edited.txt <<EOF\nchanged\nEOF"
         self.thread = threading.Thread(target=self.serve, daemon=True)
         self.thread.start()
 
@@ -269,11 +271,17 @@ class FakeServer:
                         )
                         continue
                     assert b"POST /chat/completions" in headers
+                    while len(body_read) < length:
+                        body_read += conn.recv(4096)
+                    self.requests.append(json.loads(body_read[:length]))
                     posts += 1
                     if posts == 1:
                         self.blocked.set()
                         assert self.release.wait(5), "first model reply was never released"
-                        sse(conn, ">> write edited.txt <<EOF\nchanged\nEOF")
+                        try:
+                            sse(conn, self.first_reply)
+                        except BrokenPipeError:
+                            pass  # steering may abort the old model response
                     else:
                         sse(conn, "done")
             self.finished.set()
@@ -287,6 +295,69 @@ class FakeServer:
         if self.error:
             raise self.error
         assert self.finished.is_set(), "fake server did not finish"
+
+
+class FakeNoReleaseSteeringServer:
+    """Keep the first model response header blocked while serving the steered request."""
+
+    def __init__(self):
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(8)
+        self.listener.settimeout(6)
+        self.base = f"http://127.0.0.1:{self.listener.getsockname()[1]}"
+        self.first_started = threading.Event()
+        self.second_finished = threading.Event()
+        self.requests = []
+        self.first_conn = None
+        self.error = None
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        try:
+            while len(self.requests) < 2:
+                conn, _ = self.listener.accept()
+                conn.settimeout(4)
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    data += conn.recv(4096)
+                headers, body = data.split(b"\r\n\r\n", 1)
+                length = 0
+                for line in headers.split(b"\r\n"):
+                    if line.lower().startswith(b"content-length:"):
+                        length = int(line.split(b":", 1)[1].strip())
+                while len(body) < length:
+                    body += conn.recv(4096)
+                if b"GET /models" in headers:
+                    payload = b'{"data":[{"id":"fake-model"}]}'
+                    conn.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        + f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode()
+                        + payload
+                    )
+                    conn.close()
+                    continue
+                assert b"POST /chat/completions" in headers
+                self.requests.append(json.loads(body[:length]))
+                if len(self.requests) == 1:
+                    self.first_conn = conn
+                    self.first_started.set()
+                    continue  # Deliberately send no HTTP response headers.
+                sse(conn, "steered final answer")
+                conn.close()
+                self.second_finished.set()
+        except Exception as exc:
+            self.error = exc
+
+    def close(self):
+        if self.first_conn is not None:
+            self.first_conn.close()
+        self.thread.join(timeout=7)
+        self.listener.close()
+        if self.error:
+            raise self.error
+        assert self.second_finished.is_set(), "second model request was not served"
 
 
 class FakeHelperDispatchServer:
@@ -1384,6 +1455,104 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.send(b"/exit\r")
                 terminal.exit()
             finally:
+                terminal.close()
+                server.close()
+
+    def test_new_chat_steers_blocked_model_without_running_stale_tool(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            server = FakeServer()
+            terminal = Terminal(cwd, home, {"REVEX_BASE_URL": server.base, "REVEX_MODEL": "fake-model"})
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"edit file\r")
+                self.assertTrue(server.blocked.wait(4), "first model request did not start")
+                terminal.wait_for_screen("Thinking")
+                terminal.send(b"instead summarize\r")
+                terminal.wait_for_screen("Applying new instruction at the next model step")
+                server.release.set()
+                self.assertTrue(server.finished.wait(5), "steered model request did not complete")
+                terminal.wait_for_screen("done")
+                self.assertFalse(pathlib.Path(cwd, "edited.txt").exists())
+                second = server.requests[1]["messages"]
+                contents = [m["content"] for m in second if m["role"] == "user"]
+                self.assertIn("edit file", contents[0])
+                self.assertIn("instead summarize", contents[-1])
+                self.assertFalse(any("write edited.txt" in m["content"] for m in second))
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_new_chat_aborts_model_waiting_for_response_headers(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            server = FakeNoReleaseSteeringServer()
+            terminal = Terminal(cwd, home, {"REVEX_BASE_URL": server.base, "REVEX_MODEL": "fake-model"})
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"original task\r")
+                self.assertTrue(server.first_started.wait(4), "first HTTP request did not start")
+                terminal.send(b"new direction\r")
+                terminal.wait_for_screen("Applying new instruction at the next model step")
+                self.assertTrue(
+                    server.second_finished.wait(3),
+                    "steered request waited for the first response headers",
+                )
+                terminal.wait_for_screen("steered final answer")
+                second = server.requests[1]["messages"]
+                users = [m["content"] for m in second if m["role"] == "user"]
+                self.assertIn("original task", users[0])
+                self.assertIn("new direction", users[-1])
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_steering_waits_for_active_tool_and_skips_later_calls(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            script = pathlib.Path(cwd, "hold-tool.sh")
+            script.write_text(
+                "#!/bin/sh\n"
+                "printf 'first\\n' >> trace.txt\n"
+                "while [ ! -f release-tool ]; do sleep 0.02; done\n"
+                "printf 'completed\\n' >> trace.txt\n"
+            )
+            script.chmod(0o755)
+            server = FakeServer(
+                first_reply=">> sh ./hold-tool.sh\n>> sh printf 'second\\n' >> trace.txt"
+            )
+            seed_settings(home, {"approvalMode": "bypass"})
+            terminal = Terminal(cwd, home, {"REVEX_BASE_URL": server.base, "REVEX_MODEL": "fake-model"})
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"do work\r")
+                self.assertTrue(server.blocked.wait(4))
+                server.release.set()
+                trace = pathlib.Path(cwd, "trace.txt")
+                deadline = time.monotonic() + 4
+                while not trace.exists() and time.monotonic() < deadline:
+                    terminal.read_for(0.05)
+                self.assertTrue(trace.exists(), "first tool never started")
+                terminal.send(b"change direction\r")
+                terminal.wait_for_screen("Applying new instruction after the current action")
+                pathlib.Path(cwd, "release-tool").touch()
+                self.assertTrue(server.finished.wait(5), "follow-up model request did not complete")
+                terminal.wait_for_screen("done")
+                self.assertEqual(trace.read_text().splitlines(), ["first", "completed"])
+                second = server.requests[1]["messages"]
+                self.assertIn("change direction", second[-1]["content"])
+                self.assertTrue(any("<out>" in m["content"] for m in second))
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                pathlib.Path(cwd, "release-tool").touch()
                 terminal.close()
                 server.close()
 

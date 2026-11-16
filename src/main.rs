@@ -358,6 +358,15 @@ fn chat(cfg: &Cfg, msgs: &[Value]) -> Result<ChatResult, String> {
     add_runtime_model_context(&mut body, cfg.api, cfg.response_language);
     add_active_task_language_reminder(&mut body, cfg.api, cfg.response_language);
     let url = format!("{}/{path}", cfg.base);
+    if matches!(cfg.role, Role::Parent(_))
+        && let Some(ui) = &cfg.ui
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("cannot start model request: {e}"))?;
+        return runtime.block_on(chat_stream_async(cfg, &url, body, ui));
+    }
     let post = |body: &Value| {
         ureq::post(&url)
             .set("Authorization", &format!("Bearer {}", cfg.key))
@@ -398,6 +407,106 @@ fn chat(cfg: &Cfg, msgs: &[Value]) -> Result<ChatResult, String> {
             }
         },
     )
+}
+
+/// Interactive requests can be cancelled while the server is still preparing
+/// headers or is silent between SSE chunks. Dropping the future closes the old
+/// request; no detached thread can later run a stale tool reply.
+async fn await_live<F: std::future::Future>(
+    ui: &interactive::UiHandle,
+    future: F,
+) -> Result<F::Output, String> {
+    let mut future = Box::pin(future);
+    loop {
+        if ui.cancelled() {
+            return Err("interrupted".into());
+        }
+        if ui.has_steering() {
+            return Err("steered".into());
+        }
+        tokio::select! {
+            result = &mut future => return Ok(result),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+}
+
+async fn chat_stream_async(
+    cfg: &Cfg,
+    url: &str,
+    mut body: Value,
+    ui: &interactive::UiHandle,
+) -> Result<ChatResult, String> {
+    // ureq's default transport does not read proxy settings from the environment.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(|e| format!("cannot create model client: {e}"))?;
+    let send = |body: &Value| {
+        client
+            .post(url)
+            .bearer_auth(&cfg.key)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+    };
+    let mut response = await_live(ui, send(&body))
+        .await?
+        .map_err(|e| e.to_string())?;
+    if matches!(response.status().as_u16(), 400 | 422) && body.get("stream_options").is_some() {
+        body.as_object_mut()
+            .map(|object| object.remove("stream_options"));
+        response = await_live(ui, send(&body))
+            .await?
+            .map_err(|e| e.to_string())?;
+        if response.status().is_success() {
+            mark_stream_usage_rejected(&cfg.base);
+        }
+    }
+    if !response.status().is_success() {
+        return Err(format!("model request failed: HTTP {}", response.status()));
+    }
+
+    let mut stream = SseState::new(cfg.api, cfg.quiet);
+    let mut line_bytes = Vec::new();
+    while let Some(chunk) = await_live(ui, response.chunk())
+        .await?
+        .map_err(|e| e.to_string())?
+    {
+        if ui.has_steering() {
+            return Err("steered".into());
+        }
+        line_bytes.extend_from_slice(&chunk);
+        while let Some(end) = line_bytes.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = line_bytes.drain(..=end).collect();
+            let line = std::str::from_utf8(&line)
+                .map_err(|e| format!("invalid provider stream text: {e}"))?
+                .trim_end_matches(['\r', '\n']);
+            if stream.line(line, &mut |chunk| {
+                if !ui.has_steering() {
+                    ui.reasoning_chunk(chunk);
+                }
+            })? {
+                return stream.finish();
+            }
+        }
+        if line_bytes.len() > 1024 * 1024 {
+            return Err("provider stream line exceeds 1 MiB".into());
+        }
+    }
+    if !line_bytes.is_empty() {
+        if ui.has_steering() {
+            return Err("steered".into());
+        }
+        let line = std::str::from_utf8(&line_bytes)
+            .map_err(|e| format!("invalid provider stream text: {e}"))?;
+        stream.line(line, &mut |chunk| {
+            if !ui.has_steering() {
+                ui.reasoning_chunk(chunk);
+            }
+        })?;
+    }
+    stream.finish()
 }
 
 /// Tell the model only what this request actually selected. A configured ID may
@@ -534,37 +643,61 @@ fn read_stream_with_reasoning(
     quiet: bool,
     on_reasoning: &mut dyn FnMut(&str),
 ) -> Result<ChatResult, String> {
-    const MAX_REASONING_BYTES: usize = 16 * 1024;
-    let mut full = String::new();
-    let mut usage = Usage::default();
-    let mut reasoning_bytes = 0;
-    let mut cut = false;
-    let mut completed = false;
+    let mut stream = SseState::new(api, quiet);
     for line in input.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => return Err(e.to_string()),
-        };
-        if !quiet && std::env::var_os("REVEX_DEBUG").is_some() {
+        if stream.line(&line.map_err(|e| e.to_string())?, on_reasoning)? {
+            break;
+        }
+    }
+    stream.finish()
+}
+
+struct SseState {
+    api: Api,
+    quiet: bool,
+    full: String,
+    usage: Usage,
+    reasoning_bytes: usize,
+    cut: bool,
+    completed: bool,
+}
+
+impl SseState {
+    fn new(api: Api, quiet: bool) -> Self {
+        Self {
+            api,
+            quiet,
+            full: String::new(),
+            usage: Usage::default(),
+            reasoning_bytes: 0,
+            cut: false,
+            completed: false,
+        }
+    }
+
+    /// Returns true on the terminal SSE event. All other events leave the stream open.
+    fn line(&mut self, line: &str, on_reasoning: &mut dyn FnMut(&str)) -> Result<bool, String> {
+        const MAX_REASONING_BYTES: usize = 16 * 1024;
+        if !self.quiet && std::env::var_os("REVEX_DEBUG").is_some() {
             eprintln!("[raw] {line}");
         }
         let Some(data) = line.strip_prefix("data: ") else {
-            continue;
+            return Ok(false);
         };
         if data == "[DONE]" {
-            if api == Api::Chat {
-                completed = true;
+            if self.api == Api::Chat {
+                self.completed = true;
             }
-            break;
+            return Ok(true);
         }
         let Ok(v) = serde_json::from_str::<Value>(data) else {
-            continue;
+            return Ok(false);
         };
-        let (delta, reasoning_delta) = match api {
+        let (delta, reasoning_delta) = match self.api {
             Api::Chat => {
                 if let Some(u) = Usage::from_json(&v["usage"], "prompt_tokens", "completion_tokens")
                 {
-                    usage = u;
+                    self.usage = u;
                 }
                 if v["choices"][0]["finish_reason"] == "content_filter"
                     || v["choices"][0]["delta"]["refusal"].is_string()
@@ -581,7 +714,7 @@ fn read_stream_with_reasoning(
                 "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                     (None, v["delta"].as_str())
                 }
-                "response.refusal.delta" | "response.refusal.done" if !cut => {
+                "response.refusal.delta" | "response.refusal.done" if !self.cut => {
                     return Err("refused by model/provider (refusal)".into());
                 }
                 "response.incomplete" => {
@@ -601,55 +734,62 @@ fn read_stream_with_reasoning(
                     if let Some(u) =
                         Usage::from_json(&v["response"]["usage"], "input_tokens", "output_tokens")
                     {
-                        usage = u;
+                        self.usage = u;
                     }
-                    completed = true;
-                    break;
+                    self.completed = true;
+                    return Ok(true);
                 }
                 _ => (None, None),
             },
         };
-        if cut {
-            continue;
+        if self.cut {
+            return Ok(false);
         }
         if let Some(t) = reasoning_delta
-            && reasoning_bytes < MAX_REASONING_BYTES
+            && self.reasoning_bytes < MAX_REASONING_BYTES
         {
-            let mut end = t.len().min(MAX_REASONING_BYTES - reasoning_bytes);
+            let mut end = t.len().min(MAX_REASONING_BYTES - self.reasoning_bytes);
             while !t.is_char_boundary(end) {
                 end -= 1;
             }
             if end > 0 {
                 on_reasoning(&t[..end]);
-                reasoning_bytes += end;
+                self.reasoning_bytes += end;
             }
         }
         if let Some(t) = delta {
-            full.push_str(t);
+            self.full.push_str(t);
             // The Responses API has no `stop`, so cut at the marker here.
-            if api == Api::Responses
-                && let Some(i) = full.find("<out>")
+            if self.api == Api::Responses
+                && let Some(i) = self.full.find("<out>")
             {
-                let kept = i.saturating_sub(full.len() - t.len());
-                if !quiet {
+                let kept = i.saturating_sub(self.full.len() - t.len());
+                if !self.quiet {
                     eprint!("{}", &t[..kept]);
                 }
-                full.truncate(i);
-                cut = true;
-                continue;
+                self.full.truncate(i);
+                self.cut = true;
+                return Ok(false);
             }
-            if !quiet {
+            if !self.quiet {
                 eprint!("{t}");
             }
         }
+        Ok(false)
     }
-    if !quiet {
-        eprintln!();
+
+    fn finish(self) -> Result<ChatResult, String> {
+        if !self.quiet {
+            eprintln!();
+        }
+        if !self.completed {
+            return Err("provider stream ended before completion".into());
+        }
+        Ok(ChatResult {
+            text: self.full,
+            usage: self.usage,
+        })
     }
-    if !completed {
-        return Err("provider stream ended before completion".into());
-    }
-    Ok(ChatResult { text: full, usage })
 }
 
 enum Call {
@@ -1989,6 +2129,29 @@ fn mcp_from_maps(
     (Some(client), mcp_prompt(&discovery))
 }
 
+fn append_steering(
+    cfg: &Cfg,
+    msgs: &mut Vec<Value>,
+    save: &mut dyn FnMut(&[Value]) -> Result<(), String>,
+) -> Result<bool, String> {
+    if !matches!(cfg.role, Role::Parent(_)) {
+        return Ok(false);
+    }
+    let Some(ui) = &cfg.ui else {
+        return Ok(false);
+    };
+    let pending = ui.take_steering();
+    if pending.is_empty() {
+        return Ok(false);
+    }
+    for task in pending {
+        msgs.push(json!({"role": "user", "content": task}));
+    }
+    save(msgs.as_slice())?;
+    ui.progress(cfg, "steering with new input");
+    Ok(true)
+}
+
 fn steps(
     cfg: &Cfg,
     msgs: &mut Vec<Value>,
@@ -2014,6 +2177,7 @@ fn steps(
         {
             return Err("interrupted".into());
         }
+        append_steering(cfg, msgs, save)?;
         if let Some(ui) = &cfg.ui {
             ui.progress(cfg, "requesting model");
         }
@@ -2040,11 +2204,8 @@ fn steps(
         {
             first["content"] = Value::String(format!("{system}{mcp_instructions}"));
         }
-        let ChatResult { text: reply, usage } = model(cfg, request_messages.as_slice())
-            .inspect_err(|_| {
-                add_usage(cfg, total, None);
-            })?;
-        add_usage(cfg, total, Some(usage));
+        let result = model(cfg, request_messages.as_slice());
+        add_usage(cfg, total, result.as_ref().ok().map(|answer| answer.usage));
         if stop()
             || cfg
                 .ui
@@ -2053,6 +2214,10 @@ fn steps(
         {
             return Err("interrupted".into());
         }
+        if append_steering(cfg, msgs, save)? {
+            continue;
+        }
+        let ChatResult { text: reply, .. } = result?;
         if reply.trim() == ">>" {
             continue;
         }
@@ -2062,30 +2227,32 @@ fn steps(
         if calls.is_empty() {
             return Ok(reply.trim().to_string());
         }
-        let outs: Vec<String> = calls
-            .iter()
-            .map(|c| {
-                if stop()
-                    || cfg
-                        .ui
-                        .as_ref()
-                        .is_some_and(interactive::UiHandle::cancelled)
-                {
-                    return "interrupted".into();
-                }
-                if let Some(ui) = &cfg.ui {
-                    ui.progress(cfg, &format!("tool {}", interactive::call_summary(c)));
-                }
-                let out = run_with_mcp(cfg, c, mcp.as_ref(), &cancelled);
-                if let Some(ui) = &cfg.ui {
-                    ui.progress(
-                        cfg,
-                        &format!("{}: {}", c.verb(), interactive::result_summary(&out)),
-                    );
-                }
-                out
-            })
-            .collect();
+        let mut outs = Vec::with_capacity(calls.len());
+        for c in &calls {
+            if cancelled() {
+                return Err("interrupted".into());
+            }
+            if matches!(cfg.role, Role::Parent(_))
+                && cfg
+                    .ui
+                    .as_ref()
+                    .is_some_and(interactive::UiHandle::has_steering)
+            {
+                outs.push(format!("{} skipped after user steering", c.verb()));
+                continue;
+            }
+            if let Some(ui) = &cfg.ui {
+                ui.progress(cfg, &format!("tool {}", interactive::call_summary(c)));
+            }
+            let out = run_with_mcp(cfg, c, mcp.as_ref(), &cancelled);
+            if let Some(ui) = &cfg.ui {
+                ui.progress(
+                    cfg,
+                    &format!("{}: {}", c.verb(), interactive::result_summary(&out)),
+                );
+            }
+            outs.push(out);
+        }
         if stop()
             || cfg
                 .ui
@@ -3749,6 +3916,109 @@ mod step_limit_tests {
             250
         );
         assert!(!PROJECT_KEYS.contains(&"max_steps"));
+    }
+}
+
+#[cfg(test)]
+mod steering_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn steering_discards_stale_tool_reply_and_preserves_both_user_messages() {
+        let mut cfg = approval_mode_tests::config(std::env::temp_dir(), ApprovalMode::Plan);
+        let ui = interactive::steering_test_handle();
+        cfg.ui = Some(ui.clone());
+        let turns = AtomicUsize::new(0);
+        let model = move |_: &Cfg, request: &[Value]| match turns.fetch_add(1, Ordering::Relaxed) {
+            0 => {
+                ui.queue_steering("new direction".into());
+                ui.queue_steering("one more detail".into());
+                Ok(ChatResult {
+                    text: ">> write stale.txt <<EOF\nstale\nEOF".into(),
+                    usage: Usage::default(),
+                })
+            }
+            1 => {
+                assert_eq!(request[1]["content"], "original task");
+                assert_eq!(request[2]["content"], "new direction");
+                assert_eq!(request[3]["content"], "one more detail");
+                assert_eq!(request.len(), 4);
+                Ok(ChatResult {
+                    text: "revised answer".into(),
+                    usage: Usage::default(),
+                })
+            }
+            _ => panic!("unexpected model request"),
+        };
+        let mut messages = fresh_history();
+        messages.push(json!({"role":"user","content":"original task"}));
+        let answer = steps(
+            &cfg,
+            &mut messages,
+            &mut UsageTotal::default(),
+            &model,
+            &|| false,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(answer, "revised answer");
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[4]["content"], "revised answer");
+    }
+
+    #[test]
+    fn child_helper_cannot_consume_parent_steering() {
+        let ui = interactive::steering_test_handle();
+        ui.queue_steering("parent correction".into());
+        let mut child = approval_mode_tests::config(std::env::temp_dir(), ApprovalMode::Plan);
+        child.ui = Some(ui.clone());
+        child.role = Role::Child(
+            Agents::memory(model_fn(|_, _| panic!("manager model should not run"))),
+            "a1".into(),
+        );
+        let mut child_messages = vec![
+            json!({"role":"system","content":CHILD_SYSTEM}),
+            json!({"role":"user","content":"inspect"}),
+        ];
+        let child_answer = steps(
+            &child,
+            &mut child_messages,
+            &mut UsageTotal::default(),
+            &|_, request| {
+                assert_eq!(request.len(), 2);
+                Ok(ChatResult {
+                    text: "child answer".into(),
+                    usage: Usage::default(),
+                })
+            },
+            &|| false,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(child_answer, "child answer");
+        assert!(ui.has_steering());
+
+        let mut parent = approval_mode_tests::config(std::env::temp_dir(), ApprovalMode::Plan);
+        parent.ui = Some(ui);
+        let mut parent_messages = fresh_history();
+        parent_messages.push(json!({"role":"user","content":"original"}));
+        let parent_answer = steps(
+            &parent,
+            &mut parent_messages,
+            &mut UsageTotal::default(),
+            &|_, request| {
+                assert_eq!(request[2]["content"], "parent correction");
+                Ok(ChatResult {
+                    text: "parent answer".into(),
+                    usage: Usage::default(),
+                })
+            },
+            &|| false,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(parent_answer, "parent answer");
     }
 }
 

@@ -17,18 +17,20 @@ use std::collections::VecDeque;
 #[cfg(test)]
 use std::io::BufRead;
 use std::io::Stdout;
+#[cfg(unix)]
+use std::sync::Condvar;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::{self, Sender};
-#[cfg(unix)]
-use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 #[derive(Clone)]
 pub(crate) struct UiHandle {
     events: Sender<Event>,
     cancelled: Arc<AtomicBool>,
+    steering: Arc<Mutex<VecDeque<String>>>,
     suppress_routine: bool,
     #[cfg(unix)]
     shell: Arc<ShellTracker>,
@@ -44,6 +46,29 @@ struct ShellTracker {
 impl UiHandle {
     pub(crate) fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn queue_steering(&self, task: String) {
+        self.steering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(task);
+    }
+
+    pub(crate) fn has_steering(&self) -> bool {
+        !self
+            .steering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    pub(crate) fn take_steering(&self) -> Vec<String> {
+        self.steering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect()
     }
 
     #[cfg(unix)]
@@ -131,6 +156,19 @@ impl UiHandle {
             return false;
         }
         rx.recv().unwrap_or(false) && !self.cancelled()
+    }
+}
+
+#[cfg(test)]
+pub(super) fn steering_test_handle() -> UiHandle {
+    let (events, _) = mpsc::channel();
+    UiHandle {
+        events,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        steering: Arc::new(Mutex::new(VecDeque::new())),
+        suppress_routine: false,
+        #[cfg(unix)]
+        shell: Arc::new(ShellTracker::default()),
     }
 }
 
@@ -919,8 +957,20 @@ fn submit_chat(
         task => {
             append(view, &format!("You  {task}"));
             if session.busy {
-                session.queued.push_back(task.into());
-                append(view, &format!("Task queued ({})", session.queued.len()));
+                if session.interrupted {
+                    session.queued.push_back(task.into());
+                    append(view, "Instruction queued after interruption.");
+                } else if let Some(ui) = &session.cfg.ui {
+                    ui.queue_steering(task.into());
+                    append(
+                        view,
+                        if view.model_in_flight {
+                            "Applying new instruction at the next model step."
+                        } else {
+                            "Applying new instruction after the current action."
+                        },
+                    );
+                }
             } else {
                 begin_turn(view, session);
                 session.start(task.into(), &mut |message| append(view, message));
@@ -2367,6 +2417,7 @@ impl Session {
         cfg.ui = Some(UiHandle {
             events: events.clone(),
             cancelled: cancelled.clone(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
             suppress_routine: false,
             #[cfg(unix)]
             shell: Arc::new(ShellTracker::default()),
@@ -2407,6 +2458,9 @@ impl Session {
             out(&format!("error: {e}"));
         }
         self.agents.shutdown();
+        if let Some(ui) = &self.cfg.ui {
+            ui.take_steering();
+        }
         self.queued.clear();
         self.interrupted = true;
         out("Interrupt requested; waiting for the current model request to stop.");
@@ -2435,6 +2489,7 @@ impl Session {
                 self.cfg.ui = Some(UiHandle {
                     events: self.events.clone(),
                     cancelled: self.cancelled.clone(),
+                    steering: Arc::new(Mutex::new(VecDeque::new())),
                     suppress_routine: self.tui,
                     #[cfg(unix)]
                     shell: Arc::new(ShellTracker::default()),
@@ -2577,9 +2632,21 @@ impl Session {
     ) {
         self.busy = false;
         self.msgs = Some(msgs);
+        if let Some(ui) = &self.cfg.ui {
+            self.queued.extend(ui.take_steering());
+        }
         if self.interrupted {
             self.interrupted = false;
             self.reset_after_interrupt(out);
+            if self.closed {
+                return;
+            }
+            while !self.busy {
+                let Some(line) = self.queued.pop_front() else {
+                    break;
+                };
+                self.line(&line, out);
+            }
             return;
         }
         match result {
@@ -3507,6 +3574,44 @@ mod tests {
     }
 
     #[test]
+    fn busy_chat_steering_keeps_every_instruction_in_order() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let mut config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut session = Session::new(config.clone(), fresh_history(), agents, tx);
+        session.busy = true;
+        let mut view = tui::View {
+            model_in_flight: true,
+            ..tui::View::default()
+        };
+        let mut request = 0;
+        let mut exit = false;
+        for instruction in ["use the smaller file", "then explain the result"] {
+            submit_chat(
+                instruction.into(),
+                &mut config,
+                &mut view,
+                &mut session,
+                &mut request,
+                &mut exit,
+            );
+        }
+        let ui = session.cfg.ui.as_ref().unwrap();
+        assert!(ui.has_steering());
+        assert_eq!(
+            ui.take_steering(),
+            vec!["use the smaller file", "then explain the result"]
+        );
+        assert!(session.queued.is_empty());
+        assert!(
+            view.transcript
+                .iter()
+                .any(|line| line.contains("Applying new instruction at the next model step"))
+        );
+        assert!(!exit);
+    }
+
+    #[test]
     fn reasoning_picker_can_be_reached_without_editing_model() {
         let agents = Agents::memory(model_fn(|_, _| unreachable!()));
         let mut config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
@@ -4375,6 +4480,7 @@ mod tests {
         cfg.ui = Some(UiHandle {
             events,
             cancelled,
+            steering: Arc::new(Mutex::new(VecDeque::new())),
             suppress_routine: false,
             #[cfg(unix)]
             shell: Arc::new(ShellTracker::default()),
@@ -4420,6 +4526,7 @@ mod tests {
             config.ui = Some(UiHandle {
                 events,
                 cancelled: Arc::new(AtomicBool::new(false)),
+                steering: Arc::new(Mutex::new(VecDeque::new())),
                 suppress_routine: false,
                 #[cfg(unix)]
                 shell: Arc::new(ShellTracker::default()),

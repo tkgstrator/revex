@@ -233,10 +233,15 @@ In the interactive mode these slash commands are available:
 dropped. If the matching environment variable is set, it still wins on the next start.
 
 The interactive input stays available while a model request or helper runs.
-`/agents` and `/status` work during a task; another natural-language task is queued.
+`/agents` and `/status` work during a task. New natural-language messages steer a
+running model request and remain in the conversation in the order sent. A tool
+already running finishes once before steering applies; later calls from its
+old model reply are skipped. During an external helper CLI call, new messages
+run after that call returns. Ctrl+C hard-cancels the active task and discards
+pending steering messages.
 Use Enter to send, Alt+Enter for a newline, PageUp/PageDown to scroll and Esc to
 close an overlay. Terminals that report Shift+Enter or Ctrl+J separately can use
-those for a newline too. Ctrl+C interrupts an active task; Ctrl+D, `/exit` or
+those for a newline too. Ctrl+D, `/exit` or
 `exit` quits.
 Up/Down recalls sent inputs for this workspace. Revex keeps the latest 100 inputs
 across restarts; Down past the newest restores the draft you were writing. The
