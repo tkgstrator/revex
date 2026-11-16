@@ -84,7 +84,7 @@ const SECONDARY: Color = Color::Gray;
 const USER_BG: Color = Color::Rgb(25, 62, 105);
 const EDITOR_BG: Color = Color::Rgb(27, 45, 75);
 const ACTIVE_BG: Color = Color::Rgb(22, 51, 63);
-const CODE_BG: Color = Color::Rgb(18, 23, 30);
+const CODE_BG: Color = Color::Rgb(39, 45, 52);
 const MAX_TRANSCRIPT_LINE_CHARS: usize = 2_048;
 const MAX_CODE_TOKENS_PER_ROW: usize = 256;
 const ASCII_BORDER: border::Set = border::Set {
@@ -823,7 +823,9 @@ fn transcript_rows(view: &View, width: usize) -> Vec<Line<'static>> {
             let content = line.strip_prefix("Revex  ").unwrap_or(line).trim_start();
             let fence = assistant && (content.starts_with("```") || content.starts_with("~~~"));
             let language = in_code.unwrap_or_else(|| fence_language(content));
-            let display = if user && line_index == 0 {
+            let display = if fence {
+                String::new()
+            } else if user && line_index == 0 {
                 format!("> {}", line.strip_prefix("You  ").unwrap_or(line))
             } else if assistant && line_index == 0 {
                 line.strip_prefix("Revex  ").unwrap_or(line).to_owned()
@@ -2330,7 +2332,7 @@ mod tests {
         let output = screen(&view, &[], 60, 20);
         assert!(output.contains("saved reply"));
         assert!(output.contains("second line"));
-        assert!(output.contains("```rust"));
+        assert!(!output.contains("```rust"));
         assert!(output.contains("let value = 1;"));
         assert!(!output.contains("Revex  saved reply"));
         assert!(!output.contains("Revex  ```rust"));
@@ -2467,7 +2469,67 @@ mod tests {
         assert_eq!(buffer[(0, 11)].fg, Color::Cyan);
         assert_eq!(buffer[(11, 11)].fg, Color::Green);
         assert_eq!(buffer[(17, 11)].fg, Color::DarkGray);
-        assert_eq!(buffer[(59, 11)].bg, Color::Rgb(18, 23, 30));
+        assert_eq!(buffer[(59, 11)].bg, CODE_BG);
+    }
+
+    #[test]
+    fn fenced_code_shades_full_width_and_preserves_blank_lines_and_indentation() {
+        let view = View {
+            transcript: vec![
+                "Revex  Before\n```rust\n  let x = 1;\n\n    println!(\"x\");\n```\nAfter".into(),
+            ],
+            ..View::default()
+        };
+        let rows = transcript_rows(&view, 20);
+        assert_eq!(rows.len(), 9);
+        assert_eq!(rows[1].to_string(), "Before");
+        assert!(rows[3].to_string().starts_with("  let x = 1;"));
+        assert!(rows[5].to_string().starts_with("    println!"));
+        assert_eq!(rows[7].to_string(), "After");
+        assert!(!rows.iter().any(|row| row.to_string().contains("```")));
+        let mut terminal = Terminal::new(TestBackend::new(20, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &view, &[])).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 4..=8 {
+            for x in 0..20 {
+                assert_eq!(buffer[(x, y)].bg, CODE_BG, "code block at {x},{y}");
+            }
+        }
+        assert_eq!(buffer[(0, 3)].bg, Color::Reset);
+        assert_eq!(buffer[(0, 9)].bg, Color::Reset);
+        assert_ne!(CODE_BG, USER_BG);
+
+        let tilde = View {
+            transcript: vec!["Revex  ~~~python\n  print(1)\n~~~".into()],
+            ..View::default()
+        };
+        let tilde_rows = transcript_rows(&tilde, 20);
+        assert!(!tilde_rows.iter().any(|row| row.to_string().contains("~~~")));
+        assert!(tilde_rows[2].to_string().starts_with("  print(1)"));
+    }
+
+    #[test]
+    fn unfinished_fence_keeps_wrapped_narrow_lines_shaded() {
+        let view = View {
+            transcript: vec![
+                "Revex  ```python\n    def really_long_function_name(x, y):\n      return 1".into(),
+            ],
+            ..View::default()
+        };
+        let rows = transcript_rows(&view, 16);
+        assert!(!rows.iter().any(|row| row.to_string().contains("```")));
+        assert!(rows[2].to_string().starts_with("    def"));
+        assert!(rows.len() > 5, "the long line should wrap");
+        let mut terminal = Terminal::new(TestBackend::new(16, 14)).unwrap();
+        terminal.draw(|frame| render(frame, &view, &[])).unwrap();
+        let buffer = terminal.backend().buffer();
+        let code_rows = rows.len() - 2; // Exclude the assistant's two outer gaps.
+        let top = 9usize.saturating_sub(rows.len());
+        for row in 1..=code_rows {
+            for x in 0..16 {
+                assert_eq!(buffer[(x, (top + row) as u16)].bg, CODE_BG);
+            }
+        }
     }
 
     #[test]
@@ -2515,10 +2577,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(1_000, 12)).unwrap();
         terminal.draw(|frame| render(frame, &view, &[])).unwrap();
         assert_eq!(terminal.backend().buffer()[(900, 4)].fg, Color::White);
-        assert_eq!(
-            terminal.backend().buffer()[(900, 4)].bg,
-            Color::Rgb(18, 23, 30)
-        );
+        assert_eq!(terminal.backend().buffer()[(900, 4)].bg, CODE_BG);
     }
 
     #[test]
