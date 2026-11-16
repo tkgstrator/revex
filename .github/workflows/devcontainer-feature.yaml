@@ -41,6 +41,33 @@ jobs:
         with:
           validate-only: 'true'
           base-path-to-features: ./.feature-publish
+      - name: Install Dev Container CLI
+        run: npm install --global @devcontainers/cli
+      - uses: oras-project/setup-oras@v2
+        with:
+          version: 1.3.0
+      - name: Check packaged OCI artifact
+        run: |
+          set -euo pipefail
+          devcontainer features package ./.feature-publish/revex --output-folder "$RUNNER_TEMP/revex-package"
+          archive="$RUNNER_TEMP/revex-package/devcontainer-feature-revex.tgz"
+          test -s "$archive"
+          tar -xOf "$archive" ./devcontainer-feature.json |
+            jq -e --arg version "$(jq -r .version src/revex/devcontainer-feature.json)" \
+              '.id == "revex" and .version == $version' >/dev/null
+          metadata=$(jq -c . src/revex/devcontainer-feature.json)
+          printf '{}' > "$RUNNER_TEMP/revex-config.json"
+          mkdir -p "$RUNNER_TEMP/revex-oci"
+          cd "$RUNNER_TEMP/revex-package"
+          oras push --oci-layout --image-spec v1.0 \
+            --config "$RUNNER_TEMP/revex-config.json:application/vnd.devcontainers" \
+            --annotation "dev.containers.metadata=$metadata" \
+            --annotation 'com.github.package.type=devcontainer_feature' \
+            --annotation 'org.opencontainers.image.source=https://github.com/tkgstrator/revex' \
+            "$RUNNER_TEMP/revex-oci:check" \
+            'devcontainer-feature-revex.tgz:application/vnd.devcontainers.layer.v1+tar'
+          oras manifest fetch --oci-layout "$RUNNER_TEMP/revex-oci:check" |
+            jq -e '.mediaType == "application/vnd.oci.image.manifest.v1+json" and .config.mediaType == "application/vnd.devcontainers" and .layers[0].mediaType == "application/vnd.devcontainers.layer.v1+tar" and .layers[0].annotations["org.opencontainers.image.title"] == "devcontainer-feature-revex.tgz" and .annotations["com.github.package.type"] == "devcontainer_feature" and (.annotations["dev.containers.metadata"] | fromjson | .id) == "revex"' >/dev/null
 
   container:
     name: Feature install (${{ matrix.runner }})
@@ -62,22 +89,42 @@ jobs:
     if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
       packages: write
     steps:
       - uses: actions/checkout@v7
-      - name: Stage only the Revex Feature
-        run: |
-          mkdir -p .feature-publish
-          cp -R src/revex .feature-publish/
-      - name: Publish ghcr.io/tkgstrator/revex
-        uses: devcontainers/action@v1
+      - name: Install Dev Container CLI
+        run: npm install --global @devcontainers/cli
+      - uses: oras-project/setup-oras@v2
         with:
-          publish-features: 'true'
-          base-path-to-features: ./.feature-publish
-          features-namespace: tkgstrator
-          generate-docs: 'false'
-          disable-repo-tagging: 'true'
+          version: 1.3.0
+      - name: Publish ghcr.io/tkgstrator/revex
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version=$(jq -r .version src/revex/devcontainer-feature.json)
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Feature version must be numeric semver" >&2
+            exit 1
+          fi
+          IFS=. read -r major minor patch <<< "$version"
+          printf '%s' "$GITHUB_TOKEN" | oras login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          tags=$(oras repo tags ghcr.io/tkgstrator/revex --format json)
+          jq -e '.tags | type == "array"' <<< "$tags" >/dev/null
+          if jq -e --arg version "$version" '.tags | index($version) != null' <<< "$tags" >/dev/null; then
+            oras tag "ghcr.io/tkgstrator/revex:$version" "$major.$minor" "$major" latest
+            echo "Revex Feature $version is already published; aliases restored"
+            exit 0
+          fi
+          devcontainer features package src/revex --output-folder "$RUNNER_TEMP/revex-package"
+          metadata=$(jq -c . src/revex/devcontainer-feature.json)
+          printf '{}' > "$RUNNER_TEMP/revex-config.json"
+          cd "$RUNNER_TEMP/revex-package"
+          oras push --image-spec v1.0 \
+            --config "$RUNNER_TEMP/revex-config.json:application/vnd.devcontainers" \
+            --annotation "dev.containers.metadata=$metadata" \
+            --annotation 'com.github.package.type=devcontainer_feature' \
+            --annotation 'org.opencontainers.image.source=https://github.com/tkgstrator/revex' \
+            "ghcr.io/tkgstrator/revex:$version,$major.$minor,$major,latest" \
+            'devcontainer-feature-revex.tgz:application/vnd.devcontainers.layer.v1+tar'
