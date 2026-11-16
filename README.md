@@ -7,7 +7,7 @@ schemas before the first user message. On a local model that cost is paid in pre
 time and context window. `revex` keeps the prompt short and
 skips tool schemas entirely: the model calls tools by writing one-line commands.
 
-- Small single binary with three direct dependencies (`ureq`, `serde_json`, `libc`)
+- Single binary with a full-screen terminal UI (`ratatui` and `crossterm`)
 - Talks to any OpenAI-compatible endpoint with streaming, through either Chat Completions or the Responses API
 - One-shot, interactive and MCP server modes
 - Persistent interactive history, read-only helper agents and live `/agents` status with provider-reported token usage
@@ -67,7 +67,7 @@ that caches the prompt prefix can reuse it between steps.
 | Tool output cut at 2000 bytes                       | Disassembly and logs are the fastest way to fill a small context. The model is told how many bytes were omitted and can ask for a narrower range. |
 | Unknown verbs run as shell commands                 | Small models often write `>> cat file`. Treating it as `sh` is more useful than failing.                                                          |
 | Synchronous HTTP, no async runtime                  | Each loop is strictly sequential; helper agents run on plain threads. This keeps the binary small and the build fast.                              |
-| Three source files                                  | The loop, helper agents and terminal coordinator live in separate modules.                                                                        |
+| Separate source modules                            | The loop, helper agents, terminal coordinator and renderer live in separate modules.                                                             |
 
 ### What it deliberately does not do
 
@@ -100,23 +100,31 @@ Prebuilt binaries for macOS (arm64) and Linux (x86_64, arm64) are attached to ea
 
 ## Configuration
 
-On the first interactive launch, Revex presents a setup screen for the base URL of a
-running OpenAI-compatible model API, an optional API key and an optional model ID.
-It saves these in `~/.revex` with mode `0600` on Unix. A key is entered without
-terminal echo. The setup does not start a model server. One-shot, piped and MCP
-modes require prior configuration and do not prompt. Environment variables can
-override saved settings.
+Interactive launch first displays the current directory and asks whether to use it
+as the workspace. Confirm once to use that directory for tools and saved history;
+later launches from the same workspace skip this question. A new workspace asks
+once. To use another directory, exit, change directory in your shell and start
+Revex again.
 
-On later interactive launches, the welcome screen shows the project directory,
-saved history, API reachability and selected model. At `start >`, enter a task,
-press Enter for the regular prompt, or enter `s` or `/config` to edit the saved
-connection settings before starting.
+On first launch, the full-screen setup offers Ollama, LM Studio, oMLX and a custom
+OpenAI-compatible API. The oMLX preset starts at `http://127.0.0.1:8000/v1`.
+The URL is editable. The API key is optional and masked; a model can be chosen from
+the server list when available or entered manually. You can also select one or more
+helper-agent providers: Local, Codex CLI and Claude Code CLI. Confirmed settings are saved in
+`~/.revex` with mode `0600` on Unix. Setup does not start a model server. One-shot,
+piped and MCP modes require prior configuration and do not prompt. Environment
+variables can override saved settings.
+
+After confirmation, later interactive launches open the chat screen. The top
+shows the Revex version, workspace, and any selected model and reasoning effort.
+Enter a task in the fixed input area; `/config` opens connection settings.
 
 | Variable         | Required | Description                                                                                                            |
 | ---------------- | -------- | ---------------------------------------------------------------------------------------------------------------------- |
 | `REVEX_BASE_URL` | yes      | Base URL of the OpenAI-compatible API, including `/v1`. Interactive setup can save it as `base_url` in `~/.revex` |
 | `REVEX_API`      | no       | `chat` (default, `/chat/completions`) or `responses` (`/responses`)                                                    |
-| `REVEX_MODEL`    | no       | Model ID. If unset, the first model from `/models` is used; if that fails, the field is omitted and the server decides |
+| `REVEX_MODEL`    | no       | Model ID. If unset, interactive mode leaves model choice to the server until you select one; one-shot/piped mode tries the first `/models` entry, then omits the field if discovery fails |
+| `REVEX_REASONING_EFFORT` | no | Optional reasoning effort sent with model requests; the server must support the chosen value |
 | `REVEX_API_KEY`  | no       | Sent as `Authorization: Bearer <key>`; setup can save it in private `~/.revex` |
 | `REVEX_FRONTIER` | no | Command that handles a task instead of the local model, for example `claude -p`. The task is appended as the last argument |
 | `REVEX_ROUTE` | no | Set to `auto` to let the local model decide per task whether to forward it. Off by default |
@@ -126,6 +134,15 @@ connection settings before starting.
 The Responses API has no `stop` parameter, so with `REVEX_API=responses` the reply is cut
 at `<out>` on the client side. It is stateless (`store: false`): the full history is sent
 every step.
+
+`/model` offers an optional reasoning effort after model selection. `Default`
+leaves the choice to the server. An explicit effort is sent as `reasoning_effort`
+with Chat Completions or `reasoning.effort` with the Responses API. Available
+values depend on the model and server; a rejected value is reported as an API
+error. An explicit Revex setting takes precedence over `REVEX_EXTRA` for this field.
+Each request also tells the model the effective configured ID and effort so it
+can answer identity questions accurately. If no ID is configured, the backend
+model is reported as unknown; an ID may still be a server alias.
 
 ```sh
 export REVEX_BASE_URL=http://localhost:8000/v1
@@ -140,17 +157,20 @@ directory are both read and merged key by key, and the project file wins.
 Environment variables beat both.
 
 ```json
-{ "model": "your-model-id", "route": "auto", "api": "chat" }
+{ "model": "your-model-id", "route": "auto", "api": "chat", "helper_providers": "local,codex,claude" }
 ```
 
 | Key | Allowed in `./.revex` | Environment variable |
 | --- | --- | --- |
-| `model`, `route`, `api` | yes | `REVEX_MODEL`, `REVEX_ROUTE`, `REVEX_API` |
+| `model`, `reasoning_effort`, `route`, `api` | yes | `REVEX_MODEL`, `REVEX_REASONING_EFFORT`, `REVEX_ROUTE`, `REVEX_API` |
 | `frontier`, `base_url`, `api_key` | no, `~/.revex` only | `REVEX_FRONTIER`, `REVEX_BASE_URL`, `REVEX_API_KEY` |
+| `helper_providers` | no, `~/.revex` only | none |
 
 `frontier` runs a command, and `base_url` receives your API key. A cloned repository
 cannot set these or `api_key`; project-file values are ignored with a warning. The
 optional key entered in first-run setup is stored in the private user settings file.
+Put `helper_providers` in `~/.revex` as a comma-separated list; project files
+cannot select external helper CLIs.
 
 ## Usage
 
@@ -174,11 +194,12 @@ In the interactive mode these slash commands are available:
 | --- | --- |
 | `/help` | List the commands |
 | `/agents` | Show the parent and helpers, their state, tasks, model and reported token usage |
+| `/config` | Edit the API URL, key, model and reasoning effort in the setup screen |
 | `/clear` | Clear parent and helper history, state and token totals when no helper is active |
-| `/model [ID]` | Show the current model and the server's list, or switch |
+| `/model [ID]` | Select a model (or provide its ID), then set an optional reasoning effort |
 | `/route [off\|auto\|local\|remote]` | Show or switch the forwarding mode |
 | `/status` | Show the active API, model, route, parent state, queued tasks and directory |
-| `/exit` | Quit |
+| `/exit` or `exit` | Quit |
 
 `/model` and `/route` save the choice: to `./.revex` if it exists, otherwise to
 `~/.revex`. When writing a project file, keys that a project file may not set are
@@ -186,6 +207,15 @@ dropped. If the matching environment variable is set, it still wins on the next 
 
 The interactive input stays available while a model request or helper runs.
 `/agents` and `/status` work during a task; another natural-language task is queued.
+Use Enter to send, Alt+Enter for a newline, PageUp/PageDown to scroll and Esc to
+close an overlay. Terminals that report Shift+Enter or Ctrl+J separately can use
+those for a newline too. Ctrl+C interrupts an active task; Ctrl+D, `/exit` or
+`exit` quits.
+Up/Down recalls sent inputs for this workspace. Revex keeps the latest 100 inputs
+across restarts; Down past the newest restores the draft you were writing. The
+active model request shows a Thinking indicator. Sent messages have a shaded
+background and a blank line above and below; assistant replies also have a
+blank line above and below. Fenced code in replies has syntax colors.
 The parent may start up to two read-only helpers concurrently with `>> spawn` and
 collect their answers with `>> wait`. Token counts come from the model provider;
 missing counts are shown as unavailable or partial rather than estimated.
@@ -201,8 +231,12 @@ settings file and is not used.) The file is rewritten atomically (temp file and 
 after every message, including partial progress when a request fails. A save failure
 stops the current request and exits interactive mode. On start the
 messages are reloaded, tool outputs included, and the stored system prompt is replaced by
-the current one. `/clear` rewrites the saved file as empty and removes the parent
-and helper records.
+the current one. `/clear` rewrites the saved conversation file as empty and removes
+the parent and helper records. It keeps the separate input recall history.
+
+Input recall is stored beside the conversation in a private `input-history-*.json`
+file, with the same workspace identity and Unix permissions. Only the latest 100
+sent inputs are retained.
 
 The directory is created `0700` and the file `0600` on Unix. The history holds your
 prompts and everything tools printed, so it may contain secrets from files or commands.
@@ -253,24 +287,37 @@ the answer. The loop stops after 30 steps.
 
 ### Helper agents
 
-The main agent can also delegate independent read-only questions:
+The main agent can also delegate independent tasks:
 
 ```
->> spawn TASK           start a helper; replies at once with its ID, e.g. `a1 started`
+>> spawn TASK           start a helper using an enabled provider
+>> spawn @codex TASK    start a helper with a selected provider
+>> spawn @claude TASK   start a Claude Code helper
+>> spawn @local TASK    start a local-model helper
 >> wait ID [ID ...]     block until those helpers finish; each result is returned once
 ```
 
-A helper has its own conversation and a different system prompt, and works in the same
-directory as the main agent. It can only use `read` and
+A local-model helper has its own conversation and a different system prompt, and
+works in the same directory as the main agent. It can only use `read` and
 `>> search PATTERN [PATH ...]`, which runs `rg` directly (no shell), with the pattern after
 `-e`, the paths after `--` and `--no-config`. Everything else, including `sh`, `write`,
 `replace`, `spawn`, `wait` and unknown verbs, is refused in code, not only by the prompt.
-Helpers cannot ask for confirmation, so none is needed. At most two run at once; up to
-eight more queue and start when a slot frees, and a further `spawn` is refused with an
-error. A repeated `wait` reports that the result was already returned instead of
-inserting it again, and a failed helper returns its error. Each helper's token usage is
-recorded separately from the main agent's, counting only what the provider reported.
-Helpers still unfinished when a run or session ends are stopped and marked `interrupted`.
+
+First-run setup and `/config` let you select one or more helper providers: Local,
+Codex CLI and Claude Code CLI. Local is the default. The choices are saved only in
+private `~/.revex` settings. When several are enabled, plain `>> spawn TASK`
+cycles through them; `@codex`, `@claude` or `@local` explicitly chooses one of the
+enabled providers. Codex helpers run with YOLO mode and Claude Code helpers with
+Bypass Permissions, as selected in setup; those external agents can run commands
+and edit files without another Revex approval. They need their own installed CLI
+and authentication. A failed external start reports an error and does not switch
+providers.
+
+At most two helpers run at once; up to eight more queue and start when a slot
+frees. A repeated `wait` reports that the result was already returned instead of
+inserting it again. `/agents` shows each helper's actual provider and only token
+usage reported by that provider. Helpers still unfinished when a run or session
+ends are stopped and marked `interrupted`.
 
 Because `sh` is the escape hatch, reverse-engineering tools need no dedicated
 wrappers. `objdump`, `otool`, `nm`, `strings`, `radare2` and `lldb` work as they are.
@@ -279,8 +326,8 @@ wrappers. `objdump`, `otool`, `nm`, `strings`, `radare2` and `lldb` work as they
 
 `revex` can also act as a thin gateway. When `REVEX_FRONTIER` is set, a task can be
 handed to another agent CLI and its answer returned unchanged. This is optional:
-without it, `revex` never starts another program, and Claude Code, Codex or
-OpenCode do not need to be installed.
+without it, ordinary turns stay on the local model. External helper providers
+are configured separately; when selected, they require their CLIs to be installed.
 
 ```sh
 export REVEX_FRONTIER='claude -p --output-format json'

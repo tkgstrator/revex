@@ -1,9 +1,12 @@
-//! Read-only child agents, started by the parent's `>> spawn` and collected with `>> wait`.
+//! Helper agents, started by the parent's `>> spawn` and collected with `>> wait`.
 //! Each child has its own history, status and usage. Records are saved privately so a
 //! restart can show what happened; unfinished work becomes interrupted and is never rerun.
 
 use super::*;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex, MutexGuard};
 
 /// Children running at once; more are queued.
@@ -12,9 +15,45 @@ pub(crate) const MAX_RUNNING: usize = 2;
 pub(crate) const MAX_QUEUED: usize = 8;
 const RECORD_VERSION: u64 = 1;
 const PARENT_ID: &str = "main";
+const EXTERNAL_OUTPUT_LIMIT: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Provider {
+    Local,
+    Codex,
+    Claude,
+}
+
+impl Provider {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "local" => Some(Self::Local),
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            _ => None,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Local => 0,
+            Self::Codex => 1,
+            Self::Claude => 2,
+        }
+    }
+}
 
 /// One model request. `chat` in normal use; tests substitute a fake provider.
 pub(crate) type ModelFn = dyn Fn(&Cfg, &[Value]) -> Result<ChatResult, String> + Send + Sync;
+type ErrorSink = Arc<dyn Fn(String) + Send + Sync>;
 
 pub(crate) fn model_fn(
     f: impl Fn(&Cfg, &[Value]) -> Result<ChatResult, String> + Send + Sync + 'static,
@@ -64,9 +103,10 @@ impl Status {
 }
 
 /// What `/agents` shows for one agent.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AgentInfo {
     pub(crate) id: String,
+    pub(crate) provider: Provider,
     pub(crate) task: String,
     pub(crate) status: Status,
     pub(crate) model: Option<String>,
@@ -89,7 +129,11 @@ struct Child {
 struct State {
     parent: AgentInfo,
     children: Vec<Child>,
-    queue: VecDeque<(String, Cfg)>,
+    queue: VecDeque<(String, Cfg, Provider)>,
+    providers: [bool; 3],
+    provider_cursor: usize,
+    external_pids: HashMap<String, i32>,
+    external_threads: Vec<std::thread::JoinHandle<()>>,
     next: u64,
     stopped: bool,
 }
@@ -100,6 +144,7 @@ pub(crate) struct Agents {
     model: Arc<ModelFn>,
     state: Mutex<State>,
     changed: Condvar,
+    error_sink: Mutex<Option<ErrorSink>>,
 }
 
 fn id_number(id: &str) -> Option<u64> {
@@ -112,6 +157,202 @@ fn id_number(id: &str) -> Option<u64> {
 
 fn find<'a>(s: &'a mut State, id: &str) -> Option<&'a mut Child> {
     s.children.iter_mut().find(|c| c.info.id == id)
+}
+
+fn select_provider<'a>(s: &mut State, task: &'a str) -> Result<(Provider, &'a str), String> {
+    let task = task.trim();
+    if task.is_empty() {
+        return Err("spawn needs a TASK".into());
+    }
+    if task.starts_with('@') {
+        let (word, rest) = task.split_once(char::is_whitespace).unwrap_or((task, ""));
+        let provider = Provider::parse(&word[1..])
+            .ok_or_else(|| format!("unknown helper provider `{word}`"))?;
+        if !s.providers[provider.index()] {
+            return Err(format!(
+                "helper provider `{}` is not enabled",
+                provider.name()
+            ));
+        }
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Err("spawn needs a TASK".into());
+        }
+        return Ok((provider, rest));
+    }
+    for _ in 0..3 {
+        let index = s.provider_cursor % 3;
+        s.provider_cursor = (index + 1) % 3;
+        if s.providers[index] {
+            return Ok((
+                [Provider::Local, Provider::Codex, Provider::Claude][index],
+                task,
+            ));
+        }
+    }
+    Err("no helper provider is enabled".into())
+}
+
+fn selection_from_file(path: &Path) -> Result<[bool; 3], String> {
+    let settings = read_settings(path)?;
+    let Some(value) = settings.get("helper_providers") else {
+        return Ok([true, false, false]);
+    };
+    let csv = value
+        .as_str()
+        .ok_or("helper_providers in ~/.revex must be a string")?;
+    let mut selected = [false; 3];
+    for word in csv.split(',') {
+        let name = word.trim();
+        let provider =
+            Provider::parse(name).ok_or_else(|| format!("unknown helper provider `{name}`"))?;
+        let slot = &mut selected[provider.index()];
+        if *slot {
+            return Err(format!("duplicate helper provider `{name}`"));
+        }
+        *slot = true;
+    }
+    if !selected.iter().any(|enabled| *enabled) {
+        return Err("select at least one helper provider".into());
+    }
+    Ok(selected)
+}
+
+fn kill_process_group(pid: i32) {
+    // External helpers start in a new process group. A negative PID targets
+    // their group, including grandchildren that kept the group after CLI exit.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+}
+
+struct ExternalProcess {
+    child: std::process::Child,
+    pid: i32,
+}
+
+impl Drop for ExternalProcess {
+    fn drop(&mut self) {
+        kill_process_group(self.pid);
+        let _ = self.child.wait();
+    }
+}
+
+fn capture_bounded(mut stream: impl Read) -> Result<String, String> {
+    let mut output = Vec::new();
+    let mut buf = [0_u8; 8192];
+    loop {
+        let size = stream.read(&mut buf).map_err(|e| e.to_string())?;
+        if size == 0 {
+            break;
+        }
+        output.extend_from_slice(&buf[..size]);
+        if output.len() > EXTERNAL_OUTPUT_LIMIT {
+            output.drain(..output.len() - EXTERNAL_OUTPUT_LIMIT);
+        }
+    }
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
+fn reported_usage(v: &Value) -> Option<Usage> {
+    let usage = &v["usage"];
+    let input = usage["input_tokens"].as_u64();
+    let output = usage["output_tokens"].as_u64();
+    (input.is_some() || output.is_some()).then_some(Usage { input, output })
+}
+
+fn parse_external_output(
+    provider: Provider,
+    output: &str,
+) -> Result<(String, Option<Usage>), String> {
+    match provider {
+        Provider::Codex => {
+            let mut answer = None;
+            let mut usage = None;
+            let mut completed = false;
+            for line in output.lines() {
+                let Ok(v) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                match v["type"].as_str() {
+                    Some("item.completed") if v["item"]["type"] == "agent_message" => {
+                        if let Some(text) = v["item"]["text"].as_str() {
+                            answer = Some(text.to_string());
+                        }
+                    }
+                    Some("turn.completed") => {
+                        completed = true;
+                        usage = reported_usage(&v);
+                    }
+                    _ => {}
+                }
+            }
+            if !completed {
+                return Err("codex helper ended without a completed turn".into());
+            }
+            Ok((
+                answer.ok_or("codex helper returned no final answer")?,
+                usage,
+            ))
+        }
+        Provider::Claude => {
+            let v: Value = serde_json::from_str(output)
+                .map_err(|e| format!("claude helper returned invalid JSON: {e}"))?;
+            if v["type"] != "result" || v["subtype"].as_str().is_some_and(|s| s != "success") {
+                return Err("claude helper did not report success".into());
+            }
+            let answer = v["result"]
+                .as_str()
+                .ok_or("claude helper returned no final answer")?;
+            Ok((answer.into(), reported_usage(&v)))
+        }
+        Provider::Local => Err("local helper cannot use external runner".into()),
+    }
+}
+
+fn external_command(provider: Provider, cwd: &Path, program: &Path) -> Result<Command, String> {
+    let mut command = Command::new(program);
+    match provider {
+        Provider::Codex => {
+            command
+                .args([
+                    "exec",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--skip-git-repo-check",
+                    "--json",
+                    "-C",
+                ])
+                .arg(cwd)
+                .arg("-");
+        }
+        Provider::Claude => {
+            command.args([
+                "-p",
+                "--dangerously-skip-permissions",
+                "--output-format",
+                "json",
+            ]);
+        }
+        Provider::Local => return Err("local helper cannot use external runner".into()),
+    }
+    command
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // This credential belongs to Revex's local API endpoint. External CLIs
+    // inherit their own authentication environment unchanged.
+    command.env_remove("REVEX_API_KEY");
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    Ok(command)
 }
 
 impl Agents {
@@ -155,6 +396,7 @@ impl Agents {
             + 1;
         let parent = parent.unwrap_or_else(|| AgentInfo {
             id: PARENT_ID.into(),
+            provider: Provider::Local,
             task: String::new(),
             status: Status::Idle,
             model: None,
@@ -168,11 +410,53 @@ impl Agents {
                 parent,
                 children,
                 queue: VecDeque::new(),
+                providers: [true, false, false],
+                provider_cursor: 0,
+                external_pids: HashMap::new(),
+                external_threads: Vec::new(),
                 next,
                 stopped: false,
             }),
             changed: Condvar::new(),
+            error_sink: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn set_error_sink(&self, sink: impl Fn(String) + Send + Sync + 'static) {
+        *self.error_sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(sink));
+    }
+
+    pub(crate) fn set_providers(&self, selected: [bool; 3]) -> Result<(), String> {
+        if !selected.iter().any(|enabled| *enabled) {
+            return Err("select at least one helper provider".into());
+        }
+        let mut state = self.lock();
+        state.providers = selected;
+        state.provider_cursor = 0;
+        Ok(())
+    }
+
+    /// Noninteractive sessions keep running when home helper selection is invalid.
+    /// Invalid settings can never opt into an external, editable helper.
+    pub(crate) fn set_providers_from_home_file(&self, home: Option<&Path>) -> Option<String> {
+        let (selected, warning) = match home.map(selection_from_file) {
+            None => ([true, false, false], None),
+            Some(Ok(selected)) => (selected, None),
+            Some(Err(error)) => ([true, false, false], Some(error)),
+        };
+        // Both a parsed nonempty selection and the fallback satisfy set_providers.
+        self.set_providers(selected)
+            .expect("nonempty helper selection");
+        warning
+    }
+
+    fn report_error(&self, message: String) {
+        let sink = self.error_sink.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(sink) = sink.as_ref() {
+            sink(message);
+        } else {
+            eprintln!("{message}");
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -286,13 +570,14 @@ impl Agents {
         s.children.clear();
         s.queue.clear();
         s.next = 1;
+        s.provider_cursor = 0;
         if let Some((_, moved)) = backup
             && let Err(e) = std::fs::remove_dir_all(&moved)
         {
-            eprintln!(
+            self.report_error(format!(
                 "warning: session cleared but old agent records remain at {}: {e}",
                 moved.display()
-            );
+            ));
         }
         Ok(())
     }
@@ -315,7 +600,7 @@ impl Agents {
         if id.is_none()
             && let Err(e) = self.save_parent(&s.parent)
         {
-            eprintln!("parent usage not saved: {e}");
+            self.report_error(format!("parent usage not saved: {e}"));
         }
     }
 
@@ -332,10 +617,6 @@ impl Agents {
 
     /// Start a child on `task` in the parent's cwd, or queue it when both slots are busy.
     pub(crate) fn spawn(self: &Arc<Self>, cfg: &Cfg, task: &str) -> String {
-        let task = task.trim();
-        if task.is_empty() {
-            return "error: spawn needs a TASK".into();
-        }
         let mut g = self.lock();
         if g.stopped {
             return "error: the session is ending; no agent was started".into();
@@ -345,6 +626,10 @@ impl Agents {
                 "error: {MAX_QUEUED} agents are already queued; wait for some before spawning more"
             );
         }
+        let (provider, task) = match select_provider(&mut g, task) {
+            Ok(selected) => selected,
+            Err(e) => return format!("error: {e}"),
+        };
         let id = format!("a{}", g.next);
         g.next += 1;
         let child_cfg = Cfg {
@@ -361,9 +646,12 @@ impl Agents {
         let c = Child {
             info: AgentInfo {
                 id: id.clone(),
+                provider,
                 task: task.into(),
                 status: Status::Queued,
-                model: cfg.model.clone(),
+                model: (provider == Provider::Local)
+                    .then(|| cfg.model.clone())
+                    .flatten(),
                 cwd: cwd_identity(&cfg.cwd),
                 usage: UsageTotal::default(),
             },
@@ -380,7 +668,7 @@ impl Agents {
             return format!("error: agent record not saved ({e}); no agent was started");
         }
         g.children.push(c);
-        g.queue.push_back((id.clone(), child_cfg));
+        g.queue.push_back((id.clone(), child_cfg, provider));
         self.pump(&mut g);
         let status = g.children.last().map(|c| c.info.status);
         match status {
@@ -409,27 +697,52 @@ impl Agents {
                 .count()
                 < MAX_RUNNING
         {
-            let Some((id, cfg)) = s.queue.pop_front() else {
+            let Some((id, cfg, provider)) = s.queue.pop_front() else {
                 return;
             };
             let me = self.clone();
             let tid = id.clone();
             let started = std::thread::Builder::new()
                 .name(format!("revex-{id}"))
-                .spawn(move || me.run_child(tid, cfg));
+                .spawn(move || me.run_child(tid, cfg, provider));
             let Some(c) = find(s, &id) else { continue };
+            let mut external_handle = None;
             match started {
-                Ok(_) => c.info.status = Status::Running,
+                Ok(handle) => {
+                    c.info.status = Status::Running;
+                    if provider != Provider::Local {
+                        external_handle = Some(handle);
+                    }
+                }
                 Err(e) => {
                     c.info.status = Status::Failed;
                     c.error = Some(format!("cannot start thread: {e}"));
                 }
             }
             c.unsaved = self.save(c).err();
+            if let Some(handle) = external_handle {
+                s.external_threads.push(handle);
+            }
         }
     }
 
-    fn run_child(self: Arc<Self>, id: String, mut cfg: Cfg) {
+    fn run_child(self: Arc<Self>, id: String, mut cfg: Cfg, provider: Provider) {
+        if provider != Provider::Local {
+            let task = self
+                .lock()
+                .children
+                .iter()
+                .find(|c| c.info.id == id)
+                .map(|c| c.info.task.clone())
+                .unwrap_or_default();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.run_external(&id, provider, &cfg.cwd, &task)
+            }))
+            .unwrap_or_else(|_| Err("external helper crashed".into()));
+            self.lock().external_pids.remove(&id);
+            self.finish(&id, result);
+            return;
+        }
         cfg.role = Role::Child(self.clone(), id.clone());
         let mut msgs = find(&mut self.lock(), &id)
             .map(|c| c.messages.clone())
@@ -448,6 +761,95 @@ impl Agents {
         }))
         .unwrap_or_else(|_| Err("helper agent crashed".into()));
         self.finish(&id, r);
+    }
+
+    fn run_external(
+        &self,
+        id: &str,
+        provider: Provider,
+        cwd: &Path,
+        task: &str,
+    ) -> Result<String, String> {
+        let program = match provider {
+            Provider::Codex => Path::new("codex"),
+            Provider::Claude => Path::new("claude"),
+            Provider::Local => return Err("local helper cannot use external runner".into()),
+        };
+        self.run_external_program(id, provider, cwd, task, program)
+    }
+
+    fn run_external_program(
+        &self,
+        id: &str,
+        provider: Provider,
+        cwd: &Path,
+        task: &str,
+        program: &Path,
+    ) -> Result<String, String> {
+        let result = self.run_external_program_inner(id, provider, cwd, task, program);
+        self.lock().external_pids.remove(id);
+        result
+    }
+
+    fn run_external_program_inner(
+        &self,
+        id: &str,
+        provider: Provider,
+        cwd: &Path,
+        task: &str,
+        program: &Path,
+    ) -> Result<String, String> {
+        let mut command = external_command(provider, cwd, program)?;
+        let child = command
+            .spawn()
+            .map_err(|e| format!("cannot launch {} helper: {e}", provider.name()))?;
+        let pid = child.id() as i32;
+        let mut process = ExternalProcess { child, pid };
+        {
+            let mut state = self.lock();
+            if state.stopped {
+                return Err("interrupted: parent session ended".into());
+            }
+            state.external_pids.insert(id.into(), pid);
+        }
+        let stdout = process.child.stdout.take().ok_or("missing helper stdout")?;
+        let stderr = process.child.stderr.take().ok_or("missing helper stderr")?;
+        let out_reader = std::thread::spawn(move || capture_bounded(stdout));
+        let err_reader = std::thread::spawn(move || capture_bounded(stderr));
+        let mut stdin = process.child.stdin.take().ok_or("missing helper stdin")?;
+        let input = task.as_bytes().to_vec();
+        let writer = std::thread::spawn(move || stdin.write_all(&input));
+        let status = process
+            .child
+            .wait()
+            .map_err(|e| format!("{} helper wait failed: {e}", provider.name()))?;
+        // Descendants can outlive the CLI leader and keep its pipes open.
+        // Close the entire owned group before joining pipe readers.
+        kill_process_group(pid);
+        let input_result = writer.join().map_err(|_| "helper stdin writer crashed")?;
+        let output = out_reader
+            .join()
+            .map_err(|_| "helper stdout reader crashed")??;
+        let error = err_reader
+            .join()
+            .map_err(|_| "helper stderr reader crashed")??;
+        let parsed = parse_external_output(provider, &output);
+        self.add_usage(Some(id), parsed.as_ref().ok().and_then(|(_, usage)| *usage));
+        if !self.stopped() && status.success() {
+            if let Err(e) = input_result {
+                return Err(format!("{} helper input failed: {e}", provider.name()));
+            }
+            parsed.map(|(answer, _)| truncate(answer))
+        } else if self.stopped() {
+            Err("interrupted: parent session ended".into())
+        } else {
+            Err(format!(
+                "{} helper exited with {}: {}",
+                provider.name(),
+                status,
+                truncate(error.trim().to_string())
+            ))
+        }
     }
 
     fn save_messages(&self, id: &str, m: &[Value]) -> Result<(), String> {
@@ -553,16 +955,25 @@ impl Agents {
         let mut g = self.lock();
         g.stopped = true;
         g.queue.clear();
+        for pid in g.external_pids.values() {
+            kill_process_group(*pid);
+        }
+        let threads = std::mem::take(&mut g.external_threads);
         for c in g.children.iter_mut().filter(|c| !c.info.status.finished()) {
             c.info.status = Status::Interrupted;
             c.error =
                 Some("interrupted: the parent session ended before this agent finished".into());
             if let Err(e) = self.save(c) {
-                eprintln!("agent record not saved: {e}");
+                self.report_error(format!("agent record not saved: {e}"));
             }
         }
         drop(g);
         self.changed.notify_all();
+        for thread in threads {
+            if thread.join().is_err() {
+                self.report_error("external helper thread crashed during shutdown".into());
+            }
+        }
     }
 }
 
@@ -571,6 +982,7 @@ fn save_record(dir: &Path, c: &Child) -> Result<(), String> {
     let body = json!({
         "version": RECORD_VERSION,
         "id": c.info.id,
+        "provider": c.info.provider.name(),
         "task": c.info.task,
         "cwd": c.info.cwd,
         "model": c.info.model,
@@ -593,6 +1005,7 @@ fn save_parent(dir: &Path, info: &AgentInfo) -> Result<(), String> {
     let body = json!({
         "version": RECORD_VERSION,
         "id": PARENT_ID,
+        "provider": info.provider.name(),
         "task": info.task,
         "cwd": info.cwd,
         "model": info.model,
@@ -642,6 +1055,11 @@ fn load_parent(dir: &Path) -> Result<Option<AgentInfo>, String> {
             .ok_or("unknown status")?;
         Ok(AgentInfo {
             id: PARENT_ID.into(),
+            provider: match v.get("provider") {
+                None => Provider::Local,
+                Some(Value::String(name)) => Provider::parse(name).ok_or("unknown provider")?,
+                _ => return Err("provider is not a string".into()),
+            },
             task: string("task")?,
             status,
             model,
@@ -726,6 +1144,11 @@ fn parse_record(text: &str, id: &str) -> Result<Child, String> {
     Ok(Child {
         info: AgentInfo {
             id: id.into(),
+            provider: match v.get("provider") {
+                None => Provider::Local,
+                Some(Value::String(name)) => Provider::parse(name).ok_or("unknown provider")?,
+                _ => return Err("provider is not a string".into()),
+            },
             task: text_of("task")?,
             status,
             model: opt("model")?,
@@ -751,6 +1174,7 @@ fn parse_record(text: &str, id: &str) -> Result<Child, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicUsize;
 
     fn tmp(name: &str) -> PathBuf {
@@ -771,6 +1195,7 @@ mod tests {
             base: String::new(),
             key: String::new(),
             model: Some("m".into()),
+            reasoning: None,
             yes: false,
             history: None,
             strict_save: false,
@@ -778,6 +1203,199 @@ mod tests {
             role: Role::Parent(Some(m.clone())),
             ui: None,
         }
+    }
+
+    #[test]
+    fn selected_providers_round_robin_and_explicit_override() {
+        let m = Agents::memory(model_fn(|_, _| reply("done", None, None)));
+        m.set_providers([true, true, true]).unwrap();
+        let mut state = m.lock();
+        assert_eq!(
+            select_provider(&mut state, "one"),
+            Ok((Provider::Local, "one"))
+        );
+        assert_eq!(
+            select_provider(&mut state, "two"),
+            Ok((Provider::Codex, "two"))
+        );
+        assert_eq!(
+            select_provider(&mut state, "@local three"),
+            Ok((Provider::Local, "three"))
+        );
+        assert_eq!(
+            select_provider(&mut state, "@claude four"),
+            Ok((Provider::Claude, "four"))
+        );
+        assert!(select_provider(&mut state, "@other no").is_err());
+        drop(state);
+        m.set_providers([true, false, false]).unwrap();
+        assert!(select_provider(&mut m.lock(), "@codex no").is_err());
+    }
+
+    #[test]
+    fn legacy_record_provider_defaults_to_local() {
+        let m = Agents::memory(model_fn(|_, _| reply("done", None, None)));
+        let c = cfg(Path::new("/tmp"), &m);
+        m.spawn(&c, "old");
+        let value = json!({
+            "version": 1, "id": "a1", "task": "old", "cwd": "/tmp",
+            "model": "m", "status": "done", "result": "ok", "error": null,
+            "delivered": false, "usage": {"input": 0, "output": 0, "requests": 0,
+            "input_missing": 0, "output_missing": 0}, "messages": []
+        });
+        let loaded = parse_record(&value.to_string(), "a1").unwrap();
+        assert_eq!(loaded.info.provider, Provider::Local);
+    }
+
+    #[test]
+    fn fake_external_program_gets_task_on_stdin_and_expected_flags() {
+        let dir = tmp("fake-external");
+        let executable = dir.join("fake-helper");
+        let args = dir.join("args");
+        let input = dir.join("input");
+        let agents = Agents::memory(model_fn(|_, _| reply("unused", None, None)));
+        for provider in [Provider::Codex, Provider::Claude] {
+            let answer = if provider == Provider::Codex {
+                "printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"fake-answer\"}}' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}'"
+            } else {
+                "printf '%s\\n' '{\"type\":\"result\",\"result\":\"fake-answer\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}'"
+            };
+            std::fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\n{}\n",
+                    args.display(),
+                    input.display(),
+                    answer
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let command = external_command(provider, &dir, &executable).unwrap();
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == "REVEX_API_KEY" && value.is_none())
+            );
+            let output = agents
+                .run_external_program("fake", provider, &dir, "private task", &executable)
+                .unwrap();
+            assert_eq!(output, "fake-answer");
+            assert_eq!(std::fs::read_to_string(&input).unwrap(), "private task");
+            let passed = std::fs::read_to_string(&args).unwrap();
+            assert!(!passed.contains("private task"));
+            if provider == Provider::Codex {
+                assert!(passed.contains("--dangerously-bypass-approvals-and-sandbox"));
+                assert!(passed.contains("--skip-git-repo-check"));
+                assert!(passed.contains(&dir.display().to_string()));
+                assert!(passed.contains("--json"));
+            } else {
+                assert!(passed.contains("--dangerously-skip-permissions"));
+                assert!(passed.contains("--output-format"));
+            }
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn external_json_counts_only_reported_usage() {
+        let codex = concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"first\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"last\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":11,\"output_tokens\":4}}\n"
+        );
+        let (answer, usage) = parse_external_output(Provider::Codex, codex).unwrap();
+        assert_eq!(answer, "last");
+        assert_eq!(usage.unwrap().input, Some(11));
+        assert_eq!(usage.unwrap().output, Some(4));
+        let (answer, usage) = parse_external_output(
+            Provider::Claude,
+            r#"{"type":"result","result":"done","usage":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(answer, "done");
+        assert_eq!(usage, None);
+    }
+
+    #[test]
+    fn fake_external_launch_failure_has_no_local_fallback() {
+        let dir = tmp("fake-missing");
+        let agents = Agents::memory(model_fn(|_, _| panic!("local fallback invoked")));
+        let error = agents
+            .run_external_program("fake", Provider::Codex, &dir, "task", &dir.join("missing"))
+            .unwrap_err();
+        assert!(error.contains("cannot launch codex helper"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn helper_selection_reads_only_the_home_file() {
+        let dir = tmp("home-selection");
+        let home = dir.join("home-settings");
+        std::fs::write(&home, r#"{"helper_providers":"local,claude"}"#).unwrap();
+        std::fs::write(dir.join(".revex"), r#"{"helper_providers":"codex"}"#).unwrap();
+        assert_eq!(selection_from_file(&home).unwrap(), [true, false, true]);
+        std::fs::write(&home, "{}").unwrap();
+        assert_eq!(selection_from_file(&home).unwrap(), [true, false, false]);
+        std::fs::write(&home, r#"{"helper_providers":"codex,codex"}"#).unwrap();
+        assert!(selection_from_file(&home).is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn malformed_home_helpers_allow_ordinary_turn_and_disable_external_spawn() {
+        let dir = tmp("malformed-home-helpers");
+        let home = dir.join("home-settings");
+        std::fs::write(&home, r#"{"helper_providers":"codex,codex"}"#).unwrap();
+        let agents = Agents::memory(model_fn(|_, _| reply("ordinary answer", None, None)));
+        let warning = agents.set_providers_from_home_file(Some(&home));
+        assert!(warning.is_some());
+        let config = cfg(&dir, &agents);
+        let mut messages = vec![json!({"role":"system", "content":SYSTEM})];
+        assert_eq!(
+            agent(&config, &mut messages, "ordinary task")
+                .unwrap()
+                .text(),
+            "ordinary answer"
+        );
+        assert!(agents.spawn(&config, "@codex task").contains("not enabled"));
+        assert_eq!(agents.lock().providers, [true, false, false]);
+        agents.shutdown();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn shutdown_kills_fake_external_process_group_and_reaps_child() {
+        let dir = tmp("external-shutdown");
+        let executable = dir.join("fake-helper");
+        let grandchild = dir.join("grandchild");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nwait\n",
+                grandchild.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let agents = Agents::memory(model_fn(|_, _| reply("unused", None, None)));
+        let worker = agents.clone();
+        let cwd = dir.clone();
+        let handle = std::thread::spawn(move || {
+            worker.run_external_program("fake", Provider::Claude, &cwd, "task", &executable)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !grandchild.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(grandchild.exists());
+        let start = std::time::Instant::now();
+        agents.shutdown();
+        let result = handle.join().unwrap();
+        assert!(result.unwrap_err().contains("interrupted"));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert!(agents.lock().external_pids.is_empty());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     fn reply(text: &str, input: Option<u64>, output: Option<u64>) -> Result<ChatResult, String> {
