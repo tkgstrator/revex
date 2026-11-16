@@ -85,16 +85,15 @@ Revex keeps these limits to remain a compact local-model client.
 
 ## Install
 
-After a tagged release is published, install the prebuilt binary:
+Install the latest published release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/tkgstrator/revex/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/tkgstrator/revex/master/install.sh | bash
 ```
 
 The installer verifies the release SHA-256 and installs to `~/.local/bin`
 (or `REVEX_INSTALL_DIR` if set). It supports macOS arm64 and Linux x86_64/arm64.
-The command requires a published release; until the first one is available,
-install with Cargo:
+If no release is available yet, install with Cargo:
 
 ```sh
 cargo install --git https://github.com/tkgstrator/revex
