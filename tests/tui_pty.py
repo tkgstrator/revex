@@ -79,6 +79,7 @@ class Terminal:
         for key in (
             "REVEX_BASE_URL", "REVEX_MODEL", "REVEX_API_KEY", "REVEX_API",
             "REVEX_ROUTE", "REVEX_FRONTIER", "REVEX_EXTRA",
+            "REVEX_RESPONSE_LANGUAGE",
         ):
             env.pop(key, None)
         env.update(extra or {})
@@ -367,13 +368,15 @@ class FakeHelperDispatchServer:
 
 
 class FakeSingleReplyServer:
-    def __init__(self):
+    def __init__(self, reply_count=1):
         self.listener = socket.socket()
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen(4)
         self.listener.settimeout(6)
         self.base = f"http://127.0.0.1:{self.listener.getsockname()[1]}"
         self.user_input = None
+        self.reply_count = reply_count
+        self.requests = []
         self.finished = threading.Event()
         self.error = None
         self.thread = threading.Thread(target=self.serve, daemon=True)
@@ -381,7 +384,7 @@ class FakeSingleReplyServer:
 
     def serve(self):
         try:
-            while not self.finished.is_set():
+            while len(self.requests) < self.reply_count:
                 conn, _ = self.listener.accept()
                 conn.settimeout(4)
                 with conn:
@@ -405,9 +408,10 @@ class FakeSingleReplyServer:
                         continue
                     assert b"POST /chat/completions" in headers
                     request = json.loads(body[:length])
+                    self.requests.append(request)
                     self.user_input = request["messages"][-1]["content"]
                     sse(conn, "multiline done")
-                    self.finished.set()
+            self.finished.set()
         except Exception as exc:
             self.error = exc
 
@@ -614,6 +618,52 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.exit()
             finally:
                 terminal.close()
+
+    def test_saved_japanese_reaches_next_request_after_english_history(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            server = FakeSingleReplyServer(reply_count=2)
+            seed_settings(home, {
+                "base_url": server.base,
+                "model": "fake-model",
+                "response_language": "en",
+                "helper_providers": "local",
+            })
+            terminal = Terminal(cwd, home)
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"hello\r")
+                terminal.wait_for_screen("multiline done")
+                terminal.send(b"/config\r")
+                terminal.wait_for_screen("Provider:")
+                terminal.send(b"\t\r\x1b[B\x1b[B\x1b[B\r\x1b[B\r\x13")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                self.assertEqual(json.loads(settings_file(home).read_text())["language"], "Japanese")
+                terminal.send("続きを\r".encode())
+                self.assertTrue(server.finished.wait(5), "second model request was not sent")
+                first, second = server.requests
+                self.assertEqual(first["messages"][-1]["content"].splitlines()[0], "hello")
+                self.assertEqual(first["messages"][-1]["role"], "user")
+                self.assertEqual(second["messages"][2]["content"], "multiline done")
+                self.assertTrue(second["messages"][0]["content"].startswith(
+                    "Response language for this request: Japanese."))
+                self.assertIn("[Revex response language: Japanese]",
+                              second["messages"][-1]["content"])
+                self.assertTrue(second["messages"][-1]["content"].startswith("続きを"))
+                until = time.monotonic() + 4
+                while time.monotonic() < until:
+                    terminal.read_for(0.05)
+                    screen = terminal.screen_text()
+                    if screen.count("multiline done") >= 2 and "> Ask Revex to do anything" in screen:
+                        break
+                else:
+                    self.fail("second reply did not return to chat")
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
 
     def test_setup_tabs_keep_provider_uncommitted_until_enter(self):
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:

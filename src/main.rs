@@ -138,6 +138,17 @@ fn response_language_instruction(language: ResponseLanguage) -> &'static str {
     }
 }
 
+fn response_language_reminder(language: ResponseLanguage) -> &'static str {
+    match language {
+        ResponseLanguage::English => {
+            "[Revex response language: English]\nWrite this answer in English even if earlier answers used another language. If this task explicitly requests another language, follow that request. Keep code, commands, paths, identifiers, and quoted text unchanged."
+        }
+        ResponseLanguage::Japanese => {
+            "[Revex response language: Japanese]\n今回の回答は日本語で書いてください。過去の回答が英語でも、日本語で回答してください。この依頼で別の言語が明示されている場合は、その指定を優先してください。コード、コマンド、パス、識別子、引用文は変えないでください。"
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Cfg {
     temperature: Option<f64>,
@@ -303,6 +314,7 @@ fn chat(cfg: &Cfg, msgs: &[Value]) -> Result<ChatResult, String> {
     }
     apply_reasoning(&mut body, cfg.api, cfg.reasoning.as_deref());
     add_runtime_model_context(&mut body, cfg.api, cfg.response_language);
+    add_active_task_language_reminder(&mut body, cfg.api, cfg.response_language);
     let url = format!("{}/{path}", cfg.base);
     let post = |body: &Value| {
         ureq::post(&url)
@@ -382,6 +394,34 @@ fn add_runtime_model_context(body: &mut Value, api: Api, language: ResponseLangu
             }
         }
     }
+}
+
+/// Keep the saved conversation and tool output unchanged. The active user task
+/// gets a request-only reminder close to the answer position, even after tool
+/// steps have appended a later `<out>` message.
+fn add_active_task_language_reminder(body: &mut Value, api: Api, language: ResponseLanguage) {
+    let key = match api {
+        Api::Chat => "messages",
+        Api::Responses => "input",
+    };
+    let Some(messages) = body.get_mut(key).and_then(Value::as_array_mut) else {
+        return;
+    };
+    let Some(task) = messages.iter_mut().rev().find(|message| {
+        message["role"] == "user"
+            && message["content"].as_str().is_some_and(|content| {
+                !(content.starts_with("<out>\n") && content.ends_with("\n</out>"))
+            })
+    }) else {
+        return;
+    };
+    let Some(content) = task["content"].as_str() else {
+        return;
+    };
+    task["content"] = Value::String(format!(
+        "{content}\n\n{}",
+        response_language_reminder(language)
+    ));
 }
 
 /// Explicit settings win over REVEX_EXTRA. Empty means the user selected
@@ -2985,6 +3025,10 @@ mod reasoning_tests {
             history
                 .push(json!({"role":"assistant","content":"Here is the explanation in English."}));
             history.push(json!({"role":"user","content":"続きを説明して"}));
+            history.push(json!({"role":"assistant","content":">> read src/main.rs 1-3"}));
+            let tool_output = "<out>\n1\tfn main() {}\n</out>";
+            history.push(json!({"role":"user","content":tool_output}));
+            let saved_history = history.clone();
             chat(&cfg, &history).unwrap();
             cfg.response_language = ResponseLanguage::Japanese;
             chat(&cfg, &history).unwrap();
@@ -3005,12 +3049,30 @@ mod reasoning_tests {
                 Api::Chat => &bodies[1]["messages"],
                 Api::Responses => &bodies[1]["input"],
             };
+            let active_task = messages
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| {
+                    message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.starts_with("続きを説明して"))
+                })
+                .unwrap()["content"]
+                .as_str()
+                .unwrap();
+            assert!(active_task.contains("[Revex response language: Japanese]"));
+            assert!(active_task.contains("今回の回答は日本語で書いてください"));
+            assert_eq!(
+                messages.as_array().unwrap().last().unwrap()["content"],
+                tool_output
+            );
             assert!(
                 messages
                     .to_string()
                     .contains("Here is the explanation in English.")
             );
-            assert_eq!(history[0]["content"], SYSTEM);
+            assert_eq!(history, saved_history);
         }
     }
 
