@@ -668,6 +668,14 @@ fn code_row(text: &str, width: usize, fence: bool, language: CodeLanguage) -> Li
     Line::from(spans)
 }
 
+fn user_padding(width: usize) -> Line<'static> {
+    Line::styled(" ".repeat(width), Style::default().bg(USER_BG))
+}
+
+fn is_blank_row(line: &Line<'_>) -> bool {
+    line.spans.iter().all(|span| span.content.trim().is_empty())
+}
+
 fn transcript_rows(view: &View, width: usize) -> Vec<Line<'static>> {
     let mut rows = Vec::new();
     for entry in &view.transcript {
@@ -686,8 +694,16 @@ fn transcript_rows(view: &View, width: usize) -> Vec<Line<'static>> {
             .iter()
             .rposition(|line| !line.trim().is_empty())
             .map_or(start, |index| index + 1);
-        if message_block && rows.last().is_none_or(|line: &Line<'_>| line.width() != 0) {
-            rows.push(Line::raw(""));
+        if message_block {
+            if rows.last().is_some_and(is_blank_row) {
+                if user {
+                    *rows.last_mut().expect("blank row exists") = user_padding(width);
+                }
+            } else if user {
+                rows.push(user_padding(width));
+            } else {
+                rows.push(Line::raw(""));
+            }
         }
         let mut in_code = None;
         for (line_index, &line) in source[start..end].iter().enumerate() {
@@ -696,6 +712,8 @@ fn transcript_rows(view: &View, width: usize) -> Vec<Line<'static>> {
             let language = in_code.unwrap_or_else(|| fence_language(content));
             let display = if user && line_index == 0 {
                 format!("> {}", line.strip_prefix("You  ").unwrap_or(line))
+            } else if assistant && line_index == 0 {
+                line.strip_prefix("Revex  ").unwrap_or(line).to_owned()
             } else if !user && !assistant && line_index == 0 {
                 format!("{} {line}", if error { '!' } else { '*' })
             } else {
@@ -731,17 +749,7 @@ fn transcript_rows(view: &View, width: usize) -> Vec<Line<'static>> {
                 } else if assistant && (in_code.is_some() || fence) {
                     rows.push(code_row(&visual, width, fence, language));
                 } else if assistant {
-                    if let Some(rest) = visual.strip_prefix("Revex  ") {
-                        rows.push(Line::from(vec![
-                            Span::styled(
-                                "Revex",
-                                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::raw(format!("  {rest}")),
-                        ]));
-                    } else {
-                        rows.push(Line::raw(visual));
-                    }
+                    rows.push(Line::raw(visual));
                 } else {
                     let color = if error {
                         Color::Red
@@ -774,7 +782,9 @@ fn transcript_rows(view: &View, width: usize) -> Vec<Line<'static>> {
                 };
             }
         }
-        if message_block {
+        if user {
+            rows.push(user_padding(width));
+        } else if assistant {
             rows.push(Line::raw(""));
         }
     }
@@ -1599,7 +1609,8 @@ mod tests {
         let output = screen(&view, &[], 80, 24);
         assert!(output.contains("> saved question"));
         assert!(!output.contains("You  saved question"));
-        assert!(output.contains("Revex  saved answer"));
+        assert!(output.contains("saved answer"));
+        assert!(!output.contains("Revex  saved answer"));
     }
 
     #[test]
@@ -1701,7 +1712,8 @@ mod tests {
         };
         let rows = transcript_rows(&view, 40);
         assert_eq!(rows[1].spans[0].style.fg, Some(Color::Cyan));
-        assert_eq!(rows[3].spans[0].style.fg, Some(Color::Cyan));
+        assert_eq!(rows[3].to_string(), "answer");
+        assert_eq!(rows[3].spans[0].style.fg, None);
         assert_eq!(rows[5].style.fg, Some(Color::Yellow));
         assert_eq!(rows[6].style.fg, Some(Color::Gray));
         assert_eq!(rows[7].style.fg, Some(Color::Red));
@@ -1804,10 +1816,106 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
         terminal.draw(|frame| render(frame, &view, &[])).unwrap();
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(0, 7)].bg, Color::Reset);
+        assert_eq!(buffer[(0, 7)].bg, USER_BG);
         assert_eq!(buffer[(0, 8)].bg, Color::Rgb(25, 31, 40));
         assert_eq!(buffer[(39, 8)].bg, Color::Rgb(25, 31, 40));
-        assert_eq!(buffer[(0, 9)].bg, Color::Reset);
+        assert_eq!(buffer[(0, 9)].bg, USER_BG);
+        assert_eq!(buffer[(0, 10)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn user_block_shades_full_width_padding_above_and_below() {
+        let view = View {
+            transcript: vec!["You  restored prompt".into()],
+            ..View::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &view, &[])).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in [8, 9, 10] {
+            for x in 0..40 {
+                assert_eq!(buffer[(x, y)].bg, USER_BG, "user block at {x},{y}");
+            }
+        }
+        for y in [8, 10] {
+            assert!((0..40).all(|x| buffer[(x, y)].symbol() == " "));
+        }
+    }
+
+    #[test]
+    fn adjacent_message_blocks_share_one_shaded_user_gap() {
+        let view = View {
+            transcript: vec![
+                "Revex  before".into(),
+                "You  restored".into(),
+                "You  next".into(),
+                "Revex  after".into(),
+            ],
+            ..View::default()
+        };
+        let rows = transcript_rows(&view, 20);
+        let content: Vec<_> = rows
+            .iter()
+            .map(|row| row.to_string().trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            content,
+            [
+                "",
+                "before",
+                "",
+                "> restored",
+                "",
+                "> next",
+                "",
+                "after",
+                ""
+            ]
+        );
+        for index in [2, 4, 6] {
+            assert_eq!(rows[index].style.bg, Some(USER_BG));
+            assert_eq!(rows[index].width(), 20);
+        }
+        assert_eq!(rows[8].style.bg, None);
+    }
+
+    #[test]
+    fn multiline_wide_user_block_keeps_shading_and_unicode_text() {
+        let view = View {
+            transcript: vec!["You  界界界界界\nmore".into()],
+            ..View::default()
+        };
+        let rows = transcript_rows(&view, 10);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0].style.bg, Some(USER_BG));
+        assert_eq!(rows[4].style.bg, Some(USER_BG));
+        for row in &rows[1..4] {
+            assert_eq!(row.width(), 10);
+            assert!(row.spans.iter().all(|span| span.style.bg == Some(USER_BG)));
+        }
+        let displayed = rows.iter().map(ToString::to_string).collect::<String>();
+        assert!(displayed.contains("> 界界界界"));
+        assert!(displayed.contains("界"));
+        assert!(displayed.contains("more"));
+    }
+
+    #[test]
+    fn assistant_replies_hide_internal_label_in_plain_and_fenced_content() {
+        let view = View {
+            transcript: vec![
+                "Revex  saved reply\nsecond line".into(),
+                "Revex  ```rust\nlet value = 1;\n```".into(),
+            ],
+            ..View::default()
+        };
+        let output = screen(&view, &[], 60, 20);
+        assert!(output.contains("saved reply"));
+        assert!(output.contains("second line"));
+        assert!(output.contains("```rust"));
+        assert!(output.contains("let value = 1;"));
+        assert!(!output.contains("Revex  saved reply"));
+        assert!(!output.contains("Revex  ```rust"));
+        assert!(output.lines().last().unwrap().contains("Revex"));
     }
 
     #[test]
@@ -1819,12 +1927,12 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(20, 12)).unwrap();
         terminal.draw(|frame| render(frame, &view, &[])).unwrap();
         let buffer = terminal.backend().buffer();
-        for y in [4, 5] {
+        for y in [3, 4, 5, 6] {
             assert_eq!(buffer[(0, y)].bg, Color::Rgb(25, 31, 40));
             assert_eq!(buffer[(19, y)].bg, Color::Rgb(25, 31, 40));
         }
-        assert_eq!(buffer[(0, 3)].bg, Color::Reset);
-        assert_eq!(buffer[(0, 6)].bg, Color::Reset);
+        assert_eq!(buffer[(0, 2)].bg, Color::Reset);
+        assert_eq!(buffer[(0, 7)].bg, Color::Reset);
     }
 
     #[test]
@@ -1849,12 +1957,12 @@ mod tests {
                 "",
                 "> question",
                 "",
-                "Revex  first line",
+                "first line",
                 "second line",
                 "",
                 "* tool finished",
                 "",
-                "Revex  next answer",
+                "next answer",
                 "",
             ]
         );
@@ -1883,7 +1991,7 @@ mod tests {
                 "",
                 "> restored question",
                 "",
-                "Revex  answer",
+                "answer",
                 "",
             ]
         );
@@ -1914,10 +2022,7 @@ mod tests {
             .iter()
             .map(|line| line.to_string().trim_end().to_owned())
             .collect();
-        assert_eq!(
-            rows[..],
-            ["", "Revex  answer one", "", "Revex  answer two", ""]
-        );
+        assert_eq!(rows[..], ["", "answer one", "", "answer two", ""]);
     }
 
     #[test]

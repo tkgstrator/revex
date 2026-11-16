@@ -698,7 +698,10 @@ class TuiPtyTests(unittest.TestCase):
                 self.assertNotIn("127.0.0.1", answer)
                 self.assertNotIn(b"Thinking", terminal.output)
                 self.assertNotIn(b"[main] started", terminal.output)
-                terminal.wait_for_screen("Revex  Revex")
+                until = time.monotonic() + 4
+                while "selected-alias" not in terminal.screen_text().split("-- INPUT")[0] and time.monotonic() < until:
+                    terminal.read_for(0.05)
+                self.assertIn("selected-alias", terminal.screen_text().split("-- INPUT")[0])
                 terminal.send(b"\x04")
                 terminal.exit()
             finally:
