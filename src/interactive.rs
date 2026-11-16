@@ -607,7 +607,7 @@ fn submit_chat(
         "/status" => {
             let parent = &session.agents.snapshot()[0];
             view.status = format!(
-                "{} · {} saved messages · {} queued",
+                "{} | {} saved messages | {} queued",
                 parent.status.name(),
                 session.msgs.as_ref().map_or(0, Vec::len),
                 session.queued.len()
@@ -1238,7 +1238,7 @@ pub(crate) fn run_tui(mut cfg: Cfg) -> Result<(), String> {
         }
         if let Some(session) = session.as_ref() {
             let main = &session.agents.snapshot()[0];
-            let status = format!("{}  ·  {} queued", main.status.name(), session.queued.len());
+            let status = format!("{}  |  {} queued", main.status.name(), session.queued.len());
             if view.status != status {
                 view.status = status;
                 dirty = true;

@@ -394,10 +394,10 @@ class TuiPtyTests(unittest.TestCase):
         terminal = object.__new__(Terminal)
         terminal.columns = 40
         terminal.output = (
-            "\x1b[?1049h\x1b[24;1H◐ Thinking"
+            "\x1b[?1049h\x1b[24;1H| Thinking"
             "\x1b[24;3HTh\x1b[24;7Hking"
         ).encode()
-        self.assertIn("◐ Thinking", terminal.screen_text().splitlines()[-1])
+        self.assertIn("| Thinking", terminal.screen_text().splitlines()[-1])
 
     def test_workspace_no_exits_without_opening_history(self):
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
@@ -411,7 +411,7 @@ class TuiPtyTests(unittest.TestCase):
             finally:
                 terminal.close()
 
-    def test_sparse_footer_at_eighty_columns(self):
+    def test_metadata_footer_at_eighty_columns(self):
         with tempfile.TemporaryDirectory() as home:
             terminal = Terminal(
                 ROOT, home,
@@ -422,8 +422,10 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.wait_for(b"workspace?")
                 terminal.send(b"\r")
                 terminal.wait_for_screen("> Ask Revex to do anything")
-                self.assertIn(b"/agents", terminal.output)
-                self.assertIn(b"/help", terminal.output)
+                footer = terminal.screen_text().splitlines()[-1]
+                self.assertIn("Revex", footer)
+                self.assertIn("server model", footer)
+                self.assertIn("agents", footer)
                 self.assertNotIn(b"server default", terminal.output)
                 self.assertNotIn(b"0 queued", terminal.output)
                 terminal.send(b"\x04")
@@ -440,7 +442,7 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.wait_for_screen("> Ask Revex to do anything")
                 self.assertNotIn("Ready. Enter a task below.", terminal.screen_text())
                 terminal.send(b"hello\r")
-                terminal.wait_for_screen("You  hello")
+                terminal.wait_for_screen("> hello")
                 self.assertNotIn("Ready. Enter a task below.", terminal.screen_text())
                 terminal.send(b"\x04")
                 terminal.exit()
