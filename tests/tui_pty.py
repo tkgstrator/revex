@@ -230,7 +230,7 @@ def sse(conn, text):
 
 
 class FakeServer:
-    def __init__(self, first_reply=None, later_replies=("done",)):
+    def __init__(self, first_reply=None, later_replies=("done",), hold_second=False):
         self.listener = socket.socket()
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen(8)
@@ -243,6 +243,9 @@ class FakeServer:
         self.requests = []
         self.first_reply = first_reply or ">> write edited.txt <<EOF\nchanged\nEOF"
         self.later_replies = later_replies
+        self.hold_second = hold_second
+        self.second_started = threading.Event()
+        self.release_second = threading.Event()
         self.thread = threading.Thread(target=self.serve, daemon=True)
         self.thread.start()
 
@@ -284,6 +287,9 @@ class FakeServer:
                         except BrokenPipeError:
                             pass  # steering may abort the old model response
                     else:
+                        if posts == 2 and self.hold_second:
+                            self.second_started.set()
+                            assert self.release_second.wait(5), "second model reply was never released"
                         sse(conn, self.later_replies[posts - 2])
             self.finished.set()
         except Exception as exc:
@@ -291,6 +297,7 @@ class FakeServer:
 
     def close(self):
         self.release.set()
+        self.release_second.set()
         self.thread.join(timeout=7)
         self.listener.close()
         if self.error:
@@ -1500,6 +1507,40 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.close()
                 server.close()
 
+    def test_mixed_prose_and_tool_shows_progress_before_next_model_reply(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            pathlib.Path(cwd, "marker.txt").write_text("marker contents\n")
+            server = FakeServer(
+                first_reply="Checking marker before final answer.\n>> read marker.txt",
+                later_replies=("final-complete-marker",),
+                hold_second=True,
+            )
+            terminal = Terminal(cwd, home, {"REVEX_BASE_URL": server.base, "REVEX_MODEL": "fake-model"})
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"inspect marker\r")
+                self.assertTrue(server.blocked.wait(4))
+                server.release.set()
+                self.assertTrue(server.second_started.wait(4), "next model request did not start")
+                terminal.wait_for_screen("Checking marker before final answer")
+                visible = terminal.screen_text()
+                self.assertEqual(visible.count("Checking marker before final answer"), 1)
+                self.assertLess(visible.index("Checking marker before final answer"), visible.index("tool read"))
+                self.assertNotIn("final-complete-marker", visible)
+                self.assertTrue(any("Checking marker before final answer" in m["content"]
+                                    for m in server.requests[1]["messages"] if m["role"] == "assistant"))
+                server.release_second.set()
+                terminal.wait_for_screen("final-complete-marker")
+                self.assertEqual(terminal.screen_text().count("Checking marker before final answer"), 1)
+                self.assertEqual(terminal.screen_text().count("final-complete-marker"), 1)
+                terminal.send(b"\x04")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
     def test_new_chat_waits_for_current_response_before_next_request(self):
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
             server = FakeHeldResponseSteeringServer()
@@ -1588,7 +1629,10 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.send(b"do new task\t")
                 terminal.wait_for_screen("Task queued for after this task")
                 server.release.set()
-                self.assertTrue(server.finished.wait(5), "queued follow-up never reached model")
+                deadline = time.monotonic() + 5
+                while not server.finished.is_set() and time.monotonic() < deadline:
+                    terminal.read_for(0.05)
+                self.assertTrue(server.finished.is_set(), "queued follow-up never reached model")
                 terminal.wait_for_screen("queued task finished")
                 self.assertEqual(pathlib.Path(cwd, "old.txt").read_text(), "old")
                 self.assertEqual(len(server.requests), 3)

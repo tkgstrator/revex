@@ -139,6 +139,12 @@ impl UiHandle {
         }
     }
 
+    pub(crate) fn commentary(&self, text: &str) {
+        if !self.cancelled() && !text.trim().is_empty() {
+            let _ = self.events.send(Event::Commentary(text.into()));
+        }
+    }
+
     pub(crate) fn approve(&self, what: &str, preview: &str) -> bool {
         if self.cancelled() {
             return false;
@@ -179,6 +185,7 @@ enum Event {
     #[allow(dead_code)]
     Eof,
     Progress(String),
+    Commentary(String),
     ModelPhase(bool),
     ReasoningChunk(String),
     Approval {
@@ -1600,6 +1607,15 @@ fn handle_worker_event(
 ) {
     match event {
         Event::Progress(message) => append(view, &message),
+        Event::Commentary(message) => {
+            if session
+                .as_ref()
+                .is_some_and(|session| session.busy && !session.interrupted && !session.closed)
+            {
+                let prose = truncate(terminal_safe(&message));
+                append(view, &format!("Revex  {prose}"));
+            }
+        }
         Event::ModelPhase(active) => {
             let in_flight = active
                 && session
@@ -2752,6 +2768,7 @@ fn run_loop(
             Ok(Event::Input(line)) => session.line(&line, out),
             Ok(Event::Eof) => session.close(out),
             Ok(Event::Progress(message)) => out(&message),
+            Ok(Event::Commentary(_)) => {}
             Ok(Event::ModelPhase(_)) | Ok(Event::ReasoningChunk(_)) => {}
             Ok(Event::Approval {
                 what,
@@ -3721,6 +3738,31 @@ mod tests {
             active.cfg.ui.as_ref().unwrap().take_steering(),
             ["correction"]
         );
+    }
+
+    #[test]
+    fn commentary_event_is_assistant_prose_only_during_active_turn() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let config = cfg(PathBuf::from("/tmp"), "http://fake".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut active = Session::new(config, fresh_history(), agents, tx);
+        active.busy = true;
+        let mut session = Some(active);
+        let mut view = tui::View::default();
+        handle_worker_event(
+            Event::Commentary(format!("\x1b[31mchecking {}", "x".repeat(10_000))),
+            &mut view,
+            &mut session,
+            0,
+        );
+        let shown = view.transcript.last().unwrap();
+        assert!(shown.starts_with("Revex  "));
+        assert!(shown.contains("checking"));
+        assert!(!shown.contains('\x1b'));
+        assert!(shown.len() <= MAX_OUT + 100);
+        session.as_mut().unwrap().busy = false;
+        handle_worker_event(Event::Commentary("late".into()), &mut view, &mut session, 0);
+        assert_eq!(view.transcript.len(), 1);
     }
 
     #[test]
