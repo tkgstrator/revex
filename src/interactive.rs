@@ -5,6 +5,7 @@ use super::*;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     self as terminal_event, Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -149,6 +150,13 @@ enum Event {
 
 static SIGINT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static TERMINATE_REQUESTED: AtomicBool = AtomicBool::new(false);
+static KEYBOARD_ENHANCEMENT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn restore_keyboard_enhancement() {
+    if KEYBOARD_ENHANCEMENT_ACTIVE.swap(false, Ordering::AcqRel) {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
+}
 
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -163,10 +171,21 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             return Err(e.to_string());
         }
+        // Compatible terminals report modified Enter as CSI-u. Legacy terminals
+        // ignore this request and continue to send the same CR for both keys.
+        if execute!(
+            output,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok()
+        {
+            KEYBOARD_ENHANCEMENT_ACTIVE.store(true, Ordering::Release);
+        }
         let backend = CrosstermBackend::new(output);
         match Terminal::new(backend) {
             Ok(terminal) => Ok(Self { terminal }),
             Err(e) => {
+                restore_keyboard_enhancement();
                 let _ = execute!(std::io::stdout(), Show, LeaveAlternateScreen);
                 let _ = disable_raw_mode();
                 Err(e.to_string())
@@ -178,6 +197,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = self.terminal.show_cursor();
+        restore_keyboard_enhancement();
         let _ = execute!(std::io::stdout(), Show, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
@@ -188,6 +208,7 @@ fn install_panic_restore() {
     INSTALLED.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            restore_keyboard_enhancement();
             let _ = disable_raw_mode();
             let _ = execute!(std::io::stdout(), Show, LeaveAlternateScreen);
             previous(info);
@@ -639,6 +660,9 @@ fn submit_chat(
                 match clear_history(&session.cfg, msgs) {
                     Ok(()) => {
                         view.transcript.clear();
+                        view.turn_started = None;
+                        view.last_turn_elapsed = None;
+                        view.last_turn_rate = None;
                         append(view, "Session history and agent records cleared.");
                     }
                     Err(e) => append(view, &format!("History not cleared: {e}")),
@@ -647,7 +671,7 @@ fn submit_chat(
         }
         "/help" => append(
             view,
-            "/agents  /status  /config  /model [ID] (choose reasoning)  /clear  /exit or exit  Ctrl+D exit  Alt+Enter newline  Ctrl+R retry models",
+            "/agents  /status  /config  /model [ID] (choose reasoning)  /clear  /exit or exit  Ctrl+D exit  Ctrl+J newline  Alt+Enter newline  Shift+Enter newline when terminal supports it  Ctrl+R retry models",
         ),
         _ if line.starts_with("/model") => {
             let id = line.strip_prefix("/model").unwrap_or("").trim();
@@ -704,10 +728,32 @@ fn submit_chat(
                 session.queued.push_back(task.into());
                 append(view, &format!("Task queued ({})", session.queued.len()));
             } else {
+                begin_turn(view, session);
                 session.start(task.into(), &mut |message| append(view, message));
             }
         }
     }
+}
+
+fn begin_turn(view: &mut tui::View, session: &Session) {
+    view.turn_usage_before = session.agents.snapshot()[0].usage;
+    view.turn_started = Some(std::time::Instant::now());
+    view.last_turn_elapsed = None;
+    view.last_turn_rate = None;
+}
+
+fn complete_turn(view: &mut tui::View, session: &Session) {
+    let Some(started) = view.turn_started.take() else {
+        return;
+    };
+    let elapsed = started.elapsed();
+    let after = session.agents.snapshot()[0].usage;
+    let before = view.turn_usage_before;
+    let requests = after.requests.saturating_sub(before.requests);
+    let missing = after.output_missing.saturating_sub(before.output_missing);
+    view.last_turn_rate = (requests > 0 && missing == 0 && !elapsed.is_zero())
+        .then(|| after.output.saturating_sub(before.output) as f64 / elapsed.as_secs_f64());
+    view.last_turn_elapsed = Some(elapsed);
 }
 
 fn handle_setup_key(
@@ -1116,7 +1162,11 @@ fn handle_worker_event(
         Event::Finished(result, msgs) => {
             view.model_in_flight = false;
             if let Some(session) = session.as_mut() {
+                complete_turn(view, session);
                 session.finished(result, msgs, &mut |message| append(view, message));
+                if session.busy {
+                    begin_turn(view, session);
+                }
             }
         }
         Event::ModelsFetched {
@@ -1252,7 +1302,9 @@ pub(crate) fn run_tui(mut cfg: Cfg) -> Result<(), String> {
             last_snapshot = snapshot.clone();
             dirty = true;
         }
-        if view.model_in_flight && last_activity_tick.elapsed() >= Duration::from_millis(200) {
+        if (view.model_in_flight || view.turn_started.is_some())
+            && last_activity_tick.elapsed() >= Duration::from_millis(200)
+        {
             view.activity_tick = view.activity_tick.wrapping_add(1);
             last_activity_tick = std::time::Instant::now();
             dirty = true;
@@ -2738,6 +2790,47 @@ mod tests {
     }
 
     #[test]
+    fn shift_enter_inserts_newline_and_plain_enter_submits_multiline_prompt() {
+        let agents = Agents::memory(model_fn(|_, _| unreachable!()));
+        let mut config = cfg(PathBuf::from("/tmp"), "http://unused".into(), &agents);
+        let (tx, _rx) = mpsc::channel();
+        let mut session = Some(Session::new(config.clone(), fresh_history(), agents, tx));
+        let mut view = tui::View {
+            input: "firstsecond".into(),
+            cursor: 5,
+            ..Default::default()
+        };
+        let mut request = 0;
+        let mut exit = false;
+        handle_chat_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            &mut config,
+            &mut view,
+            &mut session,
+            &mut request,
+            &mut exit,
+        );
+        assert_eq!(view.input, "first\nsecond");
+        assert_eq!(view.cursor, 6);
+        assert!(!session.as_ref().unwrap().busy);
+        handle_chat_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut config,
+            &mut view,
+            &mut session,
+            &mut request,
+            &mut exit,
+        );
+        assert!(view.input.is_empty());
+        assert_eq!(view.cursor, 0);
+        assert!(
+            view.transcript
+                .iter()
+                .any(|line| line == "You  first\nsecond")
+        );
+    }
+
+    #[test]
     fn changing_endpoint_drops_previous_key_before_discovery_or_save() {
         let agents = Agents::memory(model_fn(|_, _| unreachable!()));
         let mut config = cfg(
@@ -2860,6 +2953,8 @@ mod tests {
             &mut exit,
         );
         assert!(view.transcript.last().unwrap().contains("/exit or exit"));
+        assert!(view.transcript.last().unwrap().contains("Ctrl+J newline"));
+        assert!(view.transcript.last().unwrap().contains("Shift+Enter"));
         assert!(!exit);
         submit_chat(
             "exit".into(),

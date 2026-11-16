@@ -423,9 +423,10 @@ class TuiPtyTests(unittest.TestCase):
                 terminal.send(b"\r")
                 terminal.wait_for_screen("> Ask Revex to do anything")
                 footer = terminal.screen_text().splitlines()[-1]
-                self.assertIn("Revex", footer)
                 self.assertIn("server model", footer)
-                self.assertIn("agents", footer)
+                self.assertIn("/revex", footer)
+                self.assertNotIn("Revex v", footer)
+                self.assertNotIn("0 agents", footer)
                 self.assertNotIn(b"server default", terminal.output)
                 self.assertNotIn(b"0 queued", terminal.output)
                 terminal.send(b"\x04")
@@ -724,6 +725,60 @@ class TuiPtyTests(unittest.TestCase):
                 self.assertTrue(server.finished.wait(4), "multiline request was not sent")
                 self.assertEqual(server.user_input, "first\nsecond")
                 terminal.wait_for(b"multiline")
+                terminal.wait_for_screen("tok/s")
+                footer = terminal.screen_text().splitlines()[-1].strip()
+                self.assertRegex(footer, r"[0-9]+\.[0-9] tok/s \. [0-9]+\.[0-9]s \. -")
+                terminal.send(b"exit\r")
+                terminal.exit()
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_shift_enter_csi_u_keeps_multiline_prompt_and_restores_mode(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            server = FakeSingleReplyServer()
+            terminal = Terminal(cwd, home, {
+                "REVEX_BASE_URL": server.base,
+                "REVEX_MODEL": "fake-model",
+            })
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.wait_for(b"\x1b[>1u")  # Request unambiguous modified keys.
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                self.assertIn("Ctrl+J newline", terminal.screen_text())
+                terminal.send(b"first\x1b[13;2usecond")  # CSI-u Shift+Enter.
+                terminal.read_for(0.2)
+                self.assertFalse(server.finished.is_set(), "Shift+Enter submitted early")
+                terminal.send(b"\r")
+                self.assertTrue(server.finished.wait(4), "multiline request was not sent")
+                self.assertEqual(server.user_input, "first\nsecond")
+                terminal.wait_for(b"multiline")
+                terminal.send(b"exit\r")
+                terminal.exit()
+                self.assertIn(b"\x1b[<1u", terminal.output)
+            finally:
+                terminal.close()
+                server.close()
+
+    def test_ctrl_j_inserts_newline_before_plain_enter_submits(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            server = FakeSingleReplyServer()
+            terminal = Terminal(cwd, home, {
+                "REVEX_BASE_URL": server.base,
+                "REVEX_MODEL": "fake-model",
+            })
+            try:
+                terminal.wait_for(b"workspace?")
+                terminal.send(b"\r")
+                terminal.wait_for_screen("> Ask Revex to do anything")
+                terminal.send(b"first\x0asecond")  # Ctrl+J emits LF in raw mode.
+                terminal.read_for(0.2)
+                self.assertFalse(server.finished.is_set(), "Ctrl+J submitted early")
+                terminal.send(b"\r")
+                self.assertTrue(server.finished.wait(4), "multiline request was not sent")
+                self.assertEqual(server.user_input, "first\nsecond")
+                terminal.wait_for(b"multiline")
                 terminal.send(b"exit\r")
                 terminal.exit()
             finally:
@@ -747,7 +802,8 @@ class TuiPtyTests(unittest.TestCase):
                     response = (
                         "printf '%s\\n' "
                         "'{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"claude-helper-ok\","
-                        "\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}'\n"
+                        "\"usage\":{\"input_tokens\":5,\"output_tokens\":2},"
+                        "\"total_cost_usd\":0.125}'\n"
                     )
                 script.write_text(
                     "#!/bin/sh\n"
@@ -772,6 +828,15 @@ class TuiPtyTests(unittest.TestCase):
                 self.assertIn("--dangerously-bypass-approvals-and-sandbox", codex_args)
                 self.assertIn("--skip-git-repo-check", codex_args)
                 self.assertIn("--dangerously-skip-permissions", claude_args)
+                records = [json.loads(path.read_text()) for path in
+                           pathlib.Path(home, ".local/state/revex").rglob("a*.json")]
+                self.assertEqual(
+                    next(record["cost_usd"] for record in records if record.get("provider") == "claude"),
+                    0.125,
+                )
+                self.assertIsNone(
+                    next(record["cost_usd"] for record in records if record.get("provider") == "codex")
+                )
                 terminal.send(b"/agents\r")
                 terminal.wait_for(b"codex")
                 terminal.wait_for(b"claude")

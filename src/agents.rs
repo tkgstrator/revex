@@ -113,6 +113,8 @@ pub(crate) struct AgentInfo {
     pub(crate) cwd: String,
     /// Every model request of this agent; missing provider usage is counted as missing.
     pub(crate) usage: UsageTotal,
+    /// Reported by the external helper CLI; not inferred from token prices.
+    pub(crate) cost_usd: Option<f64>,
 }
 
 struct Child {
@@ -264,7 +266,7 @@ fn reported_usage(v: &Value) -> Option<Usage> {
 fn parse_external_output(
     provider: Provider,
     output: &str,
-) -> Result<(String, Option<Usage>), String> {
+) -> Result<(String, Option<Usage>, Option<f64>), String> {
     match provider {
         Provider::Codex => {
             let mut answer = None;
@@ -293,6 +295,7 @@ fn parse_external_output(
             Ok((
                 answer.ok_or("codex helper returned no final answer")?,
                 usage,
+                None,
             ))
         }
         Provider::Claude => {
@@ -304,7 +307,10 @@ fn parse_external_output(
             let answer = v["result"]
                 .as_str()
                 .ok_or("claude helper returned no final answer")?;
-            Ok((answer.into(), reported_usage(&v)))
+            let cost = v["total_cost_usd"]
+                .as_f64()
+                .filter(|value| value.is_finite() && *value >= 0.0);
+            Ok((answer.into(), reported_usage(&v), cost))
         }
         Provider::Local => Err("local helper cannot use external runner".into()),
     }
@@ -402,6 +408,7 @@ impl Agents {
             model: None,
             cwd: String::new(),
             usage: UsageTotal::default(),
+            cost_usd: None,
         });
         Arc::new(Self {
             dir,
@@ -654,6 +661,7 @@ impl Agents {
                     .flatten(),
                 cwd: cwd_identity(&cfg.cwd),
                 usage: UsageTotal::default(),
+                cost_usd: None,
             },
             result: None,
             error: None,
@@ -834,12 +842,28 @@ impl Agents {
             .join()
             .map_err(|_| "helper stderr reader crashed")??;
         let parsed = parse_external_output(provider, &output);
-        self.add_usage(Some(id), parsed.as_ref().ok().and_then(|(_, usage)| *usage));
+        self.add_usage(
+            Some(id),
+            parsed.as_ref().ok().and_then(|(_, usage, _)| *usage),
+        );
+        if status.success()
+            && let Ok((_, _, Some(cost))) = &parsed
+        {
+            let mut state = self.lock();
+            if !state.stopped
+                && let Some(child) = find(&mut state, id)
+            {
+                child.info.cost_usd = Some(*cost);
+                if let Err(e) = self.save(child) {
+                    self.report_error(format!("helper cost not saved: {e}"));
+                }
+            }
+        }
         if !self.stopped() && status.success() {
             if let Err(e) = input_result {
                 return Err(format!("{} helper input failed: {e}", provider.name()));
             }
-            parsed.map(|(answer, _)| truncate(answer))
+            parsed.map(|(answer, _, _)| truncate(answer))
         } else if self.stopped() {
             Err("interrupted: parent session ended".into())
         } else {
@@ -994,6 +1018,7 @@ fn save_record(dir: &Path, c: &Child) -> Result<(), String> {
             "input": u.input, "output": u.output, "requests": u.requests,
             "input_missing": u.input_missing, "output_missing": u.output_missing
         },
+        "cost_usd": c.info.cost_usd,
         "messages": c.messages,
     });
     let path = dir.join(format!("{}.json", c.info.id));
@@ -1071,6 +1096,7 @@ fn load_parent(dir: &Path) -> Result<Option<AgentInfo>, String> {
                 input_missing: n32("input_missing")?,
                 output_missing: n32("output_missing")?,
             },
+            cost_usd: None,
         })
     };
     parse()
@@ -1160,6 +1186,13 @@ fn parse_record(text: &str, id: &str) -> Result<Child, String> {
                 input_missing: n32("input_missing")?,
                 output_missing: n32("output_missing")?,
             },
+            cost_usd: match &v["cost_usd"] {
+                Value::Null => None,
+                Value::Number(value) => value
+                    .as_f64()
+                    .filter(|cost| cost.is_finite() && *cost >= 0.0),
+                _ => return Err("cost_usd is not a number".into()),
+            },
         },
         result: opt("result")?,
         error: opt("error")?,
@@ -1245,6 +1278,7 @@ mod tests {
         });
         let loaded = parse_record(&value.to_string(), "a1").unwrap();
         assert_eq!(loaded.info.provider, Provider::Local);
+        assert_eq!(loaded.info.cost_usd, None);
     }
 
     #[test]
@@ -1304,17 +1338,43 @@ mod tests {
             "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"last\"}}\n",
             "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":11,\"output_tokens\":4}}\n"
         );
-        let (answer, usage) = parse_external_output(Provider::Codex, codex).unwrap();
+        let (answer, usage, cost) = parse_external_output(Provider::Codex, codex).unwrap();
         assert_eq!(answer, "last");
         assert_eq!(usage.unwrap().input, Some(11));
         assert_eq!(usage.unwrap().output, Some(4));
-        let (answer, usage) = parse_external_output(
+        assert_eq!(cost, None);
+        let (answer, usage, cost) = parse_external_output(
             Provider::Claude,
-            r#"{"type":"result","result":"done","usage":{}}"#,
+            r#"{"type":"result","result":"done","usage":{},"total_cost_usd":0.125}"#,
         )
         .unwrap();
         assert_eq!(answer, "done");
         assert_eq!(usage, None);
+        assert_eq!(cost, Some(0.125));
+        let (_, _, cost) = parse_external_output(
+            Provider::Claude,
+            r#"{"type":"result","result":"done","total_cost_usd":-1}"#,
+        )
+        .unwrap();
+        assert_eq!(cost, None);
+    }
+
+    #[test]
+    fn persisted_claude_cost_survives_record_roundtrip() {
+        let value = json!({
+            "version": 1, "id": "a1", "provider": "claude", "task": "inspect", "cwd": "/tmp",
+            "model": null, "status": "done", "result": "ok", "error": null,
+            "delivered": false, "cost_usd": 0.125,
+            "usage": {"input": 7, "output": 3, "requests": 1,
+                      "input_missing": 0, "output_missing": 0}, "messages": []
+        });
+        let child = parse_record(&value.to_string(), "a1").unwrap();
+        let dir = tmp("cost-roundtrip");
+        save_record(&dir, &child).unwrap();
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("a1.json")).unwrap()).unwrap();
+        assert_eq!(saved["cost_usd"].as_f64(), Some(0.125));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
