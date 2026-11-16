@@ -52,7 +52,7 @@ jobs:
           devcontainer features package ./.feature-publish/revex --output-folder "$RUNNER_TEMP/revex-package"
           archive="$RUNNER_TEMP/revex-package/devcontainer-feature-revex.tgz"
           test -s "$archive"
-          tar -xOzf "$archive" ./devcontainer-feature.json |
+          tar -xOf "$archive" ./devcontainer-feature.json |
             jq -e --arg version "$(jq -r .version src/revex/devcontainer-feature.json)" \
               '.id == "revex" and .version == $version' >/dev/null
           metadata=$(jq -c . src/revex/devcontainer-feature.json)
